@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import importlib.util
 import math
+import os
 import sys
 import types
 from pathlib import Path
@@ -20,7 +21,7 @@ import torch
 
 ROOT = Path(__file__).resolve().parents[1]
 SERVE = ROOT / "source/badmintonlab_game/badmintonlab_game/tasks/manager_based/badmintonlab_game/serve"
-ISAACLAB = Path("D:/rl-badminton-train/IsaacLab/source/isaaclab")
+ISAACLAB = Path(os.environ.get("ISAACLAB_SRC", "/root/autodl-tmp/IsaacLab/source/isaaclab"))
 
 
 def _real_configclass():

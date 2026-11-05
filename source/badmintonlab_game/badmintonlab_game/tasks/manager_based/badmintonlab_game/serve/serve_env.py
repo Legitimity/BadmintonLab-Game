@@ -70,6 +70,11 @@ class ServeBadmintonEnv(DualAgentBadmintonEnv):
         self.extras["rally_winner"] = self.rally_winner.clone()
         self.extras["serve_height_fault"] = self.serve_height_fault.clone()
         self.extras["double_hit_fault"] = self.double_hit_fault.clone()
+        # Extra diagnostics (not in play) for P1/P2 tools; read them before the reset clears the state.
+        self.extras["hit_count"] = self.hit_count.clone()
+        self.extras["rally_net_fault"] = self.net_fault.clone()
+        self.extras["rally_out_fault"] = self.out_fault.clone()
+        self.extras["shuttle_local_pos"] = self._shuttle.data.root_pos_w - self.scene.env_origins
         reset_ids = self.reset_buf.nonzero(as_tuple=False).squeeze(-1)
         if len(reset_ids) > 0:
             self.recorder_manager.record_pre_reset(reset_ids)

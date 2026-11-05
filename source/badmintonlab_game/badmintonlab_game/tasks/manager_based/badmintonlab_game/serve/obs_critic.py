@@ -9,11 +9,17 @@ from isaaclab.utils.math import quat_apply_inverse
 
 
 def is_server(env, side: int) -> torch.Tensor:
+    # The observation manager probes term shapes inside ManagerBasedEnv.__init__,
+    # before DualAgentBadmintonEnv creates its rally state.
+    if not hasattr(env, "initial_hitter"):
+        return torch.zeros(env.num_envs, 1, device=env.device)
     return (env.initial_hitter == side).float().unsqueeze(-1)
 
 
 def rally_phase(env, side: int) -> torch.Tensor:
     """[own hit made, opponent hit made, episode time in seconds]."""
+    if not hasattr(env, "hit_count"):
+        return torch.zeros(env.num_envs, 3, device=env.device)
     own = (env.hit_count[:, side] > 0).float()
     other = (env.hit_count[:, 1 - side] > 0).float()
     return torch.stack((own, other, env.episode_length_buf.float() * env.step_dt), dim=-1)

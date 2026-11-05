@@ -17,7 +17,7 @@ import pytest
 import torch
 
 ROOT = Path(__file__).resolve().parents[1]
-PLAY_ROOT = Path(os.environ.get("PLAY_ROOT", "D:/rl-badminton-eval/BadmintonLab-Game-Play"))
+PLAY_ROOT = Path(os.environ.get("PLAY_ROOT", "/root/autodl-tmp/BadmintonLab-Game-Play"))
 SERVE = ROOT / "source/badmintonlab_game/badmintonlab_game/tasks/manager_based/badmintonlab_game/serve"
 PLAY_PKG = PLAY_ROOT / "source/badmintonlab_game/badmintonlab_game"
 

@@ -9,7 +9,9 @@ Use ``--max_iterations 2 --num_envs 4`` as the smoke test.
 """
 
 import argparse
+import json
 import os
+import subprocess
 import sys
 from datetime import datetime
 from pathlib import Path
@@ -18,6 +20,7 @@ from isaaclab.app import AppLauncher
 
 import cli_args
 
+_ORIGINAL_ARGV = list(sys.argv)
 parser = argparse.ArgumentParser(description=__doc__)
 parser.add_argument("--task", default="BadmintonLab-Game-Serve")
 parser.add_argument("--num_envs", type=int, default=None)
@@ -26,7 +29,16 @@ parser.add_argument("--max_iterations", type=int, default=None)
 parser.add_argument("--time_budget_hours", type=float, default=None, help="Stop cleanly before this wall-clock budget.")
 parser.add_argument("--auto_resume", action="store_true", help="Resume from the newest latest.pt of this run_name.")
 parser.add_argument("--no_pose_init", action="store_true", help="Ablation AB3: skip the actor output initialisation.")
-parser.add_argument("--swanlab", action="store_true", help="Mirror TensorBoard scalars to SwanLab (offline by default).")
+parser.add_argument(
+    "--swanlab_mode",
+    default="cloud",
+    choices=("cloud", "local", "offline", "disabled"),
+    help="Mirror TensorBoard scalars to SwanLab through scripts/tools/swanlab_bridge.py (separate interpreter).",
+)
+parser.add_argument("--swanlab_project", default="BadmintonLab-Game")
+parser.add_argument("--swanlab_workspace", default="Legitimity")
+parser.add_argument("--swanlab_group", default=None)
+parser.add_argument("--swanlab_name", default=None)
 cli_args.add_rsl_rl_args(parser)
 AppLauncher.add_app_launcher_args(parser)
 args_cli, hydra_args = parser.parse_known_args()
@@ -59,6 +71,64 @@ from common import prepare_agent_cfg  # noqa: E402
 torch.backends.cuda.matmul.allow_tf32 = True
 torch.backends.cudnn.allow_tf32 = True
 REPO = Path(__file__).resolve().parents[2]
+
+
+def _git_state() -> dict:
+    try:
+        sha = subprocess.check_output(["git", "-C", str(REPO), "rev-parse", "--short", "HEAD"], text=True).strip()
+        dirty = bool(subprocess.check_output(["git", "-C", str(REPO), "status", "--porcelain"], text=True).strip())
+    except (OSError, subprocess.CalledProcessError):
+        return {"commit": "nogit", "dirty": False}
+    return {"commit": sha, "dirty": dirty}
+
+
+def _start_swanlab_bridge(agent_cfg, env_cfg, log_dir: str):
+    """SwanLab >= 0.9 cannot live next to Isaac Sim (wrapt pin), so a sidecar in
+    ``$SWANLAB_PYTHON`` tails the TensorBoard events. Returns the process or ``None``."""
+    if args_cli.swanlab_mode == "disabled":
+        return None
+    python = os.environ.get("SWANLAB_PYTHON", "/root/autodl-tmp/env_swanlab/bin/python")
+    if not os.path.isfile(python):
+        print(f"[WARN] SwanLab interpreter not found at {python}; TensorBoard only.")
+        return None
+    git = _git_state()
+    prefix = agent_cfg.run_name or args_cli.task
+    name = args_cli.swanlab_name or f"{prefix}-s{agent_cfg.seed}-{git['commit']}{'-dirty' if git['dirty'] else ''}"
+    config = {
+        "task": args_cli.task,
+        "num_envs": env_cfg.scene.num_envs,
+        "seed": agent_cfg.seed,
+        "log_dir": log_dir,
+        "git": git,
+        "command": " ".join(_ORIGINAL_ARGV),
+        "agent": agent_cfg.to_dict(),
+    }
+    config_path = os.path.join(log_dir, "params", "swanlab_config.json")
+    os.makedirs(os.path.dirname(config_path), exist_ok=True)
+    with open(config_path, "w") as f:
+        json.dump(config, f, indent=1, default=str)
+    cmd = [
+        python, str(REPO / "scripts" / "tools" / "swanlab_bridge.py"),
+        "--logdir", log_dir, "--project", args_cli.swanlab_project, "--name", name,
+        "--config", config_path, "--mode", args_cli.swanlab_mode, "--parent_pid", str(os.getpid()),
+    ]  # fmt: skip
+    if args_cli.swanlab_workspace:
+        cmd += ["--workspace", args_cli.swanlab_workspace]
+    if args_cli.swanlab_group:
+        cmd += ["--group", args_cli.swanlab_group]
+    log_file = open(os.path.join(log_dir, "swanlab_bridge.log"), "w")
+    print(f"[INFO] SwanLab bridge: {args_cli.swanlab_project}/{name} ({args_cli.swanlab_mode})")
+    return subprocess.Popen(cmd, stdout=log_file, stderr=subprocess.STDOUT, start_new_session=True)
+
+
+def _stop_swanlab_bridge(proc, log_dir: str) -> None:
+    if proc is None:
+        return
+    open(os.path.join(log_dir, ".swanlab_done"), "w").close()
+    try:
+        proc.wait(timeout=180)
+    except subprocess.TimeoutExpired:
+        proc.terminate()
 
 
 def _ready_action(env) -> torch.Tensor:
@@ -134,29 +204,13 @@ def main(env_cfg, agent_cfg):
             init_actor_output(runner.alg.policy, _ready_action(env))
         dump_yaml(os.path.join(log_dir, "params", "env.yaml"), env_cfg)
         dump_yaml(os.path.join(log_dir, "params", "agent.yaml"), agent_cfg)
-        swan = None
-        if args_cli.swanlab:
-            try:
-                import swanlab
-
-                swan = swanlab
-                swanlab.init(
-                    project=os.environ.get("SWANLAB_PROJECT", "BadmintonLab-Game"),
-                    name=run_name,
-                    mode=os.environ.get("SWANLAB_MODE", "offline"),
-                    log_dir=str(REPO / "swanlog"),
-                )
-                swanlab.sync_tensorboard_torch()
-            except Exception as exc:  # Tracking must never stop a run.
-                print(f"[SwanLab] disabled: {exc}")
-                swan = None
+        swan = _start_swanlab_bridge(agent_cfg, env_cfg, log_dir)
         try:
             reason = runner.learn_until_stop(agent_cfg.max_iterations, init_at_random_ep_len=True)
             print(f"[INFO] stopped: {reason}")
         finally:
             finish_run_meta(meta_path, runner)
-            if swan is not None:
-                swan.finish()
+            _stop_swanlab_bridge(swan, log_dir)
     finally:
         env.close()
 

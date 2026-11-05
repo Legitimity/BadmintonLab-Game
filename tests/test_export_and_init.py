@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import ast
 import importlib.util
+import os
 import sys
 import types
 from pathlib import Path
@@ -14,7 +15,7 @@ from tensordict import TensorDict
 
 ROOT = Path(__file__).resolve().parents[1]
 SERVE = ROOT / "source/badmintonlab_game/badmintonlab_game/tasks/manager_based/badmintonlab_game/serve"
-PLAY_MODEL = Path("D:/rl-badminton-eval/BadmintonLab-Game-Play/model_test.pt")
+PLAY_MODEL = Path(os.environ.get("PLAY_ROOT", "/root/autodl-tmp/BadmintonLab-Game-Play")) / "model_test.pt"
 sys.path.insert(0, str(ROOT / "scripts"))
 
 import export_torchscript as ex  # noqa: E402

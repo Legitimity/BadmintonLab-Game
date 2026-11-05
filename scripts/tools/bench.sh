@@ -1,15 +1,22 @@
 #!/usr/bin/env bash
 # P0 throughput benchmark (design doc 4.4). Run from the repo root on the remote machine.
 # Each setting runs 60 iterations; read steady-state numbers from iterations 20-60 in the logs.
-set -euo pipefail
+# Must own the GPU: do not run anything else concurrently.
+set -uo pipefail
+cd "$(dirname "$0")/../.."
+PY=${PY:-/root/autodl-tmp/env_isaaclab/bin/python}
+export OMNI_KIT_ACCEPT_EULA=YES
+export PYTHONPATH="$PWD/source/badmintonlab_game${PYTHONPATH:+:$PYTHONPATH}"
 TASK=${TASK:-BadmintonLab-Game-Serve}
 LOG=${LOG:-/root/autodl-tmp/logs/bench}
+SIZES=${SIZES:-"2048 4096 8192"}
 mkdir -p "$LOG"
 run() {  # name num_envs
-  python scripts/rsl_rl/train_serve.py --headless --task "$TASK" --num_envs "$2" --max_iterations 60 \
-    --seed 1 --run_name "bench_$1" > "$LOG/$1.log" 2>&1
+  timeout 1800 "$PY" scripts/rsl_rl/train_serve.py --headless --task "$TASK" --num_envs "$2" --max_iterations 60 \
+    --seed 1 --run_name "bench_$1" --swanlab_mode disabled > "$LOG/$1.log" 2>&1
+  echo "$1 exit=$?"
 }
-for n in 2048 4096 8192; do
+for n in $SIZES; do
   run "single_$n" "$n"
   grep -E "Computation|collection|learning|steps/s" "$LOG/single_$n.log" | tail -3 || true
 done
