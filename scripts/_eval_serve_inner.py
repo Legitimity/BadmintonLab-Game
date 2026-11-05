@@ -1,4 +1,10 @@
-"""Inner process for ``eval_serve.py``: runs inside the play package, reads only play's info and state."""
+"""Inner process for ``eval_serve.py``: runs inside the play package, reads only play's info and state.
+
+play resets a resolved court inside ``env.step`` before it returns, and its ``_reset_idx``
+clears ``just_hit``. Reading the robot or ``just_hit`` after ``step`` therefore sees the
+next rally on those courts. We wrap ``_reset_idx`` (bookkeeping only, play's rules are
+untouched) to snapshot the last state of a rally before it is cleared.
+"""
 
 import argparse
 import json
@@ -16,6 +22,7 @@ parser.add_argument("--num_envs", type=int, default=16)
 parser.add_argument("--rallies", type=int, default=200)
 parser.add_argument("--seed", type=int, default=42)
 parser.add_argument("--watchdog_s", type=float, default=60.0)
+parser.add_argument("--fall_height", type=float, default=0.45)
 AppLauncher.add_app_launcher_args(parser)
 args, hydra_args = parser.parse_known_args()
 sys.argv = [sys.argv[0]] + hydra_args
@@ -61,6 +68,25 @@ def main():
     sim_t = 0.0
     total = 0
     robot = u.scene[f"robot_{me}"]
+    origin_z = u.scene.env_origins[:, 2]
+    # Snapshots taken inside play's step, just before a resolved court is reset.
+    pre_z = torch.zeros(n, device=device)
+    pre_hit = torch.zeros(n, dtype=torch.bool, device=device)
+    original_reset = u._reset_idx
+
+    def reset_with_snapshot(env_ids):
+        ids = torch.as_tensor(env_ids, device=device, dtype=torch.long)
+        pre_z[ids] = robot.data.root_pos_w[ids, 2] - origin_z[ids]
+        pre_hit[ids] = u.just_hit[ids, me]
+        return original_reset(env_ids)
+
+    u._reset_idx = reset_with_snapshot
+    fall_t = torch.full((n,), -1.0, device=device)
+    hit_t = torch.full((n,), -1.0, device=device)
+    timing = {"serve": {"len": [], "hit": [], "fall": [], "fall_after_hit": []}, "receive": {"len": [], "hit": [], "fall": [], "fall_after_hit": []}}
+    keys = keys + ("fell_before_hit", "fell_after_hit")
+    for s_ in stats.values():
+        s_.update({k: 0 for k in ("fell_before_hit", "fell_after_hit")})
     wall = time.time()
     while total < args.rallies * n:
         with torch.inference_mode():
@@ -68,12 +94,18 @@ def main():
             a1 = pols[1](obs["player_1"]).to(device=device, dtype=torch.float32)
             obs, info = env.step(torch.cat((a0, a1), dim=-1))
         sim_t += u.step_dt
-        new_hit = u.just_hit[:, me]
+        resolved = info["rally_resolved"]
+        # On resolved courts the live state already belongs to the next rally: use the snapshots.
+        new_hit = torch.where(resolved, pre_hit, u.just_hit[:, me])
+        z = torch.where(resolved, pre_z, robot.data.root_pos_w[:, 2] - origin_z)
+        hit_t = torch.where(new_hit & (hit_t < 0), torch.full_like(hit_t, sim_t), hit_t)
         ours_hit |= new_hit
         ours_hits += new_hit.long()
-        fell |= robot.data.root_pos_w[:, 2] < 0.45
+        now_fell = z < args.fall_height
+        fall_t = torch.where(now_fell & (fall_t < 0), torch.full_like(fall_t, sim_t), fall_t)
+        fell |= now_fell
         stuck = (sim_t - started) > args.watchdog_s
-        done = info["rally_resolved"] | stuck
+        done = resolved | stuck
         if done.any():
             for i in done.nonzero().flatten().tolist():
                 role = "serve" if int(server[i]) == me else "receive"
@@ -84,22 +116,48 @@ def main():
                     s["watchdog"] += 1
                     continue
                 won = int(info["rally_winner"][i]) == me
-                s["height"] += int(info["serve_height_fault"][i] and role == "serve" and not won)
-                s["double"] += int(info["double_hit_fault"][i] and not won)
-                s["legal"] += int(ours_hit[i] and not (info["serve_height_fault"][i] and not won))
-                s["no_hit"] += int(not ours_hit[i])
+                height = bool(info["serve_height_fault"][i]) and role == "serve" and not won
+                double = bool(info["double_hit_fault"][i]) and not won
+                s["height"] += int(height)
+                s["double"] += int(double)
+                # A high serve never registers as a hit, so it is a fault, not a miss.
+                s["legal"] += int(bool(ours_hit[i]) and not double)
+                s["no_hit"] += int(not ours_hit[i] and not height)
                 s["served_in"] += int(won and bool(ours_hit[i]))
                 s["fell"] += int(fell[i])
                 s["hits_ours"] += int(ours_hits[i])
+                t0 = float(started[i])
+                tl = timing[role]
+                tl["len"].append(sim_t - t0)
+                if hit_t[i] >= 0:
+                    tl["hit"].append(float(hit_t[i]) - t0)
+                if fall_t[i] >= 0:
+                    tl["fall"].append(float(fall_t[i]) - t0)
+                    after = hit_t[i] >= 0 and fall_t[i] >= hit_t[i]
+                    s["fell_after_hit"] += int(after)
+                    s["fell_before_hit"] += int(not after)
+                    if after:
+                        tl["fall_after_hit"].append(float(fall_t[i] - hit_t[i]))
             # Rally state of the resolved courts was reset by play; capture the new server.
             server[done] = u.next_hitter[done]
             ours_hit[done] = False
             ours_hits[done] = 0
             fell[done] = False
+            fall_t[done] = -1.0
+            hit_t[done] = -1.0
             started[done] = sim_t
+    def summary(xs):
+        if not xs:
+            return None
+        xs = sorted(xs)
+        q = lambda f: round(xs[min(len(xs) - 1, int(f * len(xs)))], 3)  # noqa: E731
+        return {"n": len(xs), "p10": q(0.1), "p50": q(0.5), "p90": q(0.9)}
+
     for role, s in stats.items():
         r = max(s["rallies"], 1)
         s["rates"] = {k: s[k] / r for k in keys if k != "rallies"}
+        # Seconds from the rally start (hit, fall, rally length) and from our hit to the fall.
+        s["timing_s"] = {k: summary(v) for k, v in timing[role].items()}
     out = dict(obs_dims=dims, num_envs=n, seed=args.seed, wall_s=time.time() - wall, **stats)
     print("[SERVE_EVAL]" + json.dumps(out), flush=True)
     env.close()
