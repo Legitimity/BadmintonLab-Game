@@ -108,5 +108,14 @@ def main():
 if __name__ == "__main__":
     try:
         main()
+    except BaseException:
+        # Kit can hang in close() after an exception; print and exit hard instead.
+        import os
+        import traceback
+
+        traceback.print_exc()
+        sys.stdout.flush()
+        sys.stderr.flush()
+        os._exit(1)
     finally:
         app.close()
