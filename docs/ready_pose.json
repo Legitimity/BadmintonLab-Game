@@ -1,48 +1,48 @@
 {
- "candidate": 0,
+ "candidate": 2,
  "root": {
-  "x": -2.961,
-  "y": 0.916,
-  "yaw": 0.177
+  "x": -3.251,
+  "y": 0.605,
+  "yaw": -0.043
  },
  "joints": {
-  "Waist": 0.308,
-  "Right_Shoulder_Pitch": 1.029,
-  "Right_Shoulder_Roll": 0.167,
-  "Right_Elbow_Pitch": -0.22,
-  "Right_Elbow_Yaw": -0.035
+  "Waist": -0.657,
+  "Right_Shoulder_Pitch": -1.896,
+  "Right_Shoulder_Roll": 1.024,
+  "Right_Elbow_Pitch": -0.085,
+  "Right_Elbow_Yaw": -1.198
  },
  "swing_target": {
-  "Waist": -0.2827679705478119,
-  "Right_Shoulder_Pitch": 1.0367809129991121,
-  "Right_Shoulder_Roll": -1.7664427288290745,
-  "Right_Elbow_Pitch": -2.033257502204865,
-  "Right_Elbow_Yaw": -0.08838857220462915
+  "Waist": -0.6207633555182077,
+  "Right_Shoulder_Pitch": -0.633476213373148,
+  "Right_Shoulder_Roll": -1.5997505543068409,
+  "Right_Elbow_Pitch": -3.2464366346032736,
+  "Right_Elbow_Yaw": -4.045432896433223
  },
- "trigger_ctrl_step": 27.0,
+ "trigger_ctrl_step": 22.0,
  "score": 1.0,
  "speculative": 1.0,
  "contact": {
-  "k": 9,
-  "trig": 108,
+  "k": 27,
+  "trig": 88,
   "xy": [
-   -2.8997685505885125,
-   0.926992660141918
+   -3.188649197161967,
+   0.6022753437136869
   ],
-  "z": 0.6619258844558298,
-  "vn": 5.619932913620534,
-  "el": 53.37491446122809,
-  "hd": -1.3781067229487307,
-  "z0": 0.5977806117119902
+  "z": 0.6952744513282639,
+  "vn": 5.327530407165384,
+  "el": 69.0456791192525,
+  "hd": 5.263252813114898,
+  "z0": 0.7424570599637484
  },
  "checks": {
   "sweet_world": [
-   -2.614,
-   0.001,
-   0.598
+   -2.45,
+   0.049,
+   0.742
   ],
-  "sweet_to_ball_xy": 0.06362193710093746,
-  "racket_top_z": 0.6900178110250537,
+  "sweet_to_ball_xy": 0.11170126447965013,
+  "racket_top_z": 0.8233666072445116,
   "racket_in_drop_column_above_1_10": false
  }
 }

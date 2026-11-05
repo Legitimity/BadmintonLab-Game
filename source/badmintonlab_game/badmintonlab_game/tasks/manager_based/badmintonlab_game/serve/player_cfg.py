@@ -41,14 +41,14 @@ SIDE = 0
 OBS_DIM = 95
 
 # Player-0 trunk pose. Offsets are added to the default root state (0, 0, 0.70).
-READY_ROOT = dict(x=-2.961, y=0.916, yaw=0.177)
+READY_ROOT = dict(x=-3.251, y=0.605, yaw=-0.043)
 # Joint targets at reset; joints not listed keep their default value.
 READY_JOINTS = {
-    "Waist": 0.308,
-    "Right_Shoulder_Pitch": 1.029,
-    "Right_Shoulder_Roll": 0.167,
-    "Right_Elbow_Pitch": -0.22,
-    "Right_Elbow_Yaw": -0.035,
+    "Waist": -0.657,
+    "Right_Shoulder_Pitch": -1.896,
+    "Right_Shoulder_Roll": 1.024,
+    "Right_Elbow_Pitch": -0.085,
+    "Right_Elbow_Yaw": -1.198,
 }
 
 
