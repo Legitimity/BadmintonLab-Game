@@ -16,3 +16,5 @@ gym.register(
         "rsl_rl_cfg_entry_point": f"{__name__}.agents.rsl_rl_ppo_cfg:PPORunnerCfg",
     },
 )
+
+from . import serve  # noqa: E402,F401  registers BadmintonLab-Game-Serve

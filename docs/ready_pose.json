@@ -1,0 +1,48 @@
+{
+ "candidate": 0,
+ "root": {
+  "x": -2.961,
+  "y": 0.916,
+  "yaw": 0.177
+ },
+ "joints": {
+  "Waist": 0.308,
+  "Right_Shoulder_Pitch": 1.029,
+  "Right_Shoulder_Roll": 0.167,
+  "Right_Elbow_Pitch": -0.22,
+  "Right_Elbow_Yaw": -0.035
+ },
+ "swing_target": {
+  "Waist": -0.2827679705478119,
+  "Right_Shoulder_Pitch": 1.0367809129991121,
+  "Right_Shoulder_Roll": -1.7664427288290745,
+  "Right_Elbow_Pitch": -2.033257502204865,
+  "Right_Elbow_Yaw": -0.08838857220462915
+ },
+ "trigger_ctrl_step": 27.0,
+ "score": 1.0,
+ "speculative": 1.0,
+ "contact": {
+  "k": 9,
+  "trig": 108,
+  "xy": [
+   -2.8997685505885125,
+   0.926992660141918
+  ],
+  "z": 0.6619258844558298,
+  "vn": 5.619932913620534,
+  "el": 53.37491446122809,
+  "hd": -1.3781067229487307,
+  "z0": 0.5977806117119902
+ },
+ "checks": {
+  "sweet_world": [
+   -2.614,
+   0.001,
+   0.598
+  ],
+  "sweet_to_ball_xy": 0.06362193710093746,
+  "racket_top_z": 0.6900178110250537,
+  "racket_in_drop_column_above_1_10": false
+ }
+}
