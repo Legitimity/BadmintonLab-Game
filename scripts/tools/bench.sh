@@ -21,7 +21,7 @@ for n in $SIZES; do
   grep -E "Computation|collection|learning|steps/s" "$LOG/single_$n.log" | tail -3 || true
 done
 # Two processes at once: total throughput decides whether to train two seeds in parallel.
-run dual_a 2048 & run dual_b 2048 & wait
+[ -n "${SKIP_DUAL:-}" ] || { run dual_a 2048 & run dual_b 2048 & wait; }
 grep -h -E "PhysX|overflow|capacity" "$LOG"/*.log | sort | uniq -c || true
 nvidia-smi --query-gpu=memory.used,memory.total --format=csv
 free -g; cat /sys/fs/cgroup/memory.max 2>/dev/null || cat /sys/fs/cgroup/memory/memory.limit_in_bytes 2>/dev/null || true

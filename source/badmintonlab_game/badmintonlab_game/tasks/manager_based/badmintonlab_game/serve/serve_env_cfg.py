@@ -100,3 +100,6 @@ class ServeEnvCfg(DualAgentBadmintonEnvCfg):
         super().__post_init__()
         collider = self.scene.net_collider
         collider.spawn = dataclasses.replace(collider.spawn, func=spawn_net_collider_filtered)
+        # 4096/8192 courts overflow the default 5*2^15 contact patches (PhysX asks for ~176k / ~352k).
+        # Training only; play keeps its own setting. Costs a few tens of MB of GPU memory.
+        self.sim.physx.gpu_max_rigid_patch_count = 2**19
