@@ -63,9 +63,24 @@ ROOT = Path(__file__).resolve().parents[2]
 TASK = "BadmintonLab-Game-Serve"
 
 
-def _env(num_envs):
+def _env(num_envs, candidate=None):
     cfg = parse_env_cfg(TASK, num_envs=num_envs)
     cfg.episode_length_s = 4.0
+    if candidate is not None:
+        # Each swing candidate comes with its own trunk pose; override the player_cfg reset for both sides.
+        data = json.loads((ROOT / "docs/swing_search.json").read_text(encoding="utf-8"))
+        cand = data["results"][candidate]
+        trunk = cand["trunk"]
+        for side in range(2):
+            sign = 1.0 if side == 0 else -1.0
+            yaw = trunk["yaw"] + (0.0 if side == 0 else math.pi)
+            root = getattr(cfg.events, f"reset_player_{side}_root")
+            root.params["pose_range"].update(
+                x=(sign * trunk["x"],) * 2, y=(sign * trunk["y"],) * 2, yaw=(yaw, yaw)
+            )
+            joints = getattr(cfg.events, f"reset_player_{side}_joints")
+            joints.params["joint_pos"] = dict(zip(data["joints"], cand["q0"]))
+        print(f"[robot] reset trunk {trunk}", flush=True)
     env = gym.make(TASK, cfg=cfg).unwrapped
     env.reset()
     return env
