@@ -39,6 +39,8 @@ parser.add_argument("--swanlab_project", default="BadmintonLab-Game")
 parser.add_argument("--swanlab_workspace", default="Legitimity")
 parser.add_argument("--swanlab_group", default=None)
 parser.add_argument("--swanlab_name", default=None)
+parser.add_argument("--stage", choices=("A", "B", "C"), default="A", help="Start stage when not resuming.")
+parser.add_argument("--no_curriculum", action="store_true", help="Fixed weights of --stage, no promotion or stop.")
 cli_args.add_rsl_rl_args(parser)
 AppLauncher.add_app_launcher_args(parser)
 args_cli, hydra_args = parser.parse_known_args()
@@ -55,6 +57,7 @@ from isaaclab_tasks.utils.hydra import hydra_task_config  # noqa: E402
 
 import badmintonlab_game.tasks  # noqa: E402,F401
 from badmintonlab_game.tasks.manager_based.badmintonlab_game.serve import player_cfg  # noqa: E402
+from badmintonlab_game.tasks.manager_based.badmintonlab_game.serve.curriculum import ServeCurriculum  # noqa: E402
 from badmintonlab_game.tasks.manager_based.badmintonlab_game.serve.runner import (  # noqa: E402
     ServeRunner,
     find_latest,
@@ -156,6 +159,7 @@ def main(env_cfg, agent_cfg):
         env_cfg.sim.device = args_cli.device
         agent_cfg.device = args_cli.device
     env_cfg.seed = agent_cfg.seed
+    env_cfg.serve_reward.initial_stage = args_cli.stage
 
     log_root = os.path.abspath(os.path.join("logs", "rsl_rl", agent_cfg.experiment_name))
     resume_path = None
@@ -181,6 +185,8 @@ def main(env_cfg, agent_cfg):
             time_budget_hours=args_cli.time_budget_hours,
             resume=resume_path,
             pose_init=not args_cli.no_pose_init,
+            stage=args_cli.stage,
+            curriculum=not args_cli.no_curriculum,
             samples_per_iteration=2 * env_cfg.scene.num_envs * agent_cfg.num_steps_per_env,
         ),
     )
@@ -189,12 +195,14 @@ def main(env_cfg, agent_cfg):
     try:
         env = ServePolicyVecEnvWrapper(env, clip_actions=agent_cfg.clip_actions)
         print(f"[INFO] {env.court_count} courts, {env.num_envs} player samples per step, log {log_dir}")
+        curriculum = None if args_cli.no_curriculum else ServeCurriculum(stage=args_cli.stage)
         runner = ServeRunner(
             env,
             agent_cfg.to_dict(),
             log_dir=log_dir,
             device=agent_cfg.device,
             time_budget_hours=args_cli.time_budget_hours,
+            curriculum=curriculum,
         )
         runner.install_signal_handlers()
         if resume_path:

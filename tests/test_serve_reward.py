@@ -1,0 +1,370 @@
+"""CPU tests for the P3 serve reward and curriculum. No Isaac import.
+
+Loads ``serve_reward.py``, ``rules.py`` and ``curriculum.py`` by file into a fake package,
+so the Isaac-dependent ``serve/__init__`` chain is never imported.
+"""
+
+from __future__ import annotations
+
+import importlib.util
+import math
+import sys
+import types
+from pathlib import Path
+
+import pytest
+import torch
+
+ROOT = Path(__file__).resolve().parents[1]
+SERVE = ROOT / "source/badmintonlab_game/badmintonlab_game/tasks/manager_based/badmintonlab_game/serve"
+DT = 0.02
+
+
+def _load_pkg():
+    pkg = types.ModuleType("_serve")
+    pkg.__path__ = [str(SERVE)]
+    sys.modules["_serve"] = pkg
+    mods = {}
+    for name in ("rules", "serve_reward", "curriculum"):
+        spec = importlib.util.spec_from_file_location(f"_serve.{name}", SERVE / f"{name}.py")
+        mod = importlib.util.module_from_spec(spec)
+        sys.modules[f"_serve.{name}"] = mod
+        spec.loader.exec_module(mod)
+        mods[name] = mod
+    return mods
+
+
+M = _load_pkg()
+R, C, RULES = M["serve_reward"], M["curriculum"], M["rules"]
+J = 23
+
+
+def make(n=4, stage="B", **kw):
+    p = R.ServeRewardParams(initial_stage=stage, **kw)
+    hold = torch.ones(J)
+    hold[:5] = 0.0
+    return R.ServeRewardComputer(n, "cpu", p, torch.zeros(J), hold, DT)
+
+
+def inputs(n=4, **over):
+    d = dict(
+        server=torch.zeros(n, dtype=torch.long),
+        just_hit=torch.zeros(n, 2, dtype=torch.bool),
+        hit_count=torch.zeros(n, 2, dtype=torch.long),
+        just_resolved=torch.zeros(n, dtype=torch.bool),
+        winner=torch.full((n,), -1, dtype=torch.long),
+        height_fault=torch.zeros(n, dtype=torch.bool),
+        double_fault=torch.zeros(n, dtype=torch.bool),
+        net_fault=torch.zeros(n, dtype=torch.bool),
+        out_fault=torch.zeros(n, dtype=torch.bool),
+        shuttle_pos=torch.tensor([[-2.55, 0.0, 1.0]]).repeat(n, 1),
+        shuttle_vel=torch.zeros(n, 3),
+        root_z=torch.full((n, 2), 0.68),
+        joint_pos=torch.zeros(n, 2, J),
+    )
+    d.update(over)
+    return R.StepInputs(**d)
+
+
+def quat_for_normal(elev_deg, head_deg):
+    """Quaternion (w,x,y,z) whose body x axis has the given elevation and heading."""
+    e, h = math.radians(elev_deg), math.radians(head_deg)
+    # yaw h about z, then pitch -e about y.
+    qz = torch.tensor([math.cos(h / 2), 0, 0, math.sin(h / 2)])
+    qy = torch.tensor([math.cos(-e / 2), 0, math.sin(-e / 2), 0])
+    w1, x1, y1, z1 = qz
+    w2, x2, y2, z2 = qy
+    return torch.tensor([w1 * w2 - x1 * x2 - y1 * y2 - z1 * z2, w1 * x2 + x1 * w2 + y1 * z2 - z1 * y2,
+                         w1 * y2 - x1 * z2 + y1 * w2 + z1 * x2, w1 * z2 + x1 * y2 - y1 * x2 + z1 * w2])
+
+
+def ev(c, term, side=0):
+    """Event value in reward units (undo the 1/dt scaling)."""
+    return c.values[term][:, side] * DT
+
+
+# ------------------------------------------------------------------ geometry helpers
+def test_quat_x_axis_and_contact_features():
+    q = quat_for_normal(55, 10)
+    n = R.quat_rotate_x_axis(q[None])[0]
+    assert math.degrees(math.asin(n[2])) == pytest.approx(55, abs=1e-4)
+    assert math.degrees(math.atan2(n[1], n[0])) == pytest.approx(10, abs=1e-4)
+    # The face moving along -n is the striking face: same speed, flipped normal.
+    vn, el, hd = R.contact_features(n[None], (-6.0 * n)[None])
+    assert vn.item() == pytest.approx(6.0, abs=1e-5)
+    assert el.item() == pytest.approx(-55, abs=1e-3)
+    vn, el, hd = R.contact_features(n[None], (6.0 * n)[None])
+    assert el.item() == pytest.approx(55, abs=1e-3) and hd.item() == pytest.approx(10, abs=1e-3)
+
+
+def test_canonical_frame_side1():
+    v = torch.tensor([[1.0, 2.0, 3.0]])
+    assert torch.equal(R.to_canonical(v, torch.tensor([1])), torch.tensor([[-1.0, -2.0, 3.0]]))
+    assert torch.equal(R.to_canonical(v, torch.tensor([0])), v)
+
+
+# ------------------------------------------------------------------ outcome prediction
+def _launch(speed, elev_deg):
+    e = math.radians(elev_deg)
+    return torch.tensor([[-2.55, 0.0, 0.7]]), torch.tensor([[speed * math.cos(e), 0.0, speed * math.sin(e)]])
+
+
+def test_outcome_score_orders_serves():
+    p = R.ServeRewardParams()
+    scores = {}
+    for name, (spd, el) in {"short": (3.0, 50), "good": (10.0, 45), "long": (30.0, 25)}.items():
+        pos, vel = _launch(spd, el)
+        net_z, land = RULES.predict_flight(pos, vel, p.drag_over_mass, dt=p.flight_dt, max_steps=200)
+        scores[name] = R.outcome_score(net_z, land, p).item()
+        scores[name + "_x"] = land[0, 0].item()
+    assert scores["short"] < 0.2, scores
+    assert scores["good"] > 0.6, scores
+    assert 0 < scores["good_x"] < 6.7, scores
+    # A long serve is predicted out and must score much less than a good one (guard added to V3).
+    assert scores["long_x"] > 6.7 and scores["long"] < 0.1, scores
+
+
+def test_outcome_backward_ball_scores_zero():
+    p = R.ServeRewardParams()
+    net_z, land = RULES.predict_flight(torch.tensor([[-2.55, 0, 1.0]]), torch.tensor([[-3.0, 0, 2.0]]), p.drag_over_mass)
+    assert R.outcome_score(net_z, land, p).item() == 0.0
+
+
+def test_flight_dt_matches_fine_integration():
+    p = R.ServeRewardParams()
+    pos, vel = _launch(10.0, 45)
+    nz1, l1 = RULES.predict_flight(pos, vel, p.drag_over_mass, dt=p.flight_dt, max_steps=400)
+    nz2, l2 = RULES.predict_flight(pos, vel, p.drag_over_mass, dt=0.001, max_steps=8000)
+    assert abs(nz1 - nz2).item() < 0.03 and abs(l1 - l2).max().item() < 0.08
+
+
+# ------------------------------------------------------------------ reward computer
+def _hit(c, n, quat, vel, server=None):
+    server = torch.zeros(n, dtype=torch.long) if server is None else server
+    new = torch.zeros(n, 2, dtype=torch.bool)
+    new[torch.arange(n), server] = True
+    c.capture_contact(new, server, quat[None, None].repeat(n, 2, 1), vel[None, None].repeat(n, 2, 1))
+    jh = torch.zeros(n, 2, dtype=torch.bool)
+    jh[torch.arange(n), server] = True
+    hc = jh.long()
+    return jh, hc
+
+
+def test_contact_terms_stage_b():
+    n = 2
+    c = make(n, "B", v_target=6.0)
+    q = quat_for_normal(55, 0)
+    nrm = R.quat_rotate_x_axis(q[None])[0]
+    jh, hc = _hit(c, n, q, 3.0 * nrm)
+    c.end_step(inputs(n, just_hit=jh, hit_count=hc))
+    assert ev(c, "legal_contact").tolist() == pytest.approx([1.0, 1.0])
+    assert ev(c, "swing_speed").tolist() == pytest.approx([1.0, 1.0], abs=1e-4)  # 2.0 * 3/6
+    assert ev(c, "face_quality").tolist() == pytest.approx([1.0, 1.0], abs=1e-4)
+    assert ev(c, "legal_contact", 1).abs().sum() == 0  # receiver gets nothing
+
+
+def test_outcome_one_step_later_and_cap():
+    n = 1
+    c = make(n, "B", positive_cap=5.0)
+    q = quat_for_normal(55, 0)
+    nrm = R.quat_rotate_x_axis(q[None])[0]
+    jh, hc = _hit(c, n, q, 12.0 * nrm)
+    c.end_step(inputs(n, just_hit=jh, hit_count=hc))
+    first = sum(ev(c, k).item() for k in R.POSITIVE_TERMS)
+    assert first == pytest.approx(4.0, abs=1e-3)  # 1 + 2 + 1
+    assert ev(c, "outcome_pred").item() == 0.0
+    pos, vel = _launch(10.0, 45)
+    c.end_step(inputs(n, hit_count=hc, shuttle_pos=pos, shuttle_vel=vel))
+    # outcome_pred would be ~4 * 0.89 (ball 10 m/s at 45 deg), but only 1.0 is left under the cap of 5.
+    assert ev(c, "outcome_pred").item() == pytest.approx(1.0, abs=1e-4)
+    c.end_step(inputs(n, hit_count=hc, shuttle_pos=pos, shuttle_vel=vel))
+    assert ev(c, "outcome_pred").item() == 0.0
+
+
+def test_side1_server_uses_canonical_frame():
+    n = 1
+    c = make(n, "B")
+    server = torch.tensor([1])
+    # World normal pointing to -x with 55 deg elevation is "towards the net" for side 1.
+    q = quat_for_normal(55, 180)
+    nrm = R.quat_rotate_x_axis(q[None])[0]
+    jh, hc = _hit(c, n, q, 6.0 * nrm, server)
+    c.end_step(inputs(n, server=server, just_hit=jh, hit_count=hc))
+    assert ev(c, "face_quality", 1).item() == pytest.approx(1.0, abs=1e-4)
+    pos, vel = _launch(10.0, 45)
+    pos[:, :2] *= -1
+    vel[:, :2] *= -1
+    c.end_step(inputs(n, server=server, hit_count=hc, shuttle_pos=pos, shuttle_vel=vel))
+    assert ev(c, "outcome_pred", 1).item() > 2.0
+
+
+def test_fault_no_outcome_and_result():
+    n = 1
+    c = make(n, "B")
+    q = quat_for_normal(55, 0)
+    jh, hc = _hit(c, n, q, torch.zeros(3))
+    c.end_step(inputs(n, just_hit=jh, hit_count=hc))
+    pos, vel = _launch(10.0, 45)
+    # Double hit next step: rally lost by the server, no outcome reward, fault and result penalties.
+    c.end_step(inputs(n, hit_count=hc, just_resolved=torch.tensor([True]), winner=torch.tensor([1]),
+                      double_fault=torch.tensor([True]), shuttle_pos=pos, shuttle_vel=vel))
+    assert ev(c, "outcome_pred").item() == 0.0
+    assert ev(c, "serve_fault").item() == pytest.approx(-5.0)
+    assert ev(c, "serve_result").item() == pytest.approx(-10.0)
+    stats = c.pop_iteration()
+    assert stats["double"] == 1.0 and stats["legal"] == 0.0 and stats["in"] == 0.0
+
+
+def test_height_fault_is_not_no_hit():
+    n = 1
+    c = make(n, "B")
+    c.end_step(inputs(n, just_resolved=torch.tensor([True]), winner=torch.tensor([1]),
+                      height_fault=torch.tensor([True]), shuttle_pos=torch.tensor([[-2.55, 0, 0.3]])))
+    assert ev(c, "serve_fault").item() == -5.0 and ev(c, "no_hit").item() == 0.0
+    assert c.pop_iteration()["height"] == 1.0
+
+
+def test_no_hit_once_then_landing_loss():
+    n = 1
+    c = make(n, "A")
+    low = torch.tensor([[-2.55, 0, 0.4]])
+    c.end_step(inputs(n, shuttle_pos=low))
+    assert ev(c, "no_hit").item() == -3.0
+    c.end_step(inputs(n, shuttle_pos=low))
+    assert ev(c, "no_hit").item() == 0.0
+    c.end_step(inputs(n, shuttle_pos=low, just_resolved=torch.tensor([True]), winner=torch.tensor([1])))
+    assert ev(c, "serve_result").item() == -10.0
+    r = c.pop_iteration()
+    assert r["no_hit"] == 1.0 and r["rallies"] == 1.0
+
+
+def test_success_on_landing_and_on_return():
+    n = 2
+    c = make(n, "B")
+    q = quat_for_normal(55, 0)
+    jh, hc = _hit(c, n, q, torch.zeros(3))
+    c.end_step(inputs(n, just_hit=jh, hit_count=hc))
+    over = torch.tensor([[1.0, 0, 1.6], [1.0, 0, 1.6]])
+    c.end_step(inputs(n, hit_count=hc, shuttle_pos=over))
+    # env 0: lands in the receiver's court. env 1: the receiver touches it.
+    rj = torch.tensor([[False, False], [False, True]])
+    hc2 = hc.clone()
+    hc2[1, 1] = 1
+    c.end_step(inputs(n, just_hit=rj, hit_count=hc2, just_resolved=torch.tensor([True, False]),
+                      winner=torch.tensor([0, -1]), shuttle_pos=over))
+    assert ev(c, "serve_result").tolist() == pytest.approx([10.0, 10.0])
+    assert c.return_done.tolist() == [False, True]
+    r = c.pop_iteration()
+    assert r["in"] == 1.0 and r["crossed"] == 1.0 and r["return_touch"] == 0.5
+    # The return is not rewarded twice when the rally later resolves.
+    c.end_step(inputs(n, hit_count=hc2, just_resolved=torch.tensor([False, True]), winner=torch.tensor([-1, 1])))
+    assert ev(c, "serve_result").tolist() == [0.0, 0.0]
+
+
+def test_hold_ready_masks_and_server_release():
+    n = 1
+    c = make(n, "A")
+    jp = torch.zeros(n, 2, J)
+    jp[:, :, :5] = 1.0  # swing joints: ignored for the server only
+    c.end_step(inputs(n, joint_pos=jp))
+    assert c.values["hold_ready"][0, 0].item() == 0.0
+    assert c.values["hold_ready"][0, 1].item() < 0.0
+    jp[:, :, 10] = 1.0
+    c.end_step(inputs(n, joint_pos=jp))
+    assert c.values["hold_ready"][0, 0].item() < 0.0
+    hc = torch.tensor([[1, 0]])
+    c.end_step(inputs(n, joint_pos=jp, hit_count=hc))
+    assert c.values["hold_ready"][0, 0].item() == 0.0  # free after the hit
+
+
+def test_fall_once_per_rally_both_sides_and_reset():
+    n = 1
+    c = make(n, "B")
+    rz = torch.tensor([[0.3, 0.3]])
+    c.end_step(inputs(n, root_z=rz))
+    assert ev(c, "fall", 0).item() == -5.0 and ev(c, "fall", 1).item() == -5.0
+    c.end_step(inputs(n, root_z=rz))
+    assert ev(c, "fall", 0).item() == 0.0
+    c.reset(torch.tensor([0]))
+    c.end_step(inputs(n, root_z=rz))
+    assert ev(c, "fall", 0).item() == -5.0
+
+
+def test_reward_manager_scaling():
+    """RewardManager multiplies by weight*dt: events must come out as their table value."""
+    n = 1
+    c = make(n, "B")
+    q = quat_for_normal(55, 0)
+    jh, hc = _hit(c, n, q, torch.zeros(3))
+    c.end_step(inputs(n, just_hit=jh, hit_count=hc))
+    env = types.SimpleNamespace(serve_reward=c)
+    assert (R.serve_term(env, "legal_contact", 0) * 1.0 * DT).item() == pytest.approx(1.0)
+
+
+def test_timeout_counted_as_rally():
+    n = 2
+    c = make(n, "B")
+    c.end_step(inputs(n))
+    c.count_timeouts(torch.tensor([True, False]))
+    r = c.pop_iteration()
+    assert r["rallies"] == 1.0 and r["timeout"] == 1.0
+
+
+def test_unknown_weight_rejected():
+    c = make(1, "A")
+    with pytest.raises(KeyError):
+        c.set_weights({"nope": 1.0})
+
+
+# ------------------------------------------------------------------ curriculum
+def good(stage):
+    return dict(rallies=500.0, fall=0.01, legal=0.95, crossed=0.9, **{"in": 0.95}, fault=0.0) if stage else {}
+
+
+def test_curriculum_min_iters_promotion_blend_and_finish():
+    cur = C.ServeCurriculum(ema_iters=10, blend_iters=4)
+    rates = good(True)
+    for it in range(199):
+        cur.update(it, rates)
+    assert cur.stage == "A"
+    w = cur.update(199, rates)
+    assert cur.stage == "B" and cur.events == ["passed_A"]
+    # First blended iteration is still mostly stage A.
+    assert w["hold_ready"] == pytest.approx(R.STAGE_WEIGHTS["A"]["hold_ready"])
+    for i in range(4):
+        w = cur.update(200 + i, rates)
+    assert w == pytest.approx(R.STAGE_WEIGHTS["B"])
+    for it in range(204, 2000):
+        cur.update(it, rates)
+        if cur.finished:
+            break
+    assert cur.finished and cur.stage == "C" and cur.stop_reason is None
+    assert [h["stage"] for h in cur.history] == ["A", "B", "C"]
+
+
+def test_curriculum_stops_at_max_without_promotion():
+    cur = C.ServeCurriculum(ema_iters=10)
+    bad = dict(rallies=500.0, fall=0.5, legal=0.2)
+    for it in range(1500):
+        cur.update(it, bad)
+    assert cur.stage == "A" and cur.stop_reason == "stage_A_max_iters"
+
+
+def test_curriculum_ignores_thin_iterations_and_roundtrips():
+    cur = C.ServeCurriculum(ema_iters=10)
+    cur.update(0, dict(rallies=10.0, fall=1.0, legal=0.0))
+    assert cur.ema == {}
+    cur.update(1, good(True))
+    d = cur.state_dict()
+    cur2 = C.ServeCurriculum()
+    cur2.load_state_dict(d)
+    assert cur2.state_dict() == d and cur2.stop_reason is None
+
+
+def test_stage_tables_match_v3():
+    a, b, c = (R.STAGE_WEIGHTS[k] for k in "ABC")
+    assert (a["hold_ready"], b["hold_ready"], c["hold_ready"]) == (-0.5, -0.2, -0.1)
+    assert (a["outcome_pred"], b["outcome_pred"], c["outcome_pred"]) == (1.0, 4.0, 4.0)
+    assert set(a) == set(R.TERMS)
+    s = C.DEFAULT_STAGES
+    assert (s["A"].min_iters, s["A"].max_iters, s["B"].max_iters, s["C"].max_iters) == (200, 1500, 4000, 4000)

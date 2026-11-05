@@ -52,9 +52,31 @@ class ServeRunner(OnPolicyRunner):
         signal.signal(signal.SIGINT, handler)
         signal.signal(signal.SIGTERM, handler)
 
+    def _serve_metrics(self, it: int) -> None:
+        """Serve rates of this iteration, the curriculum step and the weight update."""
+        unwrapped = self.env.unwrapped
+        computer = getattr(unwrapped, "serve_reward", None)
+        if computer is None:
+            return
+        rates = computer.pop_iteration()
+        values = {f"Serve/{k}": v for k, v in rates.items()}
+        if self.curriculum is not None:
+            computer.set_weights(self.curriculum.update(it, rates))
+            values.update(self.curriculum.log_values())
+            for event in self.curriculum.events:
+                print(f"[Curriculum] {event} at iteration {it}: {self.curriculum.history[-1] if self.curriculum.history else ''}", flush=True)
+                if self.log_dir is not None:
+                    self.save(os.path.join(self.log_dir, f"model_{event}_{it}.pt"))
+        values.update({f"Serve/weight_{k}": v for k, v in computer.weights.items()})
+        if self.writer is not None:
+            for key, value in values.items():
+                self.writer.add_scalar(key, value, it)
+        print("[Serve] " + " ".join(f"{k}={rates[k]:.3f}" for k in ("legal", "crossed", "in", "fault", "no_hit", "fall", "vn_mean")), flush=True)
+
     def log(self, locs, *args, **kwargs):
         super().log(locs, *args, **kwargs)
         it = locs["it"]
+        self._serve_metrics(it)
         self.samples += self.num_steps_per_env * self.env.num_envs
         now = time.time()
         if self._last_iter_end is not None:
@@ -67,6 +89,10 @@ class ServeRunner(OnPolicyRunner):
             self.save_latest()
         if self._stop_signal:
             self.stop_reason = "signal"
+            raise StopTraining
+        if self.curriculum is not None and self.curriculum.stop_reason:
+            # A stage hit its maximum without passing its gate: stop and investigate (V3 7.3).
+            self.stop_reason = self.curriculum.stop_reason
             raise StopTraining
         if self.time_budget_s is not None and self._over_budget(now):
             self.stop_reason = "time_budget"
@@ -115,6 +141,9 @@ class ServeRunner(OnPolicyRunner):
                     group["lr"] = infos["learning_rate"]
             if self.curriculum is not None and infos.get("curriculum") is not None:
                 self.curriculum.load_state_dict(infos["curriculum"])
+                computer = getattr(self.env.unwrapped, "serve_reward", None)
+                if computer is not None:
+                    computer.set_weights(self.curriculum.weights())
             rng = infos.get("rng")
             if rng:
                 random.setstate(rng["python"])

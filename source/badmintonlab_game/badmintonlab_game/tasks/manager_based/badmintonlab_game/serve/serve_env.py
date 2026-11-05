@@ -13,7 +13,11 @@ import torch
 from isaaclab.utils.math import quat_apply_inverse
 
 from ..dual_agent_env import DualAgentBadmintonEnv
+from . import player_cfg
 from .rules import CourtGeometry, MatchRules
+from .serve_reward import ServeRewardComputer, StepInputs
+
+SWING_JOINTS = ("Waist", "Right_Shoulder_Pitch", "Right_Shoulder_Roll", "Right_Elbow_Pitch", "Right_Elbow_Yaw")
 
 
 class ServeBadmintonEnv(DualAgentBadmintonEnv):
@@ -33,7 +37,17 @@ class ServeBadmintonEnv(DualAgentBadmintonEnv):
         self.serve_height_fault = self.rules.serve_height_fault
         self.double_hit_fault = self.rules.double_hit_fault
         self.extras.setdefault("log", {})
-        self._stats = {k: torch.zeros(1, device=self.device) for k in _STAT_KEYS}
+        self.serve_reward = self._make_serve_reward()
+
+    def _make_serve_reward(self) -> ServeRewardComputer:
+        robot = self._robots[0]
+        q_ready = robot.data.default_joint_pos[0].clone()
+        ids, _ = robot.find_joints(list(player_cfg.READY_JOINTS), preserve_order=True)
+        q_ready[ids] = torch.tensor(list(player_cfg.READY_JOINTS.values()), device=q_ready.device)
+        hold = torch.ones_like(q_ready)
+        swing, _ = robot.find_joints(list(SWING_JOINTS), preserve_order=True)
+        hold[swing] = 0.0
+        return ServeRewardComputer(self.num_envs, self.device, self.cfg.serve_reward, q_ready, hold, self.step_dt)
 
     def step(self, action: torch.Tensor):
         self.action_manager.process_action(action.to(self.device))
@@ -57,9 +71,11 @@ class ServeBadmintonEnv(DualAgentBadmintonEnv):
         self._finish_control_step()
         self._update_approach_state()
         self._update_return_history()
+        self.serve_reward.end_step(self._step_inputs())
         self.reset_buf = self.termination_manager.compute()
         self.reset_terminated = self.termination_manager.terminated
         self.reset_time_outs = self.termination_manager.time_outs
+        self.serve_reward.count_timeouts(self.reset_time_outs)
         reward_0 = self.reward_manager.compute(dt=self.step_dt)
         reward_1 = self.player_1_reward_manager.compute(dt=self.step_dt)
         self.approach_reward_event.zero_()
@@ -102,7 +118,14 @@ class ServeBadmintonEnv(DualAgentBadmintonEnv):
             ],
             dim=1,
         )
+        before = self.rules.just_hit.clone()
         self.rules.update_hits(contacts, local_z)
+        new_hits = self.rules.just_hit & ~before
+        if bool(new_hits.any()):
+            sid = self._sweet_spot_ids
+            quat = torch.stack([r.data.body_link_quat_w[:, i] for r, i in zip(self._robots, sid)], dim=1)
+            vel = torch.stack([r.data.body_link_lin_vel_w[:, i] for r, i in zip(self._robots, sid)], dim=1)
+            self.serve_reward.capture_contact(new_hits, self.initial_hitter, quat, vel)
         self.rules.update_rally_result(pos_w, self.scene.env_origins)
 
     def _finish_control_step(self) -> None:
@@ -127,26 +150,24 @@ class ServeBadmintonEnv(DualAgentBadmintonEnv):
                 self.return_opportunity_slot[ready_ids, side] = slots
                 self.return_opportunity_pending[ready_ids, side] = True
                 self.return_hit_pending[ready_ids, side] = False
-        self._accumulate_stats()
 
-    def _accumulate_stats(self) -> None:
-        done = self.rally_just_resolved
-        if not done.any():
-            return
-        server = self.initial_hitter[done]
-        winner = self.rally_winner[done]
-        hit = self.hit_count[done].gather(1, server.unsqueeze(1)).squeeze(1) > 0
-        height = self.serve_height_fault[done]
-        double = self.double_hit_fault[done]
-        s = self._stats
-        s["rallies"] += done.sum()
-        s["legal"] += hit.sum()
-        s["height"] += height.sum()
-        s["double"] += double.sum()
-        s["no_hit"] += (~hit & ~height).sum()
-        s["in"] += (hit & (winner == server) & ~double & ~height).sum()
-        s["net"] += self.net_fault[done].sum()
-        s["out"] += self.out_fault[done].sum()
+    def _step_inputs(self) -> StepInputs:
+        origins = self.scene.env_origins
+        return StepInputs(
+            server=self.initial_hitter,
+            just_hit=self.just_hit,
+            hit_count=self.hit_count,
+            just_resolved=self.rally_just_resolved,
+            winner=self.rally_winner,
+            height_fault=self.serve_height_fault,
+            double_fault=self.double_hit_fault,
+            net_fault=self.net_fault,
+            out_fault=self.out_fault,
+            shuttle_pos=self._shuttle.data.root_pos_w - origins,
+            shuttle_vel=self._shuttle.data.root_lin_vel_w,
+            root_z=torch.stack([r.data.root_pos_w[:, 2] - origins[:, 2] for r in self._robots], dim=1),
+            joint_pos=torch.stack([r.data.joint_pos for r in self._robots], dim=1),
+        )
 
     def _apply_shuttle_forces(self) -> None:
         velocity = self._shuttle.data.root_lin_vel_w
@@ -161,17 +182,5 @@ class ServeBadmintonEnv(DualAgentBadmintonEnv):
         super()._reset_idx(env_ids)
         ids = torch.as_tensor(env_ids, device=self.device, dtype=torch.long)
         self.rules.reset(ids, self.initial_hitter[ids], self._shuttle.data.root_pos_w[ids])
-        self._log_stats()
-
-    def _log_stats(self) -> None:
-        s = self._stats
-        n = max(float(s["rallies"].item()), 1.0)
-        for key in _STAT_KEYS:
-            if key != "rallies":
-                self.extras["log"][f"Metrics/Serve/{key}_rate"] = float(s[key].item()) / n
-        if s["rallies"].item() >= 256:
-            for key in _STAT_KEYS:
-                s[key].zero_()
-
-
-_STAT_KEYS = ("rallies", "legal", "height", "double", "no_hit", "in", "net", "out")
+        # The runner logs the serve metrics once per iteration (see runner.ServeRunner.log).
+        self.serve_reward.reset(ids)

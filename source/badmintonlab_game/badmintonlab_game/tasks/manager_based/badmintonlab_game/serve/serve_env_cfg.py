@@ -6,6 +6,8 @@ import dataclasses
 
 import isaaclab.sim as sim_utils
 from isaaclab.managers import EventTermCfg as EventTerm
+from isaaclab.managers import RewardTermCfg as RewTerm
+from isaaclab.managers import TerminationTermCfg as DoneTerm
 from isaaclab.managers import ObservationGroupCfg as ObsGroup
 from isaaclab.managers import ObservationTermCfg as ObsTerm
 from isaaclab.managers import SceneEntityCfg
@@ -13,8 +15,14 @@ from isaaclab.utils import configclass
 
 from .. import mdp
 from ..badminton_scene_cfg import _COURT_CFG
-from ..dual_agent_env_cfg import DualAgentBadmintonEnvCfg, Player0RewardsCfg, Player1RewardsCfg
+from ..dual_agent_env_cfg import (
+    DualAgentBadmintonEnvCfg,
+    DualTerminationsCfg,
+    Player0RewardsCfg,
+    Player1RewardsCfg,
+)
 from . import player_cfg
+from .serve_reward import TERMS, ServeRewardParams, serve_return_done, serve_term
 
 
 @sim_utils.clone
@@ -89,11 +97,38 @@ class ServeEventsCfg(player_cfg.make_events_cfg(1), player_cfg.make_events_cfg(0
 
 
 @configclass
+class ServeRewardParamsCfg(ServeRewardParams):
+    """Hydra-overridable copy, e.g. ``env.serve_reward.v_target=5.5 env.serve_reward.x_target=2.5``."""
+
+
+def _serve_reward_terms(base: type, side: int) -> type:
+    """Default costs kept; shaping and result terms replaced by the serve terms (V3 7.2)."""
+    terms = {f"serve_{t}": RewTerm(func=serve_term, weight=1.0, params={"term": t, "side": side}) for t in TERMS}
+    body = {"__annotations__": {k: RewTerm for k in terms}, **terms}
+    # The 10 m/s target of outgoing_quality conflicts with the plan; approach and rally_result are replaced.
+    for name in ("interval_approach", "outgoing_quality", "rally_result"):
+        body["__annotations__"][name] = RewTerm
+        body[name] = None
+    return configclass(type(f"ServeRewards{side}Cfg", (base,), body))
+
+
+ServeRewards0Cfg = _serve_reward_terms(Player0RewardsCfg, 0)
+ServeRewards1Cfg = _serve_reward_terms(Player1RewardsCfg, 1)
+
+
+@configclass
+class ServeTerminationsCfg(DualTerminationsCfg):
+    serve_returned = DoneTerm(func=serve_return_done)
+
+
+@configclass
 class ServeEnvCfg(DualAgentBadmintonEnvCfg):
     observations: ServeObservationsCfg = ServeObservationsCfg()
     events: ServeEventsCfg = ServeEventsCfg()
-    rewards: Player0RewardsCfg = Player0RewardsCfg()
-    player_1_rewards: Player1RewardsCfg = Player1RewardsCfg()
+    rewards: ServeRewards0Cfg = ServeRewards0Cfg()
+    player_1_rewards: ServeRewards1Cfg = ServeRewards1Cfg()
+    terminations: ServeTerminationsCfg = ServeTerminationsCfg()
+    serve_reward: ServeRewardParamsCfg = ServeRewardParamsCfg()
     max_serve_height = 1.15
 
     def __post_init__(self):
@@ -103,3 +138,8 @@ class ServeEnvCfg(DualAgentBadmintonEnvCfg):
         # 4096/8192 courts overflow the default 5*2^15 contact patches (PhysX asks for ~176k / ~352k).
         # Training only; play keeps its own setting. Costs a few tens of MB of GPU memory.
         self.sim.physx.gpu_max_rigid_patch_count = 2**19
+        # The reward module must use the drag law of _apply_shuttle_forces.
+        self.serve_reward.drag_over_mass = self.shuttle_drag_k / self.shuttle_mass
+        self.serve_reward.gravity = -float(self.gravity_z)
+        if not self.serve_reward.end_on_return:
+            self.terminations.serve_returned = None

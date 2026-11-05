@@ -104,3 +104,21 @@ docs/
 ```
 
 若你已在 `feat/serve-v3` 写了 P0 代码，请比较两者：`rules.py` 已有差分测试保障，建议以它为准。冲突之处以 Isaac 实测结果为准。
+
+## 7. P3 发球奖励与课程（2026-11-05 晚补充，仅 CPU 验证）
+
+新增 `serve/serve_reward.py`、`serve/curriculum.py`、`tests/test_serve_reward.py`，并改动 `serve_env.py`、`serve_env_cfg.py`、`runner.py`、`train_serve.py`。
+
+- **奖励**：按 V3 第 7.2 节的 9 项实现，阶段权重表 `STAGE_WEIGHTS` 与 V3 一致。父类的 `interval_approach`、`outgoing_quality`、`rally_result` 已关闭，其余默认成本保留。所有服务项在 `ServeRewardComputer` 中统一算好，奖励项权重固定为 1.0，便于课程改权重和做每回合正奖励上限（8）。
+- **触球特征**：在击球所在的物理子步读取 `racket_sweet_spot` 的姿态和速度；拍面法线取 sweet spot 的 x 轴，按运动方向选择击球面。**这个轴向是根据 URDF 推断的，冒烟时请打印 `Serve/el_mean` 并与 `racket_impact_test.py` 的结果对照。**
+- **相对 V3 的改动**：
+  1. `outcome_pred` 增加长球项 `x_long_safe=6.4`，否则预测出底线的发球仍能拿到约一半分数。
+  2. 发球方击球后不再计 `hold_ready`。
+  3. M1 中接球方触到合法发球即结束回合，并记为发球成功（`end_on_return=True`）；P5 要改成 False。
+  4. 超时回合计入统计（`Serve/timeout`），用来发现球停在机器人身上的情况。
+- **课程**：200 轮 EMA、晋级后 300 轮线性过渡；某阶段到最多轮数仍未晋级就停止（`stop_reason=stage_X_max_iters`），不会自动晋级。通过 C 阶段门槛后标记 `finished` 并继续训练。每次晋级都会保存 `model_passed_X_<it>.pt`。课程状态写在 checkpoint 中，`--auto_resume` 后会从原阶段继续。
+- **P1 实测后必须修改的参数**（hydra 覆盖）：`env.serve_reward.v_target`（默认 6.0）、`elevation_target_deg`（55）、`x_target`（3.0）。阻力模型下，0.7 m 处以 45° 出球，10 m/s 落点约网后 2.0 m，8 m/s 约 1.2 m，7 m/s 下网。
+- **新命令行参数**：`--stage A|B|C`（起始阶段）、`--no_curriculum`（固定权重，用于调试）。
+- **日志**：每轮写 `Serve/*`（legal、crossed、in、fault、no_hit、fall、timeout、vn_mean、el_mean、outcome_mean 等）、`Curriculum/*` 和 `Serve/weight_*`，终端每轮打印一行 `[Serve]`。
+
+**冒烟检查**：用 4 个球场跑 2 轮，确认 Isaac 能接受 `None` 奖励项和新的终止项，且 `[Serve]` 行里的数值有限。然后用 2048 个球场在 A 阶段跑约 100 轮，看 `legal` 是否随准备姿势上升、`timeout` 是否接近 0。
