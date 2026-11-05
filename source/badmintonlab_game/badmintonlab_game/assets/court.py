@@ -60,6 +60,15 @@ class BadmintonCourtCfg:
     use_singles_bounds: bool = True
     """If ``True``, ``is_out_of_bounds`` uses the singles sideline by default."""
 
+    net_filter_on_collision_geometry: bool = False
+    """If ``True``, author the (net, shuttle) filtered pair on the collider geometry
+    before cloning, as the ``play`` evaluation package does. ``False`` keeps the
+    original behaviour of the default training task (filter on the Xform)."""
+
+    inclusive_net_crossing: bool = False
+    """If ``True``, ``crossed_net`` also counts a step that ends exactly on the net
+    plane, matching ``play``. ``False`` keeps the strict sign-change test."""
+
     prim_sub_path: str = "Court"
 
     @property
@@ -136,6 +145,35 @@ def spawn_net_collider(
     shuttle_path = prim.GetPath().GetParentPath().AppendChild("Shuttle")
     filtered_pairs = UsdPhysics.FilteredPairsAPI.Apply(prim)
     filtered_pairs.CreateFilteredPairsRel().AddTarget(shuttle_path)
+    return prim
+
+
+@sim_utils.clone
+def spawn_net_collider_on_geometry(
+    prim_path: str,
+    cfg,
+    translation: tuple[float, float, float] | None = None,
+    orientation: tuple[float, float, float, float] | None = None,
+    **kwargs,
+):
+    """``play``-aligned net collider: filter the shuttle on the actual collision prim.
+
+    The cuboid's Xform is not a collider: ``CollisionAPI`` lives on its geometry
+    descendant. Filtering is authored there, before the outer clone decorator
+    replicates the source environment.
+    """
+    from isaaclab.sim.spawners.shapes.shapes import spawn_cuboid
+    from pxr import UsdPhysics
+
+    prim = spawn_cuboid(prim_path, cfg, translation=translation, orientation=orientation, **kwargs)
+    shuttle_path = prim.GetPath().GetParentPath().AppendChild("Shuttle")
+    pending = [prim]
+    while pending:
+        child = pending.pop()
+        if child.HasAPI(UsdPhysics.CollisionAPI):
+            filtered_pairs = UsdPhysics.FilteredPairsAPI.Apply(child)
+            filtered_pairs.CreateFilteredPairsRel().AddTarget(shuttle_path)
+        pending.extend(child.GetChildren())
     return prim
 
 
@@ -261,7 +299,7 @@ def create_badminton_court(cfg: BadmintonCourtCfg, env_ns: str = "{ENV_REGEX_NS}
     net_collider.spawn = dataclasses.replace(
         net_collider.spawn,
         visible=False,
-        func=spawn_net_collider,
+        func=spawn_net_collider_on_geometry if cfg.net_filter_on_collision_geometry else spawn_net_collider,
     )
     assets["net_collider"] = net_collider
 
@@ -321,7 +359,10 @@ def crossed_net(prev_shuttle_pos: torch.Tensor, curr_shuttle_pos: torch.Tensor, 
     """True for envs whose shuttle crossed the net plane within the net width."""
     dx_prev = prev_shuttle_pos[:, 0] - cfg.net_x
     dx_curr = curr_shuttle_pos[:, 0] - cfg.net_x
-    crossed_x = (dx_prev * dx_curr) < 0.0
+    if cfg.inclusive_net_crossing:
+        crossed_x = ((dx_prev < 0.0) & (dx_curr >= 0.0)) | ((dx_prev > 0.0) & (dx_curr <= 0.0))
+    else:
+        crossed_x = (dx_prev * dx_curr) < 0.0
 
     dx = curr_shuttle_pos[:, 0] - prev_shuttle_pos[:, 0]
     safe_dx = torch.where(dx.abs() > 1e-8, dx, torch.ones_like(dx))

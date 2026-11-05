@@ -16,3 +16,13 @@ gym.register(
         "rsl_rl_cfg_entry_point": f"{__name__}.agents.rsl_rl_ppo_cfg:PPORunnerCfg",
     },
 )
+
+gym.register(
+    id="BadmintonLab-Game-Serve",
+    entry_point=f"{__name__}.serve_env:ServeBadmintonEnv",
+    disable_env_checker=True,
+    kwargs={
+        "env_cfg_entry_point": f"{__name__}.serve_env_cfg:ServeBadmintonEnvCfg",
+        "rsl_rl_cfg_entry_point": f"{__name__}.agents.rsl_rl_ppo_cfg:ServePPORunnerCfg",
+    },
+)

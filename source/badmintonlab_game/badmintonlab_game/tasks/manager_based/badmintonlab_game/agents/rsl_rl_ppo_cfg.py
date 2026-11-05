@@ -36,3 +36,10 @@ class PPORunnerCfg(RslRlOnPolicyRunnerCfg):
         desired_kl=0.01,
         max_grad_norm=1.0,
     )
+
+
+@configclass
+class ServePPORunnerCfg(PPORunnerCfg):
+    """Runner for ``BadmintonLab-Game-Serve``; P0 keeps the default PPO settings."""
+
+    experiment_name = "badmintonlab_game_serve"
