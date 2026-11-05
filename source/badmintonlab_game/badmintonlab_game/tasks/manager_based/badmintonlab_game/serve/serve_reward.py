@@ -64,11 +64,13 @@ STAT_KEYS = (
 class ServeRewardParams:
     """Targets and shaping constants. Override with hydra, e.g. ``env.serve_reward.v_target=5.5``."""
 
-    v_target: float = 6.0  # P1: racket normal speed at contact, m/s
+    # P1 (2026-11-06): plate restitution ~0.65; pass-through ~0% at 2 m/s and ~54% at 10 m/s relative
+    # normal speed. 4.5 m/s racket speed gives ~9-10 m/s out at 55 deg; faster swings mostly add tunnelling.
+    v_target: float = 4.5  # racket normal speed at contact, m/s
     elevation_target_deg: float = 55.0  # P1: face normal elevation at contact
     heading_target_deg: float = 0.0
     face_sigma_deg: float = 20.0
-    x_target: float = 3.0  # P1: landing x behind the net, m
+    x_target: float = 2.0  # landing x behind the net, m; ~10 m/s out lands about 2 m deep
     x_sigma: float = 2.0
     net_height: float = 1.55  # conservative: the edge height
     net_margin: float = 0.20

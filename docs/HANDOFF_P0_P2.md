@@ -122,3 +122,9 @@ docs/
 - **日志**：每轮写 `Serve/*`（legal、crossed、in、fault、no_hit、fall、timeout、vn_mean、el_mean、outcome_mean 等）、`Curriculum/*` 和 `Serve/weight_*`，终端每轮打印一行 `[Serve]`。
 
 **冒烟检查**：用 4 个球场跑 2 轮，确认 Isaac 能接受 `None` 奖励项和新的终止项，且 `[Serve]` 行里的数值有限。然后用 2048 个球场在 A 阶段跑约 100 轮，看 `legal` 是否随准备姿势上升、`timeout` 是否接近 0。
+
+### 7.1 按 P1 实测调整的默认值（2026-11-06）
+
+- `v_target` 从 6.0 改为 **4.5 m/s**：plate 测试显示相对法向速度 10 m/s 时约 54% 穿过拍面，恢复系数约 0.65。4.5 m/s 的球拍速度在 55° 时可打出约 9–10 m/s，足够过网，再快主要是增加穿模。`swing_speed` 在达到目标后封顶，不鼓励更快。
+- `x_target` 从 3.0 改为 **2.0 m**：约 10 m/s 出球落点在网后约 2 m。
+- 若 P1 的穿模—速度曲线在 4–6 m/s 区间另有拐点，按实测再调 `env.serve_reward.v_target`。
