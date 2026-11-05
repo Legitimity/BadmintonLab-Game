@@ -365,7 +365,7 @@ def robot_mode(env, candidate, rallies, max_ctrl_steps):
 
 
 def main():
-    env = _env(args_cli.num_envs)
+    env = _env(args_cli.num_envs, args_cli.candidate if args_cli.mode == "robot" else None)
     out = ROOT / (args_cli.out or f"docs/IMPACT_{args_cli.mode}")
     if args_cli.mode == "plate":
         result = plate_mode(
