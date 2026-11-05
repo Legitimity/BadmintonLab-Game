@@ -44,7 +44,12 @@ args_cli.headless = True
 app_launcher = AppLauncher(args_cli)
 simulation_app = app_launcher.app
 
+import faulthandler  # noqa: E402
 import math  # noqa: E402
+import os  # noqa: E402
+
+if os.environ.get("TRACE_EVERY"):
+    faulthandler.dump_traceback_later(float(os.environ["TRACE_EVERY"]), repeat=True)
 
 import gymnasium as gym  # noqa: E402
 import torch  # noqa: E402
@@ -229,7 +234,46 @@ def robot_mode(env, candidate, rallies, max_ctrl_steps):
     target = rallies * n
     env.reset()
     shuttle = env.scene["shuttle"]
-    for _ in range(max_ctrl_steps):
+
+    # Per-physics-step diagnosis of serves without a registered hit: did the shuttle
+    # pass through the face near the sweet spot (tunnelling) or simply miss?
+    robots = (env.scene["robot_0"], env.scene["robot_1"])
+    sweet_ids = tuple(r.find_bodies("racket_sweet_spot")[0][0] for r in robots)
+    ex_axis = torch.tensor([1.0, 0.0, 0.0], device=dev).expand(n, 3)
+    diag = dict(
+        prev=torch.zeros(n, device=dev),
+        valid=torch.zeros(n, dtype=torch.bool, device=dev),
+        tunnel=torch.zeros(n, dtype=torch.bool, device=dev),
+        min_dist=torch.full((n,), float("inf"), device=dev),
+    )
+    original_substep = env._physics_substep
+
+    def substep_with_diag():
+        original_substep()
+        srv0 = (env.initial_hitter == 0).unsqueeze(-1)
+        p = torch.where(srv0, robots[0].data.body_pos_w[:, sweet_ids[0]], robots[1].data.body_pos_w[:, sweet_ids[1]])
+        q = torch.where(srv0, robots[0].data.body_quat_w[:, sweet_ids[0]], robots[1].data.body_quat_w[:, sweet_ids[1]])
+        nrm = quat_apply(q, ex_axis)
+        rel = shuttle.data.root_pos_w - p
+        side = (rel * nrm).sum(-1)
+        lateral = torch.linalg.norm(rel - side.unsqueeze(-1) * nrm, dim=-1)
+        no_hit_yet = env.rules.last_hitter < 0
+        diag["tunnel"] |= diag["valid"] & (diag["prev"] * side < 0) & (lateral < 0.08) & no_hit_yet
+        diag["min_dist"] = torch.where(
+            no_hit_yet, torch.minimum(diag["min_dist"], torch.linalg.norm(rel, dim=-1)), diag["min_dist"]
+        )
+        diag["prev"] = side
+        diag["valid"] = torch.ones_like(diag["valid"])
+
+    env._physics_substep = substep_with_diag
+    c.update(no_hit_tunnel=0)
+    miss_dist = []
+    import time
+
+    t_wall = time.time()
+    for it in range(max_ctrl_steps):
+        if it % 100 == 0:
+            print(f"[robot] ctrl step {it}: rallies {c['rallies']}/{target}, wall {time.time() - t_wall:.0f}s", flush=True)
         server = env.initial_hitter.clone()
         swinging = (step >= trig).unsqueeze(-1)
         actions = []
@@ -273,6 +317,14 @@ def robot_mode(env, candidate, rallies, max_ctrl_steps):
                 per_side[side]["served_in"] += int((ok & m).sum())
             pos = ex["shuttle_local_pos"][done]
             landing_x += (pos[ok, 0] * sign[ok]).tolist()
+            nohit = ~served & ~height
+            tun = diag["tunnel"][done]
+            c["no_hit_tunnel"] += int((nohit & tun).sum())
+            miss_dist += diag["min_dist"][done][nohit & ~tun].tolist()
+        reset = term_ | trunc
+        diag["valid"] &= ~reset
+        diag["tunnel"] &= ~reset
+        diag["min_dist"][reset] = float("inf")
         step[term_ | trunc] = 0
         if c["rallies"] >= target:
             break
@@ -288,7 +340,12 @@ def robot_mode(env, candidate, rallies, max_ctrl_steps):
         landing_x=dict(mean=float(lx.mean()) if len(lx) else None, min=float(lx.min()) if len(lx) else None, max=float(lx.max()) if len(lx) else None),
         hit_height=dict(mean=float(torch.tensor(hit_z).mean()) if hit_z else None, n=len(hit_z)),
         post_hit_speed=dict(mean=float(torch.tensor(hit_speed).mean()) if hit_speed else None),
+        no_hit_without_tunnel_min_dist=dict(
+            n=len(miss_dist),
+            quantiles=torch.tensor(miss_dist).quantile(torch.tensor([0.1, 0.5, 0.9])).tolist() if miss_dist else None,
+        ),
     )
+    env._physics_substep = original_substep
     return summary
 
 
@@ -328,5 +385,13 @@ def main():
 if __name__ == "__main__":
     try:
         main()
+    except BaseException:
+        # Print before close(): Kit can hang in close() after an exception and swallow it.
+        import traceback
+
+        traceback.print_exc()
+        sys.stdout.flush()
+        sys.stderr.flush()
+        os._exit(1)
     finally:
         simulation_app.close()
