@@ -48,6 +48,11 @@ parser.add_argument(
     help="Override curriculum max iterations per stage, e.g. 'A=4500,B=12000,C=12000'.",
 )
 parser.add_argument(
+    "--curriculum_iters",
+    default=None,
+    help="Override curriculum iteration counts, e.g. 'ema=100,blend=150,min=150' (min: every stage's minimum).",
+)
+parser.add_argument(
     "--mini_batches",
     type=int,
     default=None,
@@ -259,6 +264,20 @@ def main(env_cfg, agent_cfg):
                 spec = curriculum.stages[key.strip()]
                 curriculum.stages[key.strip()] = dataclasses.replace(spec, max_iters=int(value))
             print("[INFO] stage max iters: " + ", ".join(f"{k}={v.max_iters}" for k, v in curriculum.stages.items()))
+        if curriculum is not None and args_cli.curriculum_iters:
+            for item in args_cli.curriculum_iters.split(","):
+                key, value = (s.strip() for s in item.split("="))
+                if key == "ema":
+                    curriculum.ema_iters = int(value)
+                elif key == "blend":
+                    curriculum.blend_iters = int(value)
+                elif key == "min":
+                    for k, spec in curriculum.stages.items():
+                        curriculum.stages[k] = dataclasses.replace(spec, min_iters=int(value))
+                else:
+                    raise ValueError(f"--curriculum_iters: unknown key {key!r}")
+            print(f"[INFO] curriculum iters: ema={curriculum.ema_iters} blend={curriculum.blend_iters} "
+                  + "min=" + ",".join(f"{k}={v.min_iters}" for k, v in curriculum.stages.items()))
         runner = ServeRunner(
             env,
             agent_cfg.to_dict(),
