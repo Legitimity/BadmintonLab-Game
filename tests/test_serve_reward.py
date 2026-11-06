@@ -468,3 +468,21 @@ def test_stage_tables():
     s = C.DEFAULT_STAGES
     assert (s["A"].min_iters, s["A"].max_iters, s["B"].max_iters, s["C"].max_iters) == (200, 1500, 4000, 4000)
     assert s["C"].gate["in"] == (">=", 0.85)
+
+
+def test_tunnel_detects_racket_sweeping_past_a_slow_shuttle():
+    """The racket moves 5 cm through a shuttle that moves 1 cm: only the previous face plane sees it."""
+    n = 1
+    c = make(n, "B")
+    server = torch.zeros(n, dtype=torch.long)
+    q = quat_for_normal(90, 0)[None, None].repeat(n, 2, 1)  # face normal +z
+    no_contact = torch.zeros(n, 2, dtype=torch.bool)
+    shuttle_prev = torch.tensor([[-2.55, 0.0, 1.000]])
+    shuttle_now = torch.tensor([[-2.55, 0.0, 0.990]])
+    racket_prev = torch.tensor([[-2.55, 0.0, 0.980]])[:, None].repeat(n, 2, 1)  # 2 cm below the shuttle
+    racket_now = torch.tensor([[-2.55, 0.0, 1.030]])[:, None].repeat(n, 2, 1)  # 4 cm above it
+    c.capture_tunnel(server, racket_prev, q, shuttle_prev, shuttle_prev, no_contact)
+    c.capture_tunnel(server, racket_now, q, shuttle_now, shuttle_prev, no_contact)
+    c.end_step(inputs(n))
+    assert ev(c, "tunnel").tolist() == pytest.approx([-2.0])
+

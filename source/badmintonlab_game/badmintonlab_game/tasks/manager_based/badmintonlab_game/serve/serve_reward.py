@@ -232,6 +232,11 @@ class ServeRewardComputer:
         self.tunnel_given = z(n, dt=torch.bool)
         self.tunnel_now = z(n, dt=torch.bool)  # set at physics rate by capture_tunnel
         self.c_vc = z(n)
+        # Server face plane at the previous physics step: a racket sweeping past a slow shuttle crosses it
+        # mostly by its own motion, which a plane taken only at the current step does not see.
+        self.prev_face_pos = z(n, 3)
+        self.prev_face_n = z(n, 3)
+        self.prev_face_valid = z(n, dt=torch.bool)
         self.iteration = torch.zeros(len(STAT_KEYS), device=device)
         self.set_incoming_speed(4.3)
 
@@ -285,7 +290,14 @@ class ServeRewardComputer:
         q = racket_quat_w.gather(1, idx[..., None].expand(-1, 1, 4)).squeeze(1)
         n = quat_rotate_x_axis(q)
         d_now = ((shuttle_pos_w - pos) * n).sum(-1)
-        d_prev = ((prev_shuttle_pos_w - pos) * n).sum(-1)
+        # Previous shuttle position against the previous face plane (falls back to the current plane on
+        # the first physics step of a rally).
+        d_prev_same = ((prev_shuttle_pos_w - pos) * n).sum(-1)
+        d_prev_old = ((prev_shuttle_pos_w - self.prev_face_pos) * self.prev_face_n).sum(-1)
+        d_prev = torch.where(self.prev_face_valid, d_prev_old, d_prev_same)
+        self.prev_face_pos.copy_(pos)
+        self.prev_face_n.copy_(n)
+        self.prev_face_valid.fill_(True)
         rel = shuttle_pos_w - pos
         in_plane = torch.linalg.norm(rel - d_now.unsqueeze(-1) * n, dim=-1)
         crossed = (torch.sign(d_now) != torch.sign(d_prev)) & (d_prev != 0)
@@ -449,6 +461,7 @@ class ServeRewardComputer:
                   self.fell_server, self.return_done, self.fall_done, self.tunnel_given, self.tunnel_now):
             t[env_ids] = False
         self.fall_given[env_ids] = False
+        self.prev_face_valid[env_ids] = False
         self.pos_acc[env_ids] = 0.0
         self.c_vn[env_ids] = 0.0
         self.c_vc[env_ids] = 0.0

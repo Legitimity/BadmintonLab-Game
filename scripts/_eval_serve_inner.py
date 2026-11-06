@@ -23,6 +23,7 @@ parser.add_argument("--rallies", type=int, default=200)
 parser.add_argument("--seed", type=int, default=42)
 parser.add_argument("--watchdog_s", type=float, default=60.0)
 parser.add_argument("--fall_height", type=float, default=0.45)
+parser.add_argument("--upright_cos", type=float, default=0.70, help="Fall also if projected-gravity z > -this (trunk tilt > ~45 deg), as in training. Use -1 for height only.")
 AppLauncher.add_app_launcher_args(parser)
 args, hydra_args = parser.parse_known_args()
 sys.argv = [sys.argv[0]] + hydra_args
@@ -72,12 +73,14 @@ def main():
     # Snapshots taken inside play's step, just before a resolved court is reset.
     pre_z = torch.zeros(n, device=device)
     pre_hit = torch.zeros(n, dtype=torch.bool, device=device)
+    pre_gz = torch.full((n,), -1.0, device=device)
     original_reset = u._reset_idx
 
     def reset_with_snapshot(env_ids):
         ids = torch.as_tensor(env_ids, device=device, dtype=torch.long)
         pre_z[ids] = robot.data.root_pos_w[ids, 2] - origin_z[ids]
         pre_hit[ids] = u.just_hit[ids, me]
+        pre_gz[ids] = robot.data.projected_gravity_b[ids, 2]
         return original_reset(env_ids)
 
     u._reset_idx = reset_with_snapshot
@@ -101,7 +104,8 @@ def main():
         hit_t = torch.where(new_hit & (hit_t < 0), torch.full_like(hit_t, sim_t), hit_t)
         ours_hit |= new_hit
         ours_hits += new_hit.long()
-        now_fell = z < args.fall_height
+        gz = torch.where(resolved, pre_gz, robot.data.projected_gravity_b[:, 2])
+        now_fell = (z < args.fall_height) | (gz > -args.upright_cos)
         fall_t = torch.where(now_fell & (fall_t < 0), torch.full_like(fall_t, sim_t), fall_t)
         fell |= now_fell
         stuck = (sim_t - started) > args.watchdog_s
