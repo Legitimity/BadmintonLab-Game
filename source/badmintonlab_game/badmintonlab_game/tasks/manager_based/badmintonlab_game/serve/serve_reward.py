@@ -261,9 +261,11 @@ class ServeRewardComputer:
         q = racket_quat_w.gather(1, idx[..., None].expand(-1, 1, 4)).squeeze(1)
         v = racket_vel_w.gather(1, idx[..., None].expand(-1, 1, 3)).squeeze(1)
         n_c, v_c = to_canonical(quat_rotate_x_axis(q), server), to_canonical(v, server)
-        vn, el, hd = contact_features(n_c, v_c)
+        vn, _, _ = contact_features(n_c, v_c)
         vin = self._incoming(n_c.shape[0])
-        vc, _, _ = contact_features(n_c, v_c, vin)
+        # The striking face is decided by the racket velocity relative to the falling shuttle: with a
+        # slow racket the racket velocity alone gives a random face and a near-zero mean elevation.
+        vc, el, hd = contact_features(n_c, v_c, vin)
         self.c_vc = torch.where(hit, vc, self.c_vc)
         self.c_vn = torch.where(hit, vn, self.c_vn)
         self.c_el = torch.where(hit, el, self.c_el)

@@ -486,3 +486,18 @@ def test_tunnel_detects_racket_sweeping_past_a_slow_shuttle():
     c.end_step(inputs(n))
     assert ev(c, "tunnel").tolist() == pytest.approx([-2.0])
 
+
+def test_contact_elevation_uses_face_met_by_falling_shuttle():
+    """A static racket under a falling shuttle: the upper face (positive elevation) is the striking face."""
+    n = 1
+    c = make(n, "B")
+    server = torch.zeros(n, dtype=torch.long)
+    new = torch.tensor([[True, False]])
+    for normal_sign in (1.0, -1.0):
+        c.reset(torch.arange(n))
+        q = quat_for_normal(50, 0)
+        if normal_sign < 0:
+            q = quat_for_normal(-50, 180)
+        c.capture_contact(new, server, q[None, None].repeat(n, 2, 1), torch.zeros(n, 2, 3))
+        assert float(c.c_el[0]) == pytest.approx(50.0, abs=0.5)
+
