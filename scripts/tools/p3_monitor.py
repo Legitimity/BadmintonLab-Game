@@ -9,15 +9,21 @@ Every ``--poll_s`` seconds:
       - plan 5: stage B >= 1500 iterations with EMA in < 0.40
       - plan 5: train ``Serve/in`` vs play standing-in (zero opponent) differ by > 10 points
       - plan 5: train fall < 0.10 while play fell_after_hit > 0.30
-      - early stop: M1 met in play (both sides, both opponents)
+      - early stop: M1 met in play (both sides, both opponents; thresholds --m1_*)
       - early stop: 1000 iterations after stage C passed
+    Early stops wait for ``--min_stop_iter`` (branch comparison window); safety stops do not.
   * alerts only (no action): plan 4.6 symptoms, el_mean, the plan's original stage maxima (relaxed on
-    request), and ``in`` stuck below the gate (the trigger for considering CaT).
+    request), ``in`` stuck below the gate (the trigger for considering CaT), P3_LAUNCH_F2 5.
+
+Every play evaluation (eval_serve.py plus the ``git checkout`` of play's cfgs) holds ``<play>/.eval.lock``
+(``fcntl.flock``): eval_serve.py rewrites play's player cfgs, so two evaluations must never overlap.
+``--eval_export DIR`` evaluates one export under the same lock and exits.
 
 Exits when ``--done_file`` exists and nothing is left to evaluate.
 """
 
 import argparse
+import fcntl
 import glob
 import json
 import os
@@ -37,12 +43,23 @@ ap.add_argument("--run_name", default="p3_s1")
 ap.add_argument("--out", default="/root/autodl-tmp/logs/v3l/p3")
 ap.add_argument("--eval_every", type=int, default=1000)
 ap.add_argument("--eval_rallies", type=int, default=30, help="Per court; 16 courts -> >= 200 serve rallies.")
-ap.add_argument("--done_file", required=True)
+ap.add_argument("--done_file", default=None, help="Required unless --eval_export.")
 ap.add_argument("--poll_s", type=float, default=120.0)
 ap.add_argument("--after_c_iters", type=int, default=1000)
 ap.add_argument("--orig_max", default="A=1500,B=4000,C=4000", help="Plan maxima, alert only.")
 ap.add_argument("--no_stop", action="store_true", help="Alerts only (testing).")
 ap.add_argument("--test_stop_at", type=int, default=None, help="Testing: request a stop once this iteration is logged.")
+ap.add_argument("--gate_in", default="B=0.60,C=0.75", help="Curriculum 'in' gates (same as train_serve --stage_gates).")
+ap.add_argument("--m1_in", type=float, default=0.75, help="M1: play served_in_standing (served_in if missing).")
+ap.add_argument("--m1_fault", type=float, default=0.02, help="M1: play height + double faults.")
+ap.add_argument("--m1_fell_after_hit", type=float, default=0.05, help="M1: play fell_after_hit.")
+ap.add_argument("--min_stop_iter", type=int, default=0,
+                help="No early stop (M1, after stage C) before this iteration; safety stops are not affected.")
+ap.add_argument("--eval_export", default=None,
+                help="One-shot: evaluate this export (both sides x --eval_opps) under the play lock, then exit.")
+ap.add_argument("--eval_opps", default="zero,model_test")
+ap.add_argument("--eval_num_envs", type=int, default=16)
+ap.add_argument("--eval_tag", default="oneshot")
 args = ap.parse_args()
 
 os.makedirs(args.out, exist_ok=True)
@@ -53,9 +70,13 @@ PLAY_CFGS = [
     "source/badmintonlab_game/badmintonlab_game/tasks/manager_based/badmintonlab_game/player0_cfg.py",
     "source/badmintonlab_game/badmintonlab_game/tasks/manager_based/badmintonlab_game/player1_cfg.py",
 ]
+LOCK = os.path.join(args.play, ".eval.lock")
 ORIG_MAX = {k: int(v) for k, v in (x.split("=") for x in args.orig_max.split(","))}
 STAGES = ("A", "B", "C")
-GATE_IN = {"A": None, "B": 0.60, "C": 0.85}
+GATE_IN = {"A": None, "B": None, "C": None}
+GATE_IN.update({k.strip(): float(v) for k, v in (x.split("=") for x in args.gate_in.split(","))})
+M1_TEXT = (f"M1 = all 4 play evals (2 sides x zero/model_test): served_in_standing >= {args.m1_in}, "
+           f"height+double <= {args.m1_fault}, fell_after_hit <= {args.m1_fell_after_hit}")
 
 
 def say(msg):
@@ -123,9 +144,13 @@ def alert(st, key, msg):
     return True
 
 
-def request_stop(st, reason):
+def request_stop(st, reason, early=False, last=None):
+    """``early``: M1 / after stage C; deferred while ``last < --min_stop_iter`` (returns False)."""
     if st.get("stop"):
-        return
+        return True
+    if early and (last is None or last < args.min_stop_iter):
+        alert(st, f"defer_{reason.split(':')[0]}", f"early stop deferred to it {args.min_stop_iter} (--min_stop_iter): {reason}")
+        return False
     st["stop"] = reason
     save_state(st)
     if args.no_stop:
@@ -141,6 +166,7 @@ def request_stop(st, reason):
         except (ProcessLookupError, ValueError):
             pass
     say(f"STOP requested: {reason} (SIGTERM to {pids or 'no running trainer'}; checkpoint written after the current iteration)")
+    return True
 
 
 def check_training(st, sc, finished_it):
@@ -148,6 +174,7 @@ def check_training(st, sc, finished_it):
         return
     stage_s, iters_s = sc["Curriculum/stage"], sc.get("Curriculum/iters_in_stage", {})
     last = max(stage_s)
+    st["last_iter"] = last
     stage = STAGES[int(round(stage_s[last]))]
     iters = int(iters_s.get(last, 0))
     ema = {k.split("_", 1)[1]: v[last] for k, v in sc.items() if k.startswith("Curriculum/ema_") and last in v}
@@ -159,15 +186,25 @@ def check_training(st, sc, finished_it):
         cur = int(round(stage_s[s]))
         if prev is not None and cur != prev:
             alert(st, f"promo_{cur}_{s}", f"curriculum promoted to stage {STAGES[cur]} at iteration {s}")
+            if STAGES[cur] == "C":
+                st["c_start"] = s
         prev = cur
     if finished_it is not None:
         alert(st, f"finished_{finished_it}", f"stage C passed at iteration {finished_it}; early stop at +{args.after_c_iters} or M1")
         if last >= finished_it + args.after_c_iters:
-            request_stop(st, f"early stop: {last - finished_it} iterations after stage C passed (it {last})")
+            request_stop(st, f"early stop: {last - finished_it} iterations after stage C passed (it {last})", early=True, last=last)
+    if st.get("m1_at") is not None:
+        request_stop(st, f"early stop: M1 reached in play at it={st['m1_at']}", early=True, last=last)
     # -- automatic stop (plan 5)
     if stage == "B" and iters >= 1500 and ema.get("in", 1.0) < 0.40:
         request_stop(st, f"plan 5: stage B {iters} iterations, EMA in={ema['in']:.3f} < 0.40; EMA {short}")
     # -- alerts only
+    if stage == "C" and iters >= 2000 and ema.get("in", 1.0) < 0.72:
+        alert(st, "C2000_in72", f"F2 5: stage C {iters} iterations, EMA in={ema['in']:.3f} < 0.72 (gate {GATE_IN['C']} may be "
+              f"too high; suggested C.in=0.72, needs user confirmation). EMA {short}")
+    if iters >= 300 and ema.get("tunnel", 0) > 0.30 and ema.get("vc_mean", 0) > 8.0:
+        alert(st, f"F2tunnel_{stage}", f"F2 5: EMA tunnel={ema['tunnel']:.3f} > 0.30 and vc_mean={ema['vc_mean']:.2f} > 8 m/s "
+              f"(swing too fast; stop and check, needs user confirmation)")
     if iters >= ORIG_MAX[stage]:
         alert(st, f"origmax_{stage}", f"stage {stage} passed the plan's max {ORIG_MAX[stage]} iterations without promotion "
               f"(relaxed on request, continuing). EMA {short}")
@@ -204,22 +241,10 @@ def evaluate(st, k, ckpt, sc):
         say(f"export {k} failed (exit {r.returncode}), see {log}")
         return
     rows = []
-    env = dict(os.environ, OMNI_KIT_ACCEPT_EULA="YES")
     for opp in ("zero", "model_test"):
         for side in (0, 1):
             out = os.path.join(args.out, f"eval_{k}_{opp}_side{side}.json")
-            try:
-                r = subprocess.run(
-                    [args.isaac_python, "scripts/eval_serve.py", "--play_root", args.play, "--ours", exp, "--opponent", opp,
-                     "--side", str(side), "--num_envs", "16", "--rallies", str(args.eval_rallies),
-                     "--python", args.isaac_python, "--out", out],
-                    cwd=args.repo, env=env, stdout=open(out.replace(".json", ".log"), "w"), stderr=subprocess.STDOUT,
-                    timeout=3600,
-                )
-                code = r.returncode
-            except subprocess.TimeoutExpired:
-                code = "timeout"
-            subprocess.run(["git", "-C", args.play, "checkout", "--", *PLAY_CFGS])
+            code = play_eval(exp, opp, side, out, args.eval_rallies, 16)
             if code != 0 or not os.path.exists(out):
                 say(f"  eval {k} {opp} side{side} failed ({code})")
                 continue
@@ -242,17 +267,76 @@ def evaluate(st, k, ckpt, sc):
         request_stop(st, f"plan 5: it={k} train in {train_in:.3f} vs play standing-in {ev_in:.3f} differ by > 10 points")
     if train_fall is not None and train_fall < 0.10 and ev_fah > 0.30:
         request_stop(st, f"plan 5: it={k} train fall {train_fall:.3f} < 0.10 but play fell_after_hit {ev_fah:.3f} > 0.30")
-    m1 = len(rows) == 4 and all(
-        r[3]["legal"] >= 0.90 and r[3]["served_in"] >= 0.85 and r[3]["height"] + r[3]["double"] <= 0.02
-        and r[3]["fell_after_hit"] <= 0.10 for r in rows)
-    if m1:
-        alert(st, f"M1_{k}", f"M1 reached in play at it={k} (export {exp})")
-        request_stop(st, f"early stop: M1 reached in play at it={k}")
+    if train_fall is not None and train_fall < 0.01 and ev_fah > 0.05:
+        alert(st, f"fah_{k}", f"F2 5: it={k} play fell_after_hit {ev_fah:.3f} > 0.05 while train fall {train_fall:.3f} < 0.01 "
+              f"(falls after the rally ends? check play rally length / post_stand)")
+    if len(rows) == 4 and all(m1_ok(r[3]) for r in rows):
+        alert(st, f"M1_{k}", f"M1 reached in play at it={k} (export {exp}); {M1_TEXT}")
+        if st.get("m1_at") is None:
+            st["m1_at"] = k
+        request_stop(st, f"early stop: M1 reached in play at it={k}", early=True, last=st.get("last_iter"))
+
+
+def m1_ok(rt):
+    return (rt.get("served_in_standing", rt["served_in"]) >= args.m1_in and rt["height"] + rt["double"] <= args.m1_fault
+            and rt["fell_after_hit"] <= args.m1_fell_after_hit)
+
+
+def play_eval(exp, opp, side, out, rallies, num_envs):
+    """One eval_serve.py run plus the restore of play's cfgs, under the play lock. Returns the exit code."""
+    env = dict(os.environ, OMNI_KIT_ACCEPT_EULA="YES")
+    with open(LOCK, "a") as lock:
+        t0 = time.time()
+        fcntl.flock(lock, fcntl.LOCK_EX)
+        waited = time.time() - t0
+        if waited > 5:
+            say(f"  play lock acquired after {waited:.0f} s")
+        try:
+            try:
+                r = subprocess.run(
+                    [args.isaac_python, "scripts/eval_serve.py", "--play_root", args.play, "--ours", exp, "--opponent", opp,
+                     "--side", str(side), "--num_envs", str(num_envs), "--rallies", str(rallies),
+                     "--python", args.isaac_python, "--out", out],
+                    cwd=args.repo, env=env, stdout=open(out.replace(".json", ".log"), "w"), stderr=subprocess.STDOUT,
+                    timeout=3600,
+                )
+                code = r.returncode
+            except subprocess.TimeoutExpired:
+                code = "timeout"
+            subprocess.run(["git", "-C", args.play, "checkout", "--", *PLAY_CFGS])
+        finally:
+            fcntl.flock(lock, fcntl.LOCK_UN)
+    return code
+
+
+def oneshot():
+    """``--eval_export``: both sides x ``--eval_opps``; results to ``<out>/<tag>_<opp>_side<s>.json``."""
+    rows = {}
+    for opp in args.eval_opps.split(","):
+        for side in (0, 1):
+            out = os.path.join(args.out, f"{args.eval_tag}_{opp}_side{side}.json")
+            t = time.time()
+            code = play_eval(args.eval_export, opp, side, out, args.eval_rallies, args.eval_num_envs)
+            if code != 0 or not os.path.exists(out):
+                say(f"  oneshot {args.eval_tag} {opp} side{side} failed ({code})")
+                continue
+            s = json.load(open(out))["serve"]
+            rows[f"{opp}_side{side}"] = dict(rallies=s["rallies"], **s["rates"])
+            say(f"  oneshot {args.eval_tag} opp={opp} side={side} n={s['rallies']} "
+                f"in_standing={s['rates'].get('served_in_standing', float('nan')):.3f} {time.time() - t:.0f} s")
+    print(json.dumps(rows))
 
 
 def main():
+    if args.eval_export:
+        oneshot()
+        return
+    if not args.done_file:
+        ap.error("--done_file is required")
     st = load_state()
-    say(f"monitor start: run_name={args.run_name}, eval every {args.eval_every}, auto stop {'off' if args.no_stop else 'on'}")
+    say(f"monitor start: run_name={args.run_name}, eval every {args.eval_every}, auto stop {'off' if args.no_stop else 'on'}, "
+        f"min_stop_iter {args.min_stop_iter}, gate in {GATE_IN}")
+    say(M1_TEXT)
     while True:
         done = os.path.exists(args.done_file)
         todo = []
@@ -267,7 +351,16 @@ def main():
                 if not done and st.get("stop") and k != max(ck):
                     continue  # a stop is pending: only the final checkpoint matters now
                 say(f"evaluate checkpoint {k}: {ck[k]}")
-                evaluate(st, k, ck[k], sc)
+                try:
+                    evaluate(st, k, ck[k], sc)
+                except Exception as e:  # noqa: BLE001
+                    fails = st.setdefault("eval_fails", {})
+                    fails[str(k)] = fails.get(str(k), 0) + 1
+                    say(f"evaluate {k} error ({fails[str(k)]}/3): {e!r}")
+                    if fails[str(k)] < 3:
+                        save_state(st)
+                        continue
+                    say(f"evaluate {k}: giving up after 3 errors")
                 st["evaluated"].append(k)
                 save_state(st)
             save_state(st)

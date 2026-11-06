@@ -12,10 +12,11 @@ the checkpoint ``infos`` so a resumed run continues in the same stage.
 
 from __future__ import annotations
 
+import dataclasses
 import math
 from dataclasses import dataclass, field
 
-from .serve_reward import STAGE_WEIGHTS, TERMS
+from .serve_reward import STAGE_WEIGHTS, TERMS, ServeRewardParams
 
 ORDER = ("A", "B", "C")
 
@@ -29,13 +30,43 @@ class StageSpec:
 
 
 # Gates revised after P0-P2 (REPORT_P0_P2_RESULTS): the scripted swing of the default pose (candidate 2)
-# reaches 47% in with 34% pass-through, and the contact model caps a single-contact serve at about
-# 85-90% in under realistic noise. "fall" is the server's fall rate (root < 0.45 m or trunk > 45 deg).
+# reaches 47% in with 34% pass-through. "fall" is the server's fall rate (root < 0.45 m or trunk > 45 deg).
+# Revised after E1b (P3_LAUNCH_F2 2.1): "no_hit" stays at ~0.23, nearly all pass-through, which caps "in" at
+# about 0.77 for the current swing: C "in" 0.85 -> 0.75; B "crossed" 0.70 -> 0.65 (E1b ends at 0.68-0.70).
 DEFAULT_STAGES = {
     "A": StageSpec(200, 1500, {"legal": (">=", 0.70), "fall": ("<=", 0.10)}),
-    "B": StageSpec(300, 4000, {"crossed": (">=", 0.70), "in": (">=", 0.60), "fall": ("<=", 0.10)}),
-    "C": StageSpec(300, 4000, {"in": (">=", 0.85), "fault": ("<=", 0.02), "fall": ("<=", 0.05)}),
+    "B": StageSpec(300, 4000, {"crossed": (">=", 0.65), "in": (">=", 0.60), "fall": ("<=", 0.10)}),
+    "C": StageSpec(300, 4000, {"in": (">=", 0.75), "fault": ("<=", 0.02), "fall": ("<=", 0.05)}),
 }
+
+
+def apply_stage_gates(stages: dict, spec: str) -> dict:
+    """``"C.in=0.75,B.crossed=0.65"``: new thresholds, the comparison direction stays. Returns a new dict."""
+    out = dict(stages)
+    for item in spec.split(","):
+        key, value = (s.strip() for s in item.split("="))
+        stage, metric = key.split(".")
+        if metric not in out[stage].gate:
+            raise KeyError(f"stage {stage} has no gate on {metric!r}")
+        gate = dict(out[stage].gate)
+        gate[metric] = (gate[metric][0], float(value))
+        out[stage] = dataclasses.replace(out[stage], gate=gate)
+    return out
+
+
+def parse_stage_params(spec: str) -> dict:
+    """``"C.v_close_max=7.0"`` -> ``{"C": {"v_close_max": 7.0}}``. Only float fields of ServeRewardParams."""
+    allowed = {f.name for f in dataclasses.fields(ServeRewardParams) if f.type in ("float", float)}
+    out: dict = {}
+    for item in spec.split(","):
+        key, value = (s.strip() for s in item.split("="))
+        stage, name = key.split(".")
+        if stage not in ORDER:
+            raise KeyError(f"unknown stage {stage!r}")
+        if name not in allowed:
+            raise KeyError(f"{name!r} is not a float field of ServeRewardParams")
+        out.setdefault(stage, {})[name] = float(value)
+    return out
 
 
 @dataclass
@@ -54,6 +85,10 @@ class ServeCurriculum:
     stop_reason: str | None = None
     history: list = field(default_factory=list)
     events: list = field(default_factory=list)
+    # Run configuration, not checkpoint state: per-stage overrides of reward parameters, and the values of
+    # the overridden fields outside those stages.
+    stage_params: dict = field(default_factory=dict)
+    base_params: dict = field(default_factory=dict)
 
     @property
     def alpha(self) -> float:
@@ -66,6 +101,17 @@ class ServeCurriculum:
         f = self.blend_left / float(self.blend_iters)
         # A term missing in blend_from (checkpoint from before the term existed) blends from its target.
         return {k: f * self.blend_from.get(k, target[k]) + (1.0 - f) * target[k] for k in TERMS}
+
+    def params(self) -> dict:
+        """Current values of the overridden reward parameters, blended like the weights after a promotion."""
+        i = ORDER.index(self.stage)
+        f = self.blend_left / float(self.blend_iters) if self.blend_left > 0 and i > 0 else 0.0
+        out = {}
+        for name, base in self.base_params.items():
+            target = self.stage_params.get(self.stage, {}).get(name, base)
+            before = self.stage_params.get(ORDER[i - 1], {}).get(name, base) if i > 0 else target
+            out[name] = f * before + (1.0 - f) * target
+        return out
 
     def update(self, iteration: int, rates: dict) -> dict:
         """Returns the weights for the next iteration. Sets ``stop_reason`` to stop the run.

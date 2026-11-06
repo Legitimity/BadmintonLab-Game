@@ -472,7 +472,111 @@ def test_stage_tables():
     assert set(a) == set(b) == set(c) == set(R.TERMS)
     s = C.DEFAULT_STAGES
     assert (s["A"].min_iters, s["A"].max_iters, s["B"].max_iters, s["C"].max_iters) == (200, 1500, 4000, 4000)
-    assert s["C"].gate["in"] == (">=", 0.85)
+    # P3_LAUNCH_F2 2.1: lowered for the pass-through cap (in <= ~0.77).
+    assert s["B"].gate["crossed"] == (">=", 0.65)
+    assert s["C"].gate["in"] == (">=", 0.75)
+
+
+def test_apply_stage_gates_changes_thresholds_only():
+    s = C.apply_stage_gates(C.DEFAULT_STAGES, "C.in=0.72, B.crossed=0.6,C.fall=0.04")
+    assert s["C"].gate["in"] == (">=", 0.72) and s["C"].gate["fall"] == ("<=", 0.04)
+    assert s["B"].gate["crossed"] == (">=", 0.6) and s["B"].gate["in"] == (">=", 0.60)
+    assert C.DEFAULT_STAGES["C"].gate["in"] == (">=", 0.75)  # the defaults are not mutated
+    assert s["C"].min_iters == C.DEFAULT_STAGES["C"].min_iters
+    with pytest.raises(KeyError):
+        C.apply_stage_gates(C.DEFAULT_STAGES, "C.legal=0.9")
+    cur = C.ServeCurriculum(stage="C")
+    cur.stages = s
+    assert cur.stages["C"].gate["in"][1] == 0.72
+
+
+def test_parse_stage_params_and_unknown_fields():
+    assert C.parse_stage_params("C.v_close_max=7.0") == {"C": {"v_close_max": 7.0}}
+    assert C.parse_stage_params("B.v_close_max=7.5,C.v_close_max=7") == {"B": {"v_close_max": 7.5}, "C": {"v_close_max": 7.0}}
+    for bad in ("C.no_such_field=1", "D.v_close_max=7", "C.initial_stage=1"):
+        with pytest.raises(KeyError):
+            C.parse_stage_params(bad)
+
+
+def _param_curriculum(**kw):
+    cur = C.ServeCurriculum(ema_iters=10, blend_iters=4, **kw)
+    cur.stage_params = C.parse_stage_params("C.v_close_max=7.0")
+    cur.base_params = {"v_close_max": 8.0}
+    return cur
+
+
+def test_stage_param_switches_on_entering_c_with_blend():
+    cur = _param_curriculum(stage="B")
+    assert cur.params() == {"v_close_max": 8.0}
+    rates = good(True)
+    for it in range(400):
+        cur.update(it, rates)
+        if cur.stage == "C":
+            break
+    assert cur.stage == "C" and cur.blend_left == 4 and cur.events == ["passed_B"]
+    # The promotion iteration itself is still the old value (f = 1), then linear like the weights.
+    seen = [cur.params()["v_close_max"]]
+    for i in range(4):
+        cur.update(it + 1 + i, rates)
+        seen.append(cur.params()["v_close_max"])
+    assert seen == pytest.approx([8.0, 7.75, 7.5, 7.25, 7.0])
+    f = cur.blend_left / cur.blend_iters
+    assert f == 0.0
+    # Weights and parameter blend with the same factor.
+    cur2 = _param_curriculum(stage="B")
+    for it in range(400):
+        cur2.update(it, rates)
+        if cur2.stage == "C":
+            break
+    cur2.update(it + 1, rates)
+    f = cur2.blend_left / cur2.blend_iters
+    assert cur2.params()["v_close_max"] == pytest.approx(f * 8.0 + (1 - f) * 7.0)
+    w = cur2.weights()
+    k = "hold_ready"
+    assert w[k] == pytest.approx(f * R.STAGE_WEIGHTS["B"][k] + (1 - f) * R.STAGE_WEIGHTS["C"][k])
+
+
+def test_stage_param_resume_in_c_is_immediate():
+    src = _param_curriculum(stage="B")
+    for it in range(400):
+        src.update(it, good(True))
+        if src.stage == "C":
+            break
+    d = src.state_dict()
+    assert d["stage"] == "C" and d["blend_left"] == 4  # what model_passed_B_<it>.pt holds
+    # Resumed mid-blend: continues the blend.
+    cur = _param_curriculum()
+    cur.load_state_dict(dict(d, blend_left=2))
+    assert cur.params()["v_close_max"] == pytest.approx(7.5)
+    # Resumed after the blend: the C value at once; without --stage_param the base value.
+    cur = _param_curriculum()
+    cur.load_state_dict(dict(d, blend_left=0))
+    assert cur.params() == {"v_close_max": 7.0}
+    plain = C.ServeCurriculum()
+    plain.load_state_dict(dict(d, blend_left=0))
+    assert plain.params() == {}
+
+
+def _load_runner():
+    spec = importlib.util.spec_from_file_location("_serve.runner", SERVE / "runner.py")
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    return mod
+
+
+def test_runner_puts_stage_params_into_the_reward_computer():
+    pytest.importorskip("rsl_rl")
+    runner_mod = _load_runner()
+    comp = make(2, "C")
+    assert comp.p.v_close_max == 8.0
+    cur = _param_curriculum()
+    cur.load_state_dict(dict(_param_curriculum(stage="C").state_dict(), blend_left=0))
+    fake = types.SimpleNamespace(env=types.SimpleNamespace(unwrapped=types.SimpleNamespace(serve_reward=comp)),
+                                 curriculum=cur)
+    runner_mod.ServeRunner.apply_stage_params(fake)
+    assert comp.p.v_close_max == 7.0
+    # The swing score follows the new value: 7.5 m/s is now over the limit.
+    assert float(R.swing_score(torch.tensor([7.5]), comp.p)) < 1.0
 
 
 def test_tunnel_detects_racket_sweeping_past_a_slow_shuttle():

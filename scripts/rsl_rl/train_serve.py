@@ -53,6 +53,23 @@ parser.add_argument(
     help="Override curriculum iteration counts, e.g. 'ema=100,blend=150,min=150' (min: every stage's minimum).",
 )
 parser.add_argument(
+    "--stage_gates",
+    default=None,
+    help="Override gate thresholds (not their direction), e.g. 'C.in=0.75,B.crossed=0.65'.",
+)
+parser.add_argument(
+    "--stage_param",
+    default=None,
+    help="Reward parameter while in a stage, e.g. 'C.v_close_max=7.0'; float fields of ServeRewardParams only. "
+    "Blended like the weights after a promotion. Needs the curriculum.",
+)
+parser.add_argument(
+    "--stop_after_stage",
+    choices=("A", "B", "C"),
+    default=None,
+    help="Stop once this stage's gate passed (model_passed_<stage>_<it>.pt holds the next stage's state).",
+)
+parser.add_argument(
     "--stage_weights",
     default=None,
     help="Override stage reward weights, e.g. 'B.launch_dir=3,C.launch_dir=1'. Reward parameters go through "
@@ -80,7 +97,11 @@ from isaaclab_tasks.utils.hydra import hydra_task_config  # noqa: E402
 
 import badmintonlab_game.tasks  # noqa: E402,F401
 from badmintonlab_game.tasks.manager_based.badmintonlab_game.serve import player_cfg  # noqa: E402
-from badmintonlab_game.tasks.manager_based.badmintonlab_game.serve.curriculum import ServeCurriculum  # noqa: E402
+from badmintonlab_game.tasks.manager_based.badmintonlab_game.serve.curriculum import (  # noqa: E402
+    ServeCurriculum,
+    apply_stage_gates,
+    parse_stage_params,
+)
 from badmintonlab_game.tasks.manager_based.badmintonlab_game.serve.serve_reward import STAGE_WEIGHTS  # noqa: E402
 from badmintonlab_game.tasks.manager_based.badmintonlab_game.serve.runner import (  # noqa: E402
     ServeRunner,
@@ -266,6 +287,10 @@ def main(env_cfg, agent_cfg):
             curriculum=not args_cli.no_curriculum,
             curriculum_iters=args_cli.curriculum_iters,
             stage_weights=args_cli.stage_weights,
+            stage_max_iters=args_cli.stage_max_iters,
+            stage_gates=args_cli.stage_gates,
+            stage_param=args_cli.stage_param,
+            stop_after_stage=args_cli.stop_after_stage,
             serve_reward={k: v for k, v in vars(env_cfg.serve_reward).items() if isinstance(v, (int, float, str, bool))},
             num_mini_batches=agent_cfg.algorithm.num_mini_batches,
             samples_per_iteration=2 * env_cfg.scene.num_envs * agent_cfg.num_steps_per_env,
@@ -297,6 +322,18 @@ def main(env_cfg, agent_cfg):
                     raise ValueError(f"--curriculum_iters: unknown key {key!r}")
             print(f"[INFO] curriculum iters: ema={curriculum.ema_iters} blend={curriculum.blend_iters} "
                   + "min=" + ",".join(f"{k}={v.min_iters}" for k, v in curriculum.stages.items()))
+        if curriculum is not None and args_cli.stage_gates:
+            curriculum.stages = apply_stage_gates(curriculum.stages, args_cli.stage_gates)
+        if curriculum is not None:
+            print("[INFO] stage gates: " + "; ".join(
+                f"{k}: " + ",".join(f"{m}{op}{thr}" for m, (op, thr) in v.gate.items()) for k, v in curriculum.stages.items()))
+        if args_cli.stage_param:
+            if curriculum is None:
+                raise ValueError("--stage_param needs the curriculum (drop --no_curriculum)")
+            curriculum.stage_params = parse_stage_params(args_cli.stage_param)
+            print(f"[INFO] stage params: {curriculum.stage_params}")
+        if args_cli.stop_after_stage and curriculum is None:
+            raise ValueError("--stop_after_stage needs the curriculum (drop --no_curriculum)")
         runner = ServeRunner(
             env,
             agent_cfg.to_dict(),
@@ -304,6 +341,7 @@ def main(env_cfg, agent_cfg):
             device=agent_cfg.device,
             time_budget_hours=args_cli.time_budget_hours,
             curriculum=curriculum,
+            stop_after_stage=args_cli.stop_after_stage,
         )
         runner.install_signal_handlers()
         if resume_path:

@@ -31,10 +31,12 @@ class ServeRunner(OnPolicyRunner):
     LATEST_INTERVAL = 50
     FINITE_CHECK_INTERVAL = 50
 
-    def __init__(self, env, train_cfg, log_dir=None, device="cpu", time_budget_hours=None, curriculum=None):
+    def __init__(self, env, train_cfg, log_dir=None, device="cpu", time_budget_hours=None, curriculum=None,
+                 stop_after_stage=None):
         super().__init__(env, train_cfg, log_dir=log_dir, device=device)
         self.time_budget_s = None if time_budget_hours is None else time_budget_hours * 3600.0
         self.curriculum = curriculum
+        self.stop_after_stage = stop_after_stage
         self.start_wall = time.time()
         self.iter_times: list[float] = []
         self.stop_reason: str | None = None
@@ -42,6 +44,18 @@ class ServeRunner(OnPolicyRunner):
         self.nan_rollbacks = 0
         self._stop_signal = False
         self._last_iter_end = None
+        computer = getattr(env.unwrapped, "serve_reward", None)
+        if curriculum is not None and computer is not None:
+            names = {k for overrides in curriculum.stage_params.values() for k in overrides}
+            curriculum.base_params = {k: getattr(computer.p, k) for k in names}
+        self.apply_stage_params()
+
+    def apply_stage_params(self) -> None:
+        """Puts the curriculum's per-stage reward parameters into the reward computer."""
+        computer = getattr(self.env.unwrapped, "serve_reward", None)
+        if self.curriculum is not None and computer is not None:
+            for name, value in self.curriculum.params().items():
+                setattr(computer.p, name, value)
 
     def install_signal_handlers(self) -> None:
         def handler(signum, _frame):
@@ -62,16 +76,23 @@ class ServeRunner(OnPolicyRunner):
         values = {f"Serve/{k}": v for k, v in rates.items()}
         if self.curriculum is not None:
             computer.set_weights(self.curriculum.update(it, rates))
+            self.apply_stage_params()
             values.update(self.curriculum.log_values())
             for event in self.curriculum.events:
                 print(f"[Curriculum] {event} at iteration {it}: {self.curriculum.history[-1] if self.curriculum.history else ''}", flush=True)
                 if self.log_dir is not None:
                     self.save(os.path.join(self.log_dir, f"model_{event}_{it}.pt"))
         values.update({f"Serve/weight_{k}": v for k, v in computer.weights.items()})
+        param_names = ["v_close_max"]
+        if self.curriculum is not None:
+            param_names += [k for k in self.curriculum.base_params if k != "v_close_max"]
+        params = {f"param_{k}": float(getattr(computer.p, k)) for k in param_names}
+        values.update({f"Serve/{k}": v for k, v in params.items()})
         if self.writer is not None:
             for key, value in values.items():
                 self.writer.add_scalar(key, value, it)
-        print("[Serve] " + " ".join(f"{k}={rates[k]:.3f}" for k in ("legal", "crossed", "in", "fault", "no_hit", "tunnel", "fall", "fall_after_hit", "vc_mean", "el_mean", "launch_el_mean")), flush=True)
+        shown = {k: rates[k] for k in ("legal", "crossed", "in", "fault", "no_hit", "tunnel", "fall", "fall_after_hit", "vc_mean", "el_mean", "launch_el_mean")}
+        print("[Serve] " + " ".join(f"{k}={v:.3f}" for k, v in {**shown, **params}.items()), flush=True)
 
     def log(self, locs, *args, **kwargs):
         super().log(locs, *args, **kwargs)
@@ -93,6 +114,11 @@ class ServeRunner(OnPolicyRunner):
         if self.curriculum is not None and self.curriculum.stop_reason:
             # A stage hit its maximum without passing its gate: stop and investigate (V3 7.3).
             self.stop_reason = self.curriculum.stop_reason
+            raise StopTraining
+        if self.curriculum is not None and self.stop_after_stage and any(
+                h["stage"] == self.stop_after_stage for h in self.curriculum.history):
+            # model_passed_<stage>_<it>.pt was written above and holds the next stage's curriculum state.
+            self.stop_reason = f"stop_after_{self.stop_after_stage}"
             raise StopTraining
         if self.time_budget_s is not None and self._over_budget(now):
             self.stop_reason = "time_budget"
@@ -144,6 +170,7 @@ class ServeRunner(OnPolicyRunner):
                 computer = getattr(self.env.unwrapped, "serve_reward", None)
                 if computer is not None:
                     computer.set_weights(self.curriculum.weights())
+                self.apply_stage_params()
             rng = infos.get("rng")
             if rng:
                 random.setstate(rng["python"])
