@@ -9,6 +9,7 @@ Use ``--max_iterations 2 --num_envs 4`` as the smoke test.
 """
 
 import argparse
+import dataclasses
 import json
 import os
 import subprocess
@@ -41,6 +42,11 @@ parser.add_argument("--swanlab_group", default=None)
 parser.add_argument("--swanlab_name", default=None)
 parser.add_argument("--stage", choices=("A", "B", "C"), default="A", help="Start stage when not resuming.")
 parser.add_argument("--no_curriculum", action="store_true", help="Fixed weights of --stage, no promotion or stop.")
+parser.add_argument(
+    "--stage_max_iters",
+    default=None,
+    help="Override curriculum max iterations per stage, e.g. 'A=4500,B=12000,C=12000'.",
+)
 parser.add_argument(
     "--mini_batches",
     type=int,
@@ -205,6 +211,12 @@ def main(env_cfg, agent_cfg):
         env = ServePolicyVecEnvWrapper(env, clip_actions=agent_cfg.clip_actions)
         print(f"[INFO] {env.court_count} courts, {env.num_envs} player samples per step, log {log_dir}")
         curriculum = None if args_cli.no_curriculum else ServeCurriculum(stage=args_cli.stage)
+        if curriculum is not None and args_cli.stage_max_iters:
+            for item in args_cli.stage_max_iters.split(","):
+                key, value = item.split("=")
+                spec = curriculum.stages[key.strip()]
+                curriculum.stages[key.strip()] = dataclasses.replace(spec, max_iters=int(value))
+            print("[INFO] stage max iters: " + ", ".join(f"{k}={v.max_iters}" for k, v in curriculum.stages.items()))
         runner = ServeRunner(
             env,
             agent_cfg.to_dict(),
