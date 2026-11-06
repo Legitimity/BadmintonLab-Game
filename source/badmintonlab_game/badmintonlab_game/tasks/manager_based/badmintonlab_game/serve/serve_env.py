@@ -72,7 +72,9 @@ class ServeBadmintonEnv(DualAgentBadmintonEnv):
         self.episode_length_buf += 1
         self.common_step_counter += 1
         self._finish_control_step()
-        self._update_approach_state()
+        # Approach state only feeds the interval_approach reward, which the serve rewards remove.
+        if self.cfg.rewards.interval_approach is not None and self.cfg.player_1_rewards.interval_approach is not None:
+            self._update_approach_state()
         self._update_return_history()
         self.serve_reward.end_step(self._step_inputs())
         self.reset_buf = self.termination_manager.compute()
