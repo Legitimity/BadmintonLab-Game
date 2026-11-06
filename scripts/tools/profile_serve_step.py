@@ -82,6 +82,10 @@ def main():
     patch(u, "_apply_shuttle_forces", "2 substep/shuttle_forces")
     patch(u.scene, "write_data_to_sim", "2 substep/write_data_to_sim (+reset)")
     patch(u.sim, "step", "2 substep/sim.step (PhysX)")
+    for name, asset in list(u.scene.articulations.items()) + list(u.scene.rigid_objects.items()):
+        patch(asset, "write_data_to_sim", f"6 write/{name}")
+    for name, asset in u.scene.articulations.items():
+        patch(asset, "_apply_actuator_model", f"6 write/{name}/_apply_actuator_model")
     patch(u.scene, "update", "2 substep/scene.update")
     # Line-level copy of ServeBadmintonEnv._physics_substep (keep in sync with serve_env.py).
     def section(name):
@@ -115,12 +119,9 @@ def main():
         with section("3 phys/c body_link_quat_w (racket)"):
             new_hits = self.rules.just_hit & ~before
             quat = torch.stack([r.data.body_link_quat_w[:, i] for r, i in zip(self._robots, sid)], dim=1)
-        with section("3 phys/d new_hits.any() + body_link_lin_vel_w"):
-            any_hit = bool(new_hits.any())
-            if any_hit:
-                vel = torch.stack([r.data.body_link_lin_vel_w[:, i] for r, i in zip(self._robots, sid)], dim=1)
-        if any_hit:
-            self.serve_reward.capture_contact(new_hits, self.initial_hitter, quat, vel)
+        with section("3 phys/d racket velocity (cached COM)"):
+            vel = self._racket_link_lin_vel_w(quat)
+        self.serve_reward.capture_contact(new_hits, self.initial_hitter, quat, vel)
         with section("3 phys/e body_link_pos_w (racket)"):
             racket_pos = torch.stack([r.data.body_link_pos_w[:, i] for r, i in zip(self._robots, sid)], dim=1)
         self.serve_reward.capture_tunnel(self.initial_hitter, racket_pos, quat, pos_w, self._prev_phys_shuttle, contacts)
@@ -140,6 +141,9 @@ def main():
     patch(u, "_update_return_history", "4 post/_update_return_history")
     patch(u, "_step_inputs", "4 post/_step_inputs")
     patch(u.serve_reward, "end_step", "4 post/serve_reward.end_step")
+    from badmintonlab_game.tasks.manager_based.badmintonlab_game.serve import serve_reward as _sr
+
+    patch(_sr, "predict_flight", "5 end_step/predict_flight")
     patch(u.termination_manager, "compute", "4 post/termination_manager")
     patch(u.serve_reward, "count_timeouts", "4 post/serve_reward.count_timeouts")
     patch(u.reward_manager, "compute", "4 post/reward_manager p0")
@@ -188,7 +192,7 @@ def main():
     print(f"{'section':58s} {'ms/step':>9s} {'calls':>6s} {'% env.step':>10s}")
     for k in sorted(rows):
         ms, c = rows[k]
-        nested = k.startswith("3 ")
+        nested = k.startswith(("3 ", "5 ", "6 "))
         print(f"{('    ' if nested else '') + k:58s} {ms:9.2f} {c:6.2f} {100 * ms / step_ms:9.1f}%")
     if args_cli.out:
         os.makedirs(os.path.dirname(os.path.abspath(args_cli.out)), exist_ok=True)

@@ -10,7 +10,7 @@ from __future__ import annotations
 from collections.abc import Sequence
 
 import torch
-from isaaclab.utils.math import quat_apply_inverse
+from isaaclab.utils.math import quat_apply, quat_apply_inverse
 
 from ..dual_agent_env import DualAgentBadmintonEnv
 from . import player_cfg
@@ -39,6 +39,10 @@ class ServeBadmintonEnv(DualAgentBadmintonEnv):
         self.extras.setdefault("log", {})
         self.serve_reward = self._make_serve_reward()
         self._prev_phys_shuttle = self._shuttle.data.root_pos_w.clone()
+        # Centre of mass of the sweet-spot link in its link frame. Isaac Lab's body_link_vel_w re-reads all
+        # COMs from PhysX (get_coms, CPU->GPU copy of every body) at every physics step; nothing changes
+        # masses or COMs during training, so read it once.
+        self._sweet_com_b = [r.data.body_com_pos_b[:, i].clone() for r, i in zip(self._robots, self._sweet_spot_ids)]
 
     def _make_serve_reward(self) -> ServeRewardComputer:
         robot = self._robots[0]
@@ -128,14 +132,22 @@ class ServeBadmintonEnv(DualAgentBadmintonEnv):
         new_hits = self.rules.just_hit & ~before
         sid = self._sweet_spot_ids
         quat = torch.stack([r.data.body_link_quat_w[:, i] for r, i in zip(self._robots, sid)], dim=1)
-        if bool(new_hits.any()):
-            vel = torch.stack([r.data.body_link_lin_vel_w[:, i] for r, i in zip(self._robots, sid)], dim=1)
-            self.serve_reward.capture_contact(new_hits, self.initial_hitter, quat, vel)
+        # Unconditional (capture_contact masks by new_hits): no host sync per physics step.
+        self.serve_reward.capture_contact(new_hits, self.initial_hitter, quat, self._racket_link_lin_vel_w(quat))
         # Pass-through detection uses the shuttle position of the previous physics step.
         racket_pos = torch.stack([r.data.body_link_pos_w[:, i] for r, i in zip(self._robots, sid)], dim=1)
         self.serve_reward.capture_tunnel(self.initial_hitter, racket_pos, quat, pos_w, self._prev_phys_shuttle, contacts)
         self._prev_phys_shuttle.copy_(pos_w)
         self.rules.update_rally_result(pos_w, self.scene.env_origins)
+
+    def _racket_link_lin_vel_w(self, quat: torch.Tensor) -> torch.Tensor:
+        """(N, 2, 3) sweet-spot link velocity; same formula as ArticulationData.body_link_vel_w with cached COMs."""
+        out = []
+        for side, (r, i) in enumerate(zip(self._robots, self._sweet_spot_ids)):
+            vel = r.data.body_com_vel_w[:, i]
+            arm = quat_apply(quat[:, side], -self._sweet_com_b[side])
+            out.append(vel[:, :3] + torch.linalg.cross(vel[:, 3:], arm, dim=-1))
+        return torch.stack(out, dim=1)
 
     def _finish_control_step(self) -> None:
         """Translate the rule state into the bookkeeping the parent's rewards use."""
