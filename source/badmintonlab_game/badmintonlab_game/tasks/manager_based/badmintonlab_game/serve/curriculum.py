@@ -28,10 +28,13 @@ class StageSpec:
     gate: dict
 
 
+# Gates revised after P0-P2 (REPORT_P0_P2_RESULTS): the scripted swing of the default pose (candidate 2)
+# reaches 47% in with 34% pass-through, and the contact model caps a single-contact serve at about
+# 85-90% in under realistic noise. "fall" is the server's fall rate (root < 0.45 m or trunk > 45 deg).
 DEFAULT_STAGES = {
-    "A": StageSpec(200, 1500, {"fall": ("<=", 0.05), "legal": (">=", 0.90)}),
-    "B": StageSpec(500, 4000, {"crossed": (">=", 0.70), "in": (">=", 0.60)}),
-    "C": StageSpec(500, 4000, {"in": (">=", 0.90), "fault": ("<=", 0.02), "fall": ("<=", 0.05)}),
+    "A": StageSpec(200, 1500, {"legal": (">=", 0.70), "fall": ("<=", 0.10)}),
+    "B": StageSpec(300, 4000, {"crossed": (">=", 0.70), "in": (">=", 0.60), "fall": ("<=", 0.10)}),
+    "C": StageSpec(300, 4000, {"in": (">=", 0.85), "fault": ("<=", 0.02), "fall": ("<=", 0.05)}),
 }
 
 

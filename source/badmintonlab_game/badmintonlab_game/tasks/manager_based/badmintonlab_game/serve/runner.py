@@ -71,7 +71,7 @@ class ServeRunner(OnPolicyRunner):
         if self.writer is not None:
             for key, value in values.items():
                 self.writer.add_scalar(key, value, it)
-        print("[Serve] " + " ".join(f"{k}={rates[k]:.3f}" for k in ("legal", "crossed", "in", "fault", "no_hit", "fall", "vn_mean")), flush=True)
+        print("[Serve] " + " ".join(f"{k}={rates[k]:.3f}" for k in ("legal", "crossed", "in", "fault", "no_hit", "tunnel", "fall", "fall_after_hit", "vc_mean", "el_mean")), flush=True)
 
     def log(self, locs, *args, **kwargs):
         super().log(locs, *args, **kwargs)

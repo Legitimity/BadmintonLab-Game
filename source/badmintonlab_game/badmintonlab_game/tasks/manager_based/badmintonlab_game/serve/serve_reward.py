@@ -36,9 +36,12 @@ TERMS = (
     "no_hit",
     "fall",
     "serve_result",
+    "post_stand",
+    "tunnel",
 )
 POSITIVE_TERMS = ("legal_contact", "swing_speed", "face_quality", "outcome_pred")
-EVENT_TERMS = tuple(t for t in TERMS if t != "hold_ready")
+DENSE_TERMS = ("hold_ready", "post_stand")  # per second; everything else is a one-step event
+EVENT_TERMS = tuple(t for t in TERMS if t not in DENSE_TERMS)
 STAT_KEYS = (
     "rallies",
     "legal",
@@ -57,6 +60,9 @@ STAT_KEYS = (
     "hd_abs_sum",
     "outcome_sum",
     "contacts",
+    "tunnel_n",
+    "vc_sum",
+    "fall_after_hit",
 )
 
 
@@ -64,14 +70,20 @@ STAT_KEYS = (
 class ServeRewardParams:
     """Targets and shaping constants. Override with hydra, e.g. ``env.serve_reward.v_target=5.5``."""
 
-    # P1 (2026-11-06): plate restitution ~0.65; pass-through ~0% at 2 m/s and ~54% at 10 m/s relative
-    # normal speed. 4.5 m/s racket speed gives ~9-10 m/s out at 55 deg; faster swings mostly add tunnelling.
-    v_target: float = 4.5  # racket normal speed at contact, m/s
-    elevation_target_deg: float = 55.0  # P1: face normal elevation at contact
+    # Calibrated on the remote plate table (REPORT_P0_P2_RESULTS 4.1): restitution 0.65, friction 0.11,
+    # capture probability ~= min(1, 6.2 / v_close) with v_close the shuttle-racket closing speed along the
+    # face normal (the face stops ~3.1 cm of relative motion per 5 ms physics step).
+    # Best single-contact serve under that model: contact 1.0-1.1 m, face 50-55 deg, racket 3-4 m/s along
+    # the normal, v_close 6.5-7.5 m/s, exit ~8-9 m/s, landing 1.1-1.7 m behind the net, net clearance
+    # 0.1-0.8 m. Expected P(in) about 0.85 with +-5 deg / +-0.5 m/s noise (0.97 without noise).
+    v_close_target: float = 6.5  # m/s; swing_speed rewards approaching it and is flat above
+    v_close_max: float = 8.0  # m/s; tunnelling risk above this is penalised (capture < 0.78)
+    v_close_penalty_scale: float = 2.0  # m/s for a full unit of the over-speed penalty
+    elevation_target_deg: float = 52.0
     heading_target_deg: float = 0.0
-    face_sigma_deg: float = 20.0
-    x_target: float = 2.0  # landing x behind the net, m; ~10 m/s out lands about 2 m deep
-    x_sigma: float = 2.0
+    face_sigma_deg: float = 15.0
+    x_target: float = 1.6  # landing x behind the net, m (short serve; the receiver is weak in M1)
+    x_sigma: float = 1.5
     net_height: float = 1.55  # conservative: the edge height
     net_margin: float = 0.20
     net_scale: float = 0.5
@@ -82,6 +94,13 @@ class ServeRewardParams:
     x_long_scale: float = 0.3
     no_hit_height: float = 0.5
     fall_height: float = 0.45
+    # Upright check after the server's hit: projected-gravity z of the trunk must stay below -cos(45 deg).
+    upright_cos: float = 0.70
+    stand_height: float = 0.55  # root height counted as "standing" for post_stand
+    # A tunnelled shuttle: it was within this distance of the face, crossed the face plane in one physics
+    # step from the striking side, and no contact was registered.
+    tunnel_face_radius: float = 0.12
+    terminate_on_fall: bool = True  # end the rally at the fall: no reward for a dive that lands later
     hold_sigma2: float = 0.1  # rad^2, on the mean squared joint error
     positive_cap: float = 8.0  # per rally, on the weighted positive terms
     end_on_return: bool = True  # M1: the rally ends when the receiver touches a legal serve
@@ -92,13 +111,19 @@ class ServeRewardParams:
 
 
 # V3 table 7.2. Signs are part of the weight.
+# Signs are part of the weight. V3 table 7.2 plus the P0-P2 findings:
+#   * fall -10 and the rally ends at the fall: the 500-iteration default-reward policy fell after every
+#     successful serve; with serve_result +10 a later fall at -5 still paid.
+#   * serve_result is paid only if the server is still standing when the rally ends (see end_step).
+#   * post_stand: dense, per second, for the server after its hit while upright.
+#   * tunnel: event, the shuttle passed through the face without contact (pass-through is the main miss).
 STAGE_WEIGHTS = {
-    "A": dict(hold_ready=-0.5, legal_contact=2.0, swing_speed=0.0, face_quality=0.0, outcome_pred=1.0,
-              serve_fault=-5.0, no_hit=-3.0, fall=-5.0, serve_result=10.0),
-    "B": dict(hold_ready=-0.2, legal_contact=1.0, swing_speed=2.0, face_quality=1.0, outcome_pred=4.0,
-              serve_fault=-5.0, no_hit=-3.0, fall=-5.0, serve_result=10.0),
+    "A": dict(hold_ready=-0.5, legal_contact=2.0, swing_speed=0.5, face_quality=0.5, outcome_pred=2.0,
+              serve_fault=-5.0, no_hit=-3.0, fall=-10.0, serve_result=10.0, post_stand=1.0, tunnel=-1.0),
+    "B": dict(hold_ready=-0.2, legal_contact=1.0, swing_speed=1.5, face_quality=1.0, outcome_pred=4.0,
+              serve_fault=-5.0, no_hit=-3.0, fall=-10.0, serve_result=10.0, post_stand=1.0, tunnel=-2.0),
     "C": dict(hold_ready=-0.1, legal_contact=0.5, swing_speed=1.0, face_quality=0.5, outcome_pred=4.0,
-              serve_fault=-5.0, no_hit=-3.0, fall=-5.0, serve_result=10.0),
+              serve_fault=-5.0, no_hit=-3.0, fall=-10.0, serve_result=10.0, post_stand=0.5, tunnel=-2.0),
 }
 
 
@@ -114,17 +139,27 @@ def to_canonical(vec: torch.Tensor, side: torch.Tensor) -> torch.Tensor:
     return torch.cat((vec[..., :2] * sign, vec[..., 2:]), dim=-1)
 
 
-def contact_features(normal_c: torch.Tensor, racket_vel_c: torch.Tensor):
-    """Striking-face normal speed, elevation and heading (degrees) in the canonical frame.
+def contact_features(normal_c: torch.Tensor, racket_vel_c: torch.Tensor, shuttle_vel_c: torch.Tensor | None = None):
+    """Closing speed, elevation and heading (degrees) of the striking face, canonical frame.
 
-    The plate has two faces; the striking face is the one moving along its normal.
+    The plate has two faces. The striking face is the one the shuttle approaches in the racket's
+    frame, i.e. ``(v_racket - v_shuttle) . n > 0``. ``v_close`` is that closing speed: it decides
+    tunnelling (REPORT 4.1). Without ``shuttle_vel_c`` the racket speed alone is used.
     """
-    vn_signed = (normal_c * racket_vel_c).sum(-1)
-    n = normal_c * torch.where(vn_signed >= 0, 1.0, -1.0).unsqueeze(-1)
-    vn = vn_signed.abs()
+    rel = racket_vel_c if shuttle_vel_c is None else racket_vel_c - shuttle_vel_c
+    signed = (normal_c * rel).sum(-1)
+    n = normal_c * torch.where(signed >= 0, 1.0, -1.0).unsqueeze(-1)
+    v_close = signed.abs()
     elevation = torch.rad2deg(torch.asin(n[..., 2].clamp(-1.0, 1.0)))
     heading = torch.rad2deg(torch.atan2(n[..., 1], n[..., 0]))
-    return vn, elevation, heading
+    return v_close, elevation, heading
+
+
+def swing_score(v_close: torch.Tensor, p) -> torch.Tensor:
+    """Rises to 1 at ``v_close_target``, flat up to ``v_close_max``, then falls linearly to -1."""
+    rise = torch.clamp(v_close / p.v_close_target, max=1.0)
+    over = torch.clamp((v_close - p.v_close_max) / p.v_close_penalty_scale, min=0.0, max=2.0)
+    return rise - over
 
 
 def face_quality(elevation, heading, p: ServeRewardParams) -> torch.Tensor:
@@ -162,6 +197,7 @@ class StepInputs:
     shuttle_vel: torch.Tensor  # (N, 3) world
     root_z: torch.Tensor  # (N, 2) court-local root height
     joint_pos: torch.Tensor  # (N, 2, J)
+    gravity_z: torch.Tensor | None = None  # (N, 2) projected-gravity z of each root, -1 when upright
 
 
 class ServeRewardComputer:
@@ -192,7 +228,12 @@ class ServeRewardComputer:
         self.fell_server = z(n, dt=torch.bool)
         self.return_done = z(n, dt=torch.bool)
         self.done_now = z(n, dt=torch.bool)
+        self.fall_done = z(n, dt=torch.bool)  # termination request: a robot fell
+        self.tunnel_given = z(n, dt=torch.bool)
+        self.tunnel_now = z(n, dt=torch.bool)  # set at physics rate by capture_tunnel
+        self.c_vc = z(n)
         self.iteration = torch.zeros(len(STAT_KEYS), device=device)
+        self.set_incoming_speed(4.3)
 
     # ------------------------------------------------------------------ weights
     def set_weights(self, weights: dict) -> None:
@@ -203,20 +244,55 @@ class ServeRewardComputer:
 
     # ------------------------------------------------------------------ physics rate
     def capture_contact(self, new_hits: torch.Tensor, server: torch.Tensor, racket_quat_w: torch.Tensor,
-                        racket_vel_w: torch.Tensor) -> None:
+                        racket_vel_w: torch.Tensor, shuttle_vel_w: torch.Tensor | None = None) -> None:
         """``new_hits``: (N, 2) valid hits that appeared in this physics step.
 
         ``racket_quat_w``/``racket_vel_w``: (N, 2, 4)/(N, 2, 3) sweet-spot pose and velocity.
+        ``shuttle_vel_w`` (N, 3) is the shuttle velocity *after* the contact step, so the closing speed
+        is reconstructed from the incoming free-fall speed instead (``_incoming``).
         """
         idx = server.unsqueeze(1)
         hit = new_hits.gather(1, idx).squeeze(1) & ~self.c_have
         q = racket_quat_w.gather(1, idx[..., None].expand(-1, 1, 4)).squeeze(1)
         v = racket_vel_w.gather(1, idx[..., None].expand(-1, 1, 3)).squeeze(1)
-        vn, el, hd = contact_features(to_canonical(quat_rotate_x_axis(q), server), to_canonical(v, server))
+        n_c, v_c = to_canonical(quat_rotate_x_axis(q), server), to_canonical(v, server)
+        vn, el, hd = contact_features(n_c, v_c)
+        vin = self._incoming(n_c.shape[0])
+        vc, _, _ = contact_features(n_c, v_c, vin)
+        self.c_vc = torch.where(hit, vc, self.c_vc)
         self.c_vn = torch.where(hit, vn, self.c_vn)
         self.c_el = torch.where(hit, el, self.c_el)
         self.c_hd = torch.where(hit, hd, self.c_hd)
         self.c_have |= hit
+
+    def _incoming(self, n: int) -> torch.Tensor:
+        """Free-fall velocity of the serve shuttle just before contact. The serve is a vertical drop
+        from rest, so the incoming velocity is (0, 0, -v_drop(z)); ~4.2-4.4 m/s at 0.7-1.1 m."""
+        return self._v_in.expand(n, 3)
+
+    def set_incoming_speed(self, v_drop: float) -> None:
+        self._v_in = torch.tensor([[0.0, 0.0, -float(v_drop)]], device=self.device)
+
+    def capture_tunnel(self, server: torch.Tensor, racket_pos_w: torch.Tensor, racket_quat_w: torch.Tensor,
+                       shuttle_pos_w: torch.Tensor, prev_shuttle_pos_w: torch.Tensor, contact: torch.Tensor) -> None:
+        """Physics rate. Flags a serve shuttle that crossed the server's face plane without contact.
+
+        ``racket_*``: (N, 2, 3/4) sweet spot; ``contact``: (N, 2) raw racket-shuttle contact this step.
+        Only before the server's first hit. Positions in world frame.
+        """
+        idx = server.unsqueeze(1)
+        pos = racket_pos_w.gather(1, idx[..., None].expand(-1, 1, 3)).squeeze(1)
+        q = racket_quat_w.gather(1, idx[..., None].expand(-1, 1, 4)).squeeze(1)
+        n = quat_rotate_x_axis(q)
+        d_now = ((shuttle_pos_w - pos) * n).sum(-1)
+        d_prev = ((prev_shuttle_pos_w - pos) * n).sum(-1)
+        rel = shuttle_pos_w - pos
+        in_plane = torch.linalg.norm(rel - d_now.unsqueeze(-1) * n, dim=-1)
+        crossed = (torch.sign(d_now) != torch.sign(d_prev)) & (d_prev != 0)
+        touched = contact.gather(1, idx).squeeze(1)
+        hit_before = self.c_have
+        flag = crossed & (in_plane < self.p.tunnel_face_radius) & ~touched & ~hit_before & ~self.tunnel_given
+        self.tunnel_now |= flag
 
     # ------------------------------------------------------------------ control rate
     def end_step(self, s: StepInputs) -> None:
@@ -243,8 +319,12 @@ class ServeRewardComputer:
         # Server's first legal contact, with the features captured at the physics step.
         contact = server_hit_now & self.c_have
         role_vals["legal_contact"][:, 0] = w["legal_contact"] * contact.float()
-        role_vals["swing_speed"][:, 0] = w["swing_speed"] * contact.float() * torch.clamp(self.c_vn / p.v_target, max=1.0)
+        role_vals["swing_speed"][:, 0] = w["swing_speed"] * contact.float() * swing_score(self.c_vc, p)
         role_vals["face_quality"][:, 0] = w["face_quality"] * contact.float() * face_quality(self.c_el, self.c_hd, p)
+        # Tunnelling before the first hit: the shuttle went through the face (REPORT 4.1/4.2).
+        tunnel = self.tunnel_now & ~self.tunnel_given
+        self.tunnel_given |= tunnel
+        role_vals["tunnel"][:, 0] = w["tunnel"] * tunnel.float()
 
         # Outcome prediction one control step after the hit, unless the rally already ended on a fault.
         due = self.outcome_pending & ~(s.just_resolved & (s.winner != server))
@@ -276,11 +356,20 @@ class ServeRewardComputer:
         self.no_hit_given |= no_hit
         role_vals["no_hit"][:, 0] = w["no_hit"] * no_hit.float()
 
-        fell = (s.root_z < p.fall_height) & ~self.fall_given
+        down = s.root_z < p.fall_height
+        if s.gravity_z is not None:
+            down = down | (s.gravity_z > -p.upright_cos)
+        fell = down & ~self.fall_given
         self.fall_given |= fell
         fell_roles = torch.stack((fell[ar, server], fell[ar, receiver]), dim=1)
         role_vals["fall"] = w["fall"] * fell_roles.float()
         self.fell_server |= fell_roles[:, 0]
+        server_down = self.fall_given[ar, server]
+        # Dense stand reward for the server once it has hit, while upright and above stand_height.
+        standing = (s.root_z[ar, server] > p.stand_height) & ~server_down
+        if s.gravity_z is not None:
+            standing = standing & (s.gravity_z[ar, server] < -p.upright_cos)
+        role_vals["post_stand"][:, 0] = w["post_stand"] * (server_hits & standing).float()
 
         # Crossing the net plane after the serve, without a net fault.
         x_c = s.shuttle_pos[:, 0] * (1 - 2 * server).float()
@@ -288,8 +377,13 @@ class ServeRewardComputer:
 
         return_now = s.just_hit[ar, receiver] & server_hits & ~self.result_given
         self.return_done = return_now & p.end_on_return
-        success = ((s.just_resolved & (s.winner == server) & server_hits) | return_now) & ~self.result_given
-        failure = s.just_resolved & (s.winner == receiver) & ~self.result_given & ~success
+        # A fall ends the rally (training only). The serve is scored as a failure if the shuttle is
+        # still in the air: a dive that would land in later must not pay.
+        # Only the server's fall ends the rally; a receiver fall is penalised but does not cut the serve.
+        self.fall_done = fell_roles[:, 0] & ~s.just_resolved & ~return_now & p.terminate_on_fall
+        won = ((s.just_resolved & (s.winner == server) & server_hits) | return_now) & ~self.result_given
+        success = won & ~server_down
+        failure = ((s.just_resolved & (s.winner == receiver)) | (won & server_down) | self.fall_done) & ~self.result_given & ~success
         self.result_given |= success | failure
         role_vals["serve_result"][:, 0] = w["serve_result"] * (success.float() - failure.float())
 
@@ -301,8 +395,9 @@ class ServeRewardComputer:
             out[ar, receiver] = rv[:, 1]
             self.values[k] = out
 
-        self.done_now = s.just_resolved | return_now
-        self._stats(s, contact, score, due, success, return_now)
+        self.done_now = s.just_resolved | return_now | self.fall_done
+        self._stats(s, contact, score, due, success, return_now, tunnel, server_down)
+        self.tunnel_now.zero_()
 
     # ------------------------------------------------------------------ bookkeeping
     def pos_acc_roles(self, server: torch.Tensor) -> torch.Tensor:
@@ -314,7 +409,7 @@ class ServeRewardComputer:
         self.pos_acc[ar, server] += add_roles[:, 0]
         self.pos_acc[ar, 1 - server] += add_roles[:, 1]
 
-    def _stats(self, s, contact, score, due, success, return_now) -> None:
+    def _stats(self, s, contact, score, due, success, return_now, tunnel, server_down) -> None:
         ar = torch.arange(s.server.shape[0], device=self.device)
         done = self.done_now
         server_hits = s.hit_count[ar, s.server] > 0
@@ -336,6 +431,9 @@ class ServeRewardComputer:
             "hd_abs_sum": (self.c_hd.abs() * contact.float()).sum(),
             "outcome_sum": (score * due.float()).sum(),
             "contacts": f(contact),
+            "tunnel_n": f(tunnel),
+            "vc_sum": (self.c_vc * contact.float()).sum(),
+            "fall_after_hit": f(done & server_down & server_hits),
         }
         zero = torch.zeros((), device=self.device)
         self.iteration += torch.stack([add.get(k, zero) for k in STAT_KEYS])
@@ -348,11 +446,12 @@ class ServeRewardComputer:
 
     def reset(self, env_ids: torch.Tensor) -> None:
         for t in (self.c_have, self.outcome_pending, self.no_hit_given, self.result_given, self.crossed,
-                  self.fell_server, self.return_done):
+                  self.fell_server, self.return_done, self.fall_done, self.tunnel_given, self.tunnel_now):
             t[env_ids] = False
         self.fall_given[env_ids] = False
         self.pos_acc[env_ids] = 0.0
         self.c_vn[env_ids] = 0.0
+        self.c_vc[env_ids] = 0.0
         self.c_el[env_ids] = 0.0
         self.c_hd[env_ids] = 0.0
 
@@ -362,11 +461,12 @@ class ServeRewardComputer:
         c = dict(zip(STAT_KEYS, counts.tolist() if hasattr(counts, "tolist") else list(counts)))
         r = max(c["rallies"], 1.0)
         k = max(c["contacts"], 1.0)
-        out = {key: c[key] / r for key in STAT_KEYS if key not in ("rallies", "vn_sum", "el_sum", "hd_abs_sum",
-                                                                    "outcome_sum", "contacts")}
+        means = ("vn_sum", "el_sum", "hd_abs_sum", "outcome_sum", "vc_sum")
+        out = {key: c[key] / r for key in STAT_KEYS if key not in ("rallies", "contacts", *means)}
         out["fault"] = out["height"] + out["double"]
-        out.update(vn_mean=c["vn_sum"] / k, el_mean=c["el_sum"] / k, hd_abs_mean=c["hd_abs_sum"] / k,
-                   outcome_mean=c["outcome_sum"] / k, rallies=c["rallies"])
+        out["tunnel"] = out.pop("tunnel_n")
+        out.update(vn_mean=c["vn_sum"] / k, vc_mean=c["vc_sum"] / k, el_mean=c["el_sum"] / k,
+                   hd_abs_mean=c["hd_abs_sum"] / k, outcome_mean=c["outcome_sum"] / k, rallies=c["rallies"])
         return out
 
     def pop_iteration(self) -> dict:
@@ -384,3 +484,8 @@ def serve_term(env, term: str, side: int) -> torch.Tensor:
 def serve_return_done(env) -> torch.Tensor:
     """M1 termination: the receiver touched a legal serve. The serve counts as a success."""
     return env.serve_reward.return_done
+
+
+def serve_fall_done(env) -> torch.Tensor:
+    """Training-only termination: the server fell (root low or trunk tilted past 45 deg)."""
+    return env.serve_reward.fall_done

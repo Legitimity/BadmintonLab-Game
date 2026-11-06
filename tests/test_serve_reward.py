@@ -152,15 +152,35 @@ def _hit(c, n, quat, vel, server=None):
 
 def test_contact_terms_stage_b():
     n = 2
-    c = make(n, "B", v_target=6.0)
+    c = make(n, "B", elevation_target_deg=55.0)
     q = quat_for_normal(55, 0)
     nrm = R.quat_rotate_x_axis(q[None])[0]
-    jh, hc = _hit(c, n, q, 3.0 * nrm)
+    jh, hc = _hit(c, n, q, 2.0 * nrm)
     c.end_step(inputs(n, just_hit=jh, hit_count=hc))
+    # Closing speed = 2.0 + 4.3 * sin(55 deg) = 5.52; swing_score = 5.52 / 6.5.
+    vc = 2.0 + 4.3 * math.sin(math.radians(55))
+    assert c.c_vc[0].item() == pytest.approx(vc, abs=1e-4)
     assert ev(c, "legal_contact").tolist() == pytest.approx([1.0, 1.0])
-    assert ev(c, "swing_speed").tolist() == pytest.approx([1.0, 1.0], abs=1e-4)  # 2.0 * 3/6
+    assert ev(c, "swing_speed").tolist() == pytest.approx([1.5 * vc / 6.5] * 2, abs=1e-4)
     assert ev(c, "face_quality").tolist() == pytest.approx([1.0, 1.0], abs=1e-4)
     assert ev(c, "legal_contact", 1).abs().sum() == 0  # receiver gets nothing
+
+
+def test_swing_score_plateau_and_overspeed():
+    p = R.ServeRewardParams()
+    v = torch.tensor([0.0, 3.25, 6.5, 8.0, 9.0, 10.0, 20.0])
+    s_ = R.swing_score(v, p)
+    assert s_.tolist() == pytest.approx([0.0, 0.5, 1.0, 1.0, 0.5, 0.0, -1.0], abs=1e-5)
+
+
+def test_closing_speed_picks_the_face_the_shuttle_meets():
+    # Static racket, shuttle falling at 4.3 m/s onto a 50 deg face: v_close = 4.3 sin 50, elevation +50.
+    n = torch.tensor([[math.cos(math.radians(50)), 0.0, math.sin(math.radians(50))]])
+    vc, el, _ = R.contact_features(n, torch.zeros(1, 3), torch.tensor([[0.0, 0.0, -4.3]]))
+    assert vc.item() == pytest.approx(4.3 * math.sin(math.radians(50)), abs=1e-5)
+    assert el.item() == pytest.approx(50.0, abs=1e-3)
+    vc, el, _ = R.contact_features(-n, torch.zeros(1, 3), torch.tensor([[0.0, 0.0, -4.3]]))
+    assert el.item() == pytest.approx(50.0, abs=1e-3)
 
 
 def test_outcome_one_step_later_and_cap():
@@ -168,15 +188,16 @@ def test_outcome_one_step_later_and_cap():
     c = make(n, "B", positive_cap=5.0)
     q = quat_for_normal(55, 0)
     nrm = R.quat_rotate_x_axis(q[None])[0]
-    jh, hc = _hit(c, n, q, 12.0 * nrm)
+    jh, hc = _hit(c, n, q, 4.0 * nrm)  # v_close = 4 + 4.3 sin 55 = 7.5: inside the plateau
     c.end_step(inputs(n, just_hit=jh, hit_count=hc))
     first = sum(ev(c, k).item() for k in R.POSITIVE_TERMS)
-    assert first == pytest.approx(4.0, abs=1e-3)  # 1 + 2 + 1
+    expected_first = 1.0 + 1.5 + ev(c, "face_quality").item()
+    assert first == pytest.approx(expected_first, abs=1e-3)
     assert ev(c, "outcome_pred").item() == 0.0
     pos, vel = _launch(10.0, 45)
     c.end_step(inputs(n, hit_count=hc, shuttle_pos=pos, shuttle_vel=vel))
-    # outcome_pred would be ~4 * 0.89 (ball 10 m/s at 45 deg), but only 1.0 is left under the cap of 5.
-    assert ev(c, "outcome_pred").item() == pytest.approx(1.0, abs=1e-4)
+    # outcome_pred would be ~4 * 0.8, but only 5 - first is left under the cap of 5.
+    assert ev(c, "outcome_pred").item() == pytest.approx(5.0 - first, abs=1e-4)
     c.end_step(inputs(n, hit_count=hc, shuttle_pos=pos, shuttle_vel=vel))
     assert ev(c, "outcome_pred").item() == 0.0
 
@@ -185,8 +206,8 @@ def test_side1_server_uses_canonical_frame():
     n = 1
     c = make(n, "B")
     server = torch.tensor([1])
-    # World normal pointing to -x with 55 deg elevation is "towards the net" for side 1.
-    q = quat_for_normal(55, 180)
+    # World normal pointing to -x at the target elevation is "towards the net" for side 1.
+    q = quat_for_normal(c.p.elevation_target_deg, 180)
     nrm = R.quat_rotate_x_axis(q[None])[0]
     jh, hc = _hit(c, n, q, 6.0 * nrm, server)
     c.end_step(inputs(n, server=server, just_hit=jh, hit_count=hc))
@@ -282,12 +303,86 @@ def test_fall_once_per_rally_both_sides_and_reset():
     c = make(n, "B")
     rz = torch.tensor([[0.3, 0.3]])
     c.end_step(inputs(n, root_z=rz))
-    assert ev(c, "fall", 0).item() == -5.0 and ev(c, "fall", 1).item() == -5.0
+    assert ev(c, "fall", 0).item() == -10.0 and ev(c, "fall", 1).item() == -10.0
+    assert c.fall_done.tolist() == [True]
     c.end_step(inputs(n, root_z=rz))
     assert ev(c, "fall", 0).item() == 0.0
     c.reset(torch.tensor([0]))
     c.end_step(inputs(n, root_z=rz))
-    assert ev(c, "fall", 0).item() == -5.0
+    assert ev(c, "fall", 0).item() == -10.0
+
+
+def test_receiver_fall_does_not_end_the_serve():
+    c = make(1, "B")
+    c.end_step(inputs(1, root_z=torch.tensor([[0.68, 0.3]])))
+    assert ev(c, "fall", 1).item() == -10.0 and c.fall_done.tolist() == [False]
+
+
+def test_tilt_counts_as_fall():
+    c = make(1, "B")
+    # Trunk tilted ~60 deg: projected gravity z = -cos 60 = -0.5 > -0.70.
+    c.end_step(inputs(1, gravity_z=torch.tensor([[-0.5, -1.0]])))
+    assert ev(c, "fall", 0).item() == -10.0 and c.fall_done.tolist() == [True]
+
+
+def test_dive_serve_does_not_pay_and_is_counted():
+    """REPORT 5: every successful serve was followed by a fall. That must be a failed serve."""
+    n = 1
+    c = make(n, "B")
+    q = quat_for_normal(55, 0)
+    jh, hc = _hit(c, n, q, torch.zeros(3))
+    c.end_step(inputs(n, just_hit=jh, hit_count=hc))
+    # Falls while the shuttle is in flight: rally ends now, serve scored as a failure.
+    c.end_step(inputs(n, hit_count=hc, root_z=torch.tensor([[0.3, 0.68]])))
+    assert c.fall_done.tolist() == [True]
+    assert ev(c, "serve_result").item() == -10.0
+    r = c.pop_iteration()
+    assert r["in"] == 0.0 and r["fall"] == 1.0 and r["fall_after_hit"] == 1.0 and r["rallies"] == 1.0
+
+
+def test_win_while_down_is_not_success_when_not_terminating():
+    n = 1
+    c = make(n, "B", terminate_on_fall=False)
+    q = quat_for_normal(55, 0)
+    jh, hc = _hit(c, n, q, torch.zeros(3))
+    c.end_step(inputs(n, just_hit=jh, hit_count=hc))
+    c.end_step(inputs(n, hit_count=hc, root_z=torch.tensor([[0.3, 0.68]])))
+    assert c.fall_done.tolist() == [False]
+    c.end_step(inputs(n, hit_count=hc, root_z=torch.tensor([[0.3, 0.68]]), just_resolved=torch.tensor([True]),
+                      winner=torch.tensor([0])))
+    assert ev(c, "serve_result").item() == -10.0
+
+
+def test_post_stand_dense_after_hit_only():
+    n = 1
+    c = make(n, "B")
+    c.end_step(inputs(n))
+    assert c.values["post_stand"][0, 0].item() == 0.0
+    c.end_step(inputs(n, hit_count=torch.tensor([[1, 0]])))
+    assert c.values["post_stand"][0, 0].item() == pytest.approx(1.0)  # per second, not scaled by 1/dt
+    c.end_step(inputs(n, hit_count=torch.tensor([[1, 0]]), root_z=torch.tensor([[0.50, 0.68]])))
+    assert c.values["post_stand"][0, 0].item() == 0.0
+
+
+def test_tunnel_detection():
+    n = 2
+    c = make(n, "B")
+    server = torch.zeros(n, dtype=torch.long)
+    q = quat_for_normal(50, 0)[None, None].repeat(n, 2, 1)
+    racket = torch.tensor([[-2.55, 0.0, 1.0]])[:, None].repeat(n, 2, 1)
+    prev = torch.tensor([[-2.55, 0.0, 1.03], [-2.55, 0.30, 1.03]])  # env 1 is 30 cm to the side
+    now = torch.tensor([[-2.55, 0.0, 0.99], [-2.55, 0.30, 0.99]])
+    c.capture_tunnel(server, racket, q, now, prev, torch.zeros(n, 2, dtype=torch.bool))
+    c.end_step(inputs(n))
+    assert ev(c, "tunnel").tolist() == pytest.approx([-2.0, 0.0])
+    # Once per rally, and a registered contact is not a tunnel.
+    c.capture_tunnel(server, racket, q, now, prev, torch.zeros(n, 2, dtype=torch.bool))
+    c.end_step(inputs(n))
+    assert ev(c, "tunnel").tolist() == [0.0, 0.0]
+    c.reset(torch.arange(n))
+    c.capture_tunnel(server, racket, q, now, prev, torch.ones(n, 2, dtype=torch.bool))
+    c.end_step(inputs(n))
+    assert ev(c, "tunnel").tolist() == [0.0, 0.0]
 
 
 def test_reward_manager_scaling():
@@ -318,7 +413,7 @@ def test_unknown_weight_rejected():
 
 # ------------------------------------------------------------------ curriculum
 def good(stage):
-    return dict(rallies=500.0, fall=0.01, legal=0.95, crossed=0.9, **{"in": 0.95}, fault=0.0) if stage else {}
+    return dict(rallies=500.0, fall=0.01, legal=0.95, crossed=0.9, **{"in": 0.95}, fault=0.0) if stage else {}  # noqa: E501
 
 
 def test_curriculum_min_iters_promotion_blend_and_finish():
@@ -361,10 +456,15 @@ def test_curriculum_ignores_thin_iterations_and_roundtrips():
     assert cur2.state_dict() == d and cur2.stop_reason is None
 
 
-def test_stage_tables_match_v3():
+def test_stage_tables():
     a, b, c = (R.STAGE_WEIGHTS[k] for k in "ABC")
     assert (a["hold_ready"], b["hold_ready"], c["hold_ready"]) == (-0.5, -0.2, -0.1)
-    assert (a["outcome_pred"], b["outcome_pred"], c["outcome_pred"]) == (1.0, 4.0, 4.0)
+    assert (a["outcome_pred"], b["outcome_pred"], c["outcome_pred"]) == (2.0, 4.0, 4.0)
+    assert a["fall"] == b["fall"] == c["fall"] == -10.0
+    # Positive shaping per serve must stay below the result: max of the event terms < serve_result.
+    for w in (a, b, c):
+        assert w["legal_contact"] + w["swing_speed"] + w["face_quality"] + w["outcome_pred"] < w["serve_result"]
     assert set(a) == set(R.TERMS)
     s = C.DEFAULT_STAGES
     assert (s["A"].min_iters, s["A"].max_iters, s["B"].max_iters, s["C"].max_iters) == (200, 1500, 4000, 4000)
+    assert s["C"].gate["in"] == (">=", 0.85)

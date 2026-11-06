@@ -22,7 +22,7 @@ from ..dual_agent_env_cfg import (
     Player1RewardsCfg,
 )
 from . import player_cfg
-from .serve_reward import TERMS, ServeRewardParams, serve_return_done, serve_term
+from .serve_reward import TERMS, ServeRewardParams, serve_fall_done, serve_return_done, serve_term
 
 
 @sim_utils.clone
@@ -98,7 +98,9 @@ class ServeEventsCfg(player_cfg.make_events_cfg(1), player_cfg.make_events_cfg(0
 
 @configclass
 class ServeRewardParamsCfg(ServeRewardParams):
-    """Hydra-overridable copy, e.g. ``env.serve_reward.v_target=5.5 env.serve_reward.x_target=2.5``."""
+    """Hydra-overridable copy, e.g. ``env.serve_reward.v_close_target=6.0 env.serve_reward.x_target=1.4``."""
+
+    v_drop_at_contact: float = 4.3  # free-fall speed of the serve shuttle at 0.9-1.1 m (drag model)
 
 
 def _serve_reward_terms(base: type, side: int) -> type:
@@ -119,6 +121,7 @@ ServeRewards1Cfg = _serve_reward_terms(Player1RewardsCfg, 1)
 @configclass
 class ServeTerminationsCfg(DualTerminationsCfg):
     serve_returned = DoneTerm(func=serve_return_done)
+    robot_fell = DoneTerm(func=serve_fall_done)
 
 
 @configclass
@@ -143,3 +146,5 @@ class ServeEnvCfg(DualAgentBadmintonEnvCfg):
         self.serve_reward.gravity = -float(self.gravity_z)
         if not self.serve_reward.end_on_return:
             self.terminations.serve_returned = None
+        if not self.serve_reward.terminate_on_fall:
+            self.terminations.robot_fell = None

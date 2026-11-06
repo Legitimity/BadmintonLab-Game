@@ -38,6 +38,7 @@ class ServeBadmintonEnv(DualAgentBadmintonEnv):
         self.double_hit_fault = self.rules.double_hit_fault
         self.extras.setdefault("log", {})
         self.serve_reward = self._make_serve_reward()
+        self._prev_phys_shuttle = self._shuttle.data.root_pos_w.clone()
 
     def _make_serve_reward(self) -> ServeRewardComputer:
         robot = self._robots[0]
@@ -47,7 +48,9 @@ class ServeBadmintonEnv(DualAgentBadmintonEnv):
         hold = torch.ones_like(q_ready)
         swing, _ = robot.find_joints(list(SWING_JOINTS), preserve_order=True)
         hold[swing] = 0.0
-        return ServeRewardComputer(self.num_envs, self.device, self.cfg.serve_reward, q_ready, hold, self.step_dt)
+        computer = ServeRewardComputer(self.num_envs, self.device, self.cfg.serve_reward, q_ready, hold, self.step_dt)
+        computer.set_incoming_speed(self.cfg.serve_reward.v_drop_at_contact)
+        return computer
 
     def step(self, action: torch.Tensor):
         self.action_manager.process_action(action.to(self.device))
@@ -121,11 +124,15 @@ class ServeBadmintonEnv(DualAgentBadmintonEnv):
         before = self.rules.just_hit.clone()
         self.rules.update_hits(contacts, local_z)
         new_hits = self.rules.just_hit & ~before
+        sid = self._sweet_spot_ids
+        quat = torch.stack([r.data.body_link_quat_w[:, i] for r, i in zip(self._robots, sid)], dim=1)
         if bool(new_hits.any()):
-            sid = self._sweet_spot_ids
-            quat = torch.stack([r.data.body_link_quat_w[:, i] for r, i in zip(self._robots, sid)], dim=1)
             vel = torch.stack([r.data.body_link_lin_vel_w[:, i] for r, i in zip(self._robots, sid)], dim=1)
             self.serve_reward.capture_contact(new_hits, self.initial_hitter, quat, vel)
+        # Pass-through detection uses the shuttle position of the previous physics step.
+        racket_pos = torch.stack([r.data.body_link_pos_w[:, i] for r, i in zip(self._robots, sid)], dim=1)
+        self.serve_reward.capture_tunnel(self.initial_hitter, racket_pos, quat, pos_w, self._prev_phys_shuttle, contacts)
+        self._prev_phys_shuttle.copy_(pos_w)
         self.rules.update_rally_result(pos_w, self.scene.env_origins)
 
     def _finish_control_step(self) -> None:
@@ -167,6 +174,7 @@ class ServeBadmintonEnv(DualAgentBadmintonEnv):
             shuttle_vel=self._shuttle.data.root_lin_vel_w,
             root_z=torch.stack([r.data.root_pos_w[:, 2] - origins[:, 2] for r in self._robots], dim=1),
             joint_pos=torch.stack([r.data.joint_pos for r in self._robots], dim=1),
+            gravity_z=torch.stack([r.data.projected_gravity_b[:, 2] for r in self._robots], dim=1),
         )
 
     def _apply_shuttle_forces(self) -> None:
@@ -184,3 +192,4 @@ class ServeBadmintonEnv(DualAgentBadmintonEnv):
         self.rules.reset(ids, self.initial_hitter[ids], self._shuttle.data.root_pos_w[ids])
         # The runner logs the serve metrics once per iteration (see runner.ServeRunner.log).
         self.serve_reward.reset(ids)
+        self._prev_phys_shuttle[ids] = self._shuttle.data.root_pos_w[ids]

@@ -41,6 +41,12 @@ parser.add_argument("--swanlab_group", default=None)
 parser.add_argument("--swanlab_name", default=None)
 parser.add_argument("--stage", choices=("A", "B", "C"), default="A", help="Start stage when not resuming.")
 parser.add_argument("--no_curriculum", action="store_true", help="Fixed weights of --stage, no promotion or stop.")
+parser.add_argument(
+    "--mini_batches",
+    type=int,
+    default=None,
+    help="PPO mini-batches per epoch. Default 16 (2048 courts). At 8192 courts use 64 to keep the mini-batch size.",
+)
 cli_args.add_rsl_rl_args(parser)
 AppLauncher.add_app_launcher_args(parser)
 args_cli, hydra_args = parser.parse_known_args()
@@ -160,6 +166,8 @@ def main(env_cfg, agent_cfg):
         agent_cfg.device = args_cli.device
     env_cfg.seed = agent_cfg.seed
     env_cfg.serve_reward.initial_stage = args_cli.stage
+    if args_cli.mini_batches is not None:
+        agent_cfg.algorithm.num_mini_batches = args_cli.mini_batches
 
     log_root = os.path.abspath(os.path.join("logs", "rsl_rl", agent_cfg.experiment_name))
     resume_path = None
@@ -187,6 +195,7 @@ def main(env_cfg, agent_cfg):
             pose_init=not args_cli.no_pose_init,
             stage=args_cli.stage,
             curriculum=not args_cli.no_curriculum,
+            num_mini_batches=agent_cfg.algorithm.num_mini_batches,
             samples_per_iteration=2 * env_cfg.scene.num_envs * agent_cfg.num_steps_per_env,
         ),
     )
