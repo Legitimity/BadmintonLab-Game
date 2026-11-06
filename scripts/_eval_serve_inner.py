@@ -58,7 +58,7 @@ def main():
     pols = [_load(args.model0, device), _load(args.model1, device)]
     me, other = args.ours, 1 - args.ours
     n = u.num_envs
-    keys = ("rallies", "legal", "served_in", "height", "double", "no_hit", "net", "out", "fell", "watchdog", "hits_ours")
+    keys = ("rallies", "legal", "served_in", "served_in_standing", "height", "double", "no_hit", "net", "out", "fell", "watchdog", "hits_ours")
     stats = {"serve": {k: 0 for k in keys}, "receive": {k: 0 for k in keys}}
     dims = [int(obs["player_0"].shape[-1]), int(obs["player_1"].shape[-1])]
     server = u.next_hitter.clone()
@@ -128,6 +128,8 @@ def main():
                 s["legal"] += int(bool(ours_hit[i]) and not double)
                 s["no_hit"] += int(not ours_hit[i] and not height)
                 s["served_in"] += int(won and bool(ours_hit[i]))
+                # Same definition as the training metric Serve/in: a won serve only counts if the server is still up.
+                s["served_in_standing"] += int(won and bool(ours_hit[i]) and not bool(fell[i]))
                 s["fell"] += int(fell[i])
                 s["hits_ours"] += int(ours_hits[i])
                 t0 = float(started[i])

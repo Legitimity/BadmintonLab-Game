@@ -1,10 +1,11 @@
 #!/usr/bin/env bash
 # P3 queue (P3_PLAN_V2 4.4-4.7).
-#   S1  scale comparison: 2048 vs 8192 (64 mini-batches), stage B fixed weights, 45 min each, sequential
-#   S2  pick the scale (8192 unless its EMA in is > 3 points lower or its fall is higher, last 50 iterations)
-#   S3  formal training from stage B, curriculum on, stage max iterations relaxed; total wall time of the
-#       formal run < 20 h (restarts after a crash resume with the remaining budget)
-#   S4  monitor in parallel: export + play eval every 1000 iterations, plan-5 alerts (log only)
+#   S1  scale comparison: 2048 vs 8192 (64 mini-batches), stage B fixed weights, 45 min each, sequential.
+#       Re-entrant: a comparison already finished is skipped, one still running is waited for.
+#   S2  pick the scale (8192 unless its in is > 3 points lower or its fall is higher, last 50 iterations)
+#   S3  formal training from stage B, curriculum on, stage maxima relaxed, total wall time < 20 h
+#       (crash -> resume with the remaining budget; STOP_REQUESTED from the monitor -> no restart)
+#   S4  monitor in parallel: play eval every 1000 iterations and at stage C, automatic stops / early stop
 # Progress: $OUT/P3_STATUS.txt
 set -u
 REPO=/root/autodl-tmp/BadmintonLab-Game-V3L
@@ -19,21 +20,27 @@ cd "$REPO"
 export OMNI_KIT_ACCEPT_EULA=YES PYTHONPATH="$REPO/source/badmintonlab_game"
 STATUS="$OUT/P3_STATUS.txt"
 say() { echo "[$(date '+%F %T')] $*" | tee -a "$STATUS"; }
-say "P3 queue start, HEAD $(git rev-parse --short HEAD), formal budget ${FORMAL_HOURS} h, stage max $STAGE_MAX"
+say "P3 queue (v2) start, HEAD $(git rev-parse --short HEAD), formal budget ${FORMAL_HOURS} h, stage max $STAGE_MAX"
 
 # ---------------------------------------------------------------- S1
 cmp_run() {  # num_envs extra...
   local n=$1; shift
+  if grep -q "stopped: " "$OUT/cmp_$n.log" 2>/dev/null; then
+    say "S1 compare $n already done: $(grep -o 'stopped: .*' "$OUT/cmp_$n.log" | tail -1)"; return
+  fi
+  if pgrep -f "train_serve.py.*--run_name p3cmp_$n( |$)" > /dev/null; then
+    say "S1 compare $n running, waiting"
+    while pgrep -f "train_serve.py.*--run_name p3cmp_$n( |$)" > /dev/null; do sleep 30; done
+    say "S1 compare $n finished: $(grep -o 'stopped: .*' "$OUT/cmp_$n.log" | tail -1)"; return
+  fi
   say "S1 compare $n start"
-  timeout $(( ${CMP_HOURS%.*} * 3600 + 3600 )) "$PY" scripts/rsl_rl/train_serve.py --headless --num_envs "$n" --seed 1 --stage B \
+  timeout 4500 "$PY" scripts/rsl_rl/train_serve.py --headless --num_envs "$n" --seed 1 --stage B \
     --no_curriculum --run_name "p3cmp_$n" --time_budget_hours "$CMP_HOURS" --swanlab_group v3l-p3cmp "$@" \
     > "$OUT/cmp_$n.log" 2>&1
   say "S1 compare $n exit=$? $(grep -o 'stopped: .*' "$OUT/cmp_$n.log" | tail -1)"
 }
-if [ -z "${SKIP_CMP:-}" ]; then
-  cmp_run 2048
-  cmp_run 8192 --mini_batches 64
-fi
+cmp_run 2048
+cmp_run 8192 --mini_batches 64
 
 # ---------------------------------------------------------------- S2
 SCALE=$("$SWPY" - "$REPO" 2>>"$STATUS" <<'EOF'
@@ -71,7 +78,7 @@ say "S2 scale: $SCALE $MB"
 
 # ---------------------------------------------------------------- S3 + S4
 DONE="$OUT/FORMAL_DONE"
-rm -f "$DONE"
+rm -f "$DONE" "$OUT/STOP_REQUESTED"
 "$SWPY" scripts/tools/p3_monitor.py --run_name p3_s1 --out "$OUT" --done_file "$DONE" > "$OUT/monitor.log" 2>&1 &
 MON=$!
 DEADLINE=$(( $(date +%s) + $(python3 -c "print(int($FORMAL_HOURS*3600))") ))
@@ -81,14 +88,15 @@ while :; do
   left=$(( DEADLINE - $(date +%s) ))
   if [ "$left" -lt 900 ]; then say "S3 budget exhausted"; break; fi
   hours=$(python3 -c "print(round($left/3600, 3))")
-  say "S3 launch (attempt $((tries+1)), budget ${hours} h)"
   start_line=$(( $(wc -l < "$OUT/formal.log" 2>/dev/null || echo 0) + 1 ))
+  say "S3 launch (attempt $((tries+1)), budget ${hours} h)"
   timeout $(( left + 1800 )) "$PY" scripts/rsl_rl/train_serve.py --headless --num_envs "$SCALE" $MB --seed 1 --stage B \
     --stage_max_iters "$STAGE_MAX" --run_name p3_s1 --time_budget_hours "$hours" --auto_resume \
     --swanlab_group v3l-p3 >> "$OUT/formal.log" 2>&1
   code=$?
   reason=$(tail -n +"$start_line" "$OUT/formal.log" | grep -o 'stopped: .*' | tail -1)
   say "S3 exit=$code $reason"
+  if [ -f "$OUT/STOP_REQUESTED" ]; then say "S3 stopped by monitor: $(cat "$OUT/STOP_REQUESTED")"; break; fi
   case "$reason" in
     *time_budget*|*max_iterations*|*nonfinite*|*stage_*_max_iters*) break ;;
   esac
