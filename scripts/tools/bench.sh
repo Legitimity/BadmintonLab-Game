@@ -29,7 +29,7 @@ done
 # DUAL_SIZES: per-process court counts for the two-process runs (default 2048).
 if [ -z "${SKIP_DUAL:-}" ]; then
   for n in ${DUAL_SIZES:-2048}; do
-    run "dual_${n}_a" "$n" & run "dual_${n}_b" "$n" & wait
+    run "dual_${n}_a" "$n" & PA=$!; run "dual_${n}_b" "$n" & PB=$!; wait "$PA" "$PB"  # not bare wait: the sampler never exits
   done
 fi
 grep -h -E "PhysX|overflow|capacity" "$LOG"/*.log | sort | uniq -c || true
