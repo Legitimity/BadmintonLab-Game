@@ -91,6 +91,10 @@ if [ "$VERDICT" != "effective" ] || [ -z "$SEL" ]; then
 fi
 IFS=: read -r SCALE MBS SELRUN <<< "$SEL"
 say "S2 selected: $SCALE courts, $MBS mini-batches, start point run $SELRUN ($(jget "$OUT/e1b_summary.json" reason))"
+if [ "${AUTO_FORMAL:-0}" != "1" ]; then
+  say "S2 stop: formal run not started automatically (AUTO_FORMAL=1 to enable); group chosen by hand"
+  say "P3 queue finished"; exit 0
+fi
 
 INIT=$(ls -d "$LOGROOT"/*_"$SELRUN" 2>/dev/null | tail -1)/latest.pt
 if [ -f "$INIT" ]; then RESUME=(--resume --checkpoint "$INIT"); say "S3 start point: $INIT"
