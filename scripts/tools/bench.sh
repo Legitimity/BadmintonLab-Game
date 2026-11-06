@@ -11,17 +11,27 @@ TASK=${TASK:-BadmintonLab-Game-Serve}
 LOG=${LOG:-/root/autodl-tmp/logs/bench}
 SIZES=${SIZES:-"2048 4096 8192"}
 mkdir -p "$LOG"
+# GPU memory sampler (peak per run is read from this file afterwards).
+nvidia-smi --query-gpu=timestamp,memory.used,utilization.gpu --format=csv,noheader -l 5 > "$LOG/gpu_mem.csv" 2>/dev/null &
+SAMPLER=$!
+trap 'kill $SAMPLER 2>/dev/null' EXIT
 run() {  # name num_envs
+  echo "$1 start=$(date +%T)"
   timeout 1800 "$PY" scripts/rsl_rl/train_serve.py --headless --task "$TASK" --num_envs "$2" --max_iterations 60 \
     --seed 1 --run_name "bench_$1" --swanlab_mode disabled > "$LOG/$1.log" 2>&1
-  echo "$1 exit=$?"
+  echo "$1 exit=$? end=$(date +%T)"
 }
 for n in $SIZES; do
   run "single_$n" "$n"
   grep -E "Computation|collection|learning|steps/s" "$LOG/single_$n.log" | tail -3 || true
 done
 # Two processes at once: total throughput decides whether to train two seeds in parallel.
-[ -n "${SKIP_DUAL:-}" ] || { run dual_a 2048 & run dual_b 2048 & wait; }
+# DUAL_SIZES: per-process court counts for the two-process runs (default 2048).
+if [ -z "${SKIP_DUAL:-}" ]; then
+  for n in ${DUAL_SIZES:-2048}; do
+    run "dual_${n}_a" "$n" & run "dual_${n}_b" "$n" & wait
+  done
+fi
 grep -h -E "PhysX|overflow|capacity" "$LOG"/*.log | sort | uniq -c || true
 nvidia-smi --query-gpu=memory.used,memory.total --format=csv
 free -g; cat /sys/fs/cgroup/memory.max 2>/dev/null || cat /sys/fs/cgroup/memory/memory.limit_in_bytes 2>/dev/null || true
