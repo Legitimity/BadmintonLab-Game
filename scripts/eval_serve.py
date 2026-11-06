@@ -47,6 +47,9 @@ def main():
     ap.add_argument("--out", type=Path, default=None)
     ap.add_argument("--python", default=sys.executable)
     a = ap.parse_args()
+    a.ours = a.ours.resolve()  # the inner process runs with cwd = play root
+    if a.out is not None:
+        a.out = Path(a.out).resolve()
 
     task_dir = a.play_root / "source/badmintonlab_game/badmintonlab_game/tasks/manager_based/badmintonlab_game"
     targets = {0: task_dir / "player0_cfg.py", 1: task_dir / "player1_cfg.py"}
