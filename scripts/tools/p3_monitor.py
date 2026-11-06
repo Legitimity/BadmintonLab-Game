@@ -153,7 +153,7 @@ def check_training(st, sc, finished_it):
     ema = {k.split("_", 1)[1]: v[last] for k, v in sc.items() if k.startswith("Curriculum/ema_") and last in v}
     if args.test_stop_at is not None and last >= args.test_stop_at:
         request_stop(st, f"test stop at iteration {last}")
-    short = {k: round(v, 3) for k, v in ema.items() if k in ("legal", "crossed", "in", "fault", "fall", "tunnel", "vc_mean", "el_mean")}
+    short = {k: round(v, 3) for k, v in ema.items() if k in ("legal", "crossed", "in", "fault", "fall", "tunnel", "vc_mean", "el_mean", "launch_el_mean")}
     prev = None
     for s in sorted(stage_s):
         cur = int(round(stage_s[s]))
@@ -182,6 +182,9 @@ def check_training(st, sc, finished_it):
     el = ema.get("el_mean")
     if iters >= 300 and el is not None and ema.get("legal", 0) > 0.3 and not (30.0 <= el <= 70.0):
         alert(st, f"el_{stage}", f"EMA el_mean={el:.1f} deg outside 30-70 with legal={ema['legal']:.2f}")
+    lel = ema.get("launch_el_mean")
+    if iters >= 300 and lel is not None and ema.get("legal", 0) > 0.3 and not (25.0 <= lel <= 65.0):
+        alert(st, f"launch_el_{stage}", f"EMA launch_el_mean={lel:.1f} deg outside 25-65 with legal={ema['legal']:.2f}")
     # "in" pressed down and not recovering: below the gate and < 2 points gained over the last 500 iterations.
     gate = GATE_IN[stage]
     s_in = sc.get("Curriculum/ema_in", {})
