@@ -136,6 +136,48 @@ def _start_swanlab_bridge(agent_cfg, env_cfg, log_dir: str):
     return subprocess.Popen(cmd, stdout=log_file, stderr=subprocess.STDOUT, start_new_session=True)
 
 
+def _install_profiler(runner, env) -> None:
+    """SERVE_PROFILE=1: CUDA-synchronised time per rollout component, printed every iteration."""
+    import time
+    from collections import defaultdict
+
+    import torch
+
+    acc = defaultdict(float)
+
+    def wrap(obj, attr, name):
+        fn = getattr(obj, attr)
+
+        def timed(*a, **kw):
+            torch.cuda.synchronize()
+            t = time.perf_counter()
+            out = fn(*a, **kw)
+            torch.cuda.synchronize()
+            acc[name] += time.perf_counter() - t
+            return out
+
+        setattr(obj, attr, timed)
+
+    wrap(runner.alg, "act", "alg.act")
+    wrap(env, "step", "env.step")
+    wrap(runner.alg, "process_env_step", "alg.process_env_step")
+    wrap(runner.alg, "compute_returns", "alg.compute_returns")
+    wrap(runner.alg, "update", "alg.update")
+    wrap(runner, "log", "runner.log (+serve metrics, curriculum)")
+    original_log = runner.log
+
+    def log_and_print(locs, *a, **kw):
+        out = original_log(locs, *a, **kw)
+        total = locs["collection_time"] + locs["learn_time"]
+        parts = " ".join(f"{k}={v:.2f}s" for k, v in acc.items())
+        print(f"[PROFILE] it={locs['it']} collection={locs['collection_time']:.2f}s learn={locs['learn_time']:.2f}s "
+              f"total={total:.2f}s | {parts}", flush=True)
+        acc.clear()
+        return out
+
+    runner.log = log_and_print
+
+
 def _stop_swanlab_bridge(proc, log_dir: str) -> None:
     if proc is None:
         return
@@ -233,6 +275,8 @@ def main(env_cfg, agent_cfg):
             init_actor_output(runner.alg.policy, _ready_action(env))
         dump_yaml(os.path.join(log_dir, "params", "env.yaml"), env_cfg)
         dump_yaml(os.path.join(log_dir, "params", "agent.yaml"), agent_cfg)
+        if os.environ.get("SERVE_PROFILE"):
+            _install_profiler(runner, env)
         swan = _start_swanlab_bridge(agent_cfg, env_cfg, log_dir)
         try:
             reason = runner.learn_until_stop(agent_cfg.max_iterations, init_at_random_ep_len=True)
