@@ -38,8 +38,9 @@ TERMS = (
     "serve_result",
     "post_stand",
     "tunnel",
+    "launch_dir",
 )
-POSITIVE_TERMS = ("legal_contact", "swing_speed", "face_quality", "outcome_pred")
+POSITIVE_TERMS = ("legal_contact", "swing_speed", "face_quality", "outcome_pred", "launch_dir")
 DENSE_TERMS = ("hold_ready", "post_stand")  # per second; everything else is a one-step event
 EVENT_TERMS = tuple(t for t in TERMS if t not in DENSE_TERMS)
 STAT_KEYS = (
@@ -63,6 +64,8 @@ STAT_KEYS = (
     "tunnel_n",
     "vc_sum",
     "fall_after_hit",
+    "launch_el_sum",
+    "launch_n",
 )
 
 
@@ -82,6 +85,19 @@ class ServeRewardParams:
     elevation_target_deg: float = 52.0
     heading_target_deg: float = 0.0
     face_sigma_deg: float = 15.0
+    # V2.1 (P3_REWARD_FIX_AND_E1B 2.2): exponential tail so the elevation gradient does not vanish far
+    # from the target (0.15 at 25 deg off, 0.08 at 40 deg). 0 restores the plain Gaussian.
+    face_tail_weight: float = 0.4
+    face_tail_scale_deg: float = 25.0
+    # V2.1 (2.1): progress share of outcome_pred, so serves short of the net still rank by how close they
+    # came to clearing it by net_margin. 0 restores V3 outcome_pred. reach_x0: serve point to net, m.
+    reach_lambda: float = 0.3
+    reach_x0: float = 2.55
+    # V2.1 (2.3): launch direction one control step after the hit (in serves leave at 41-55 deg, 7-9 m/s).
+    launch_el_target_deg: float = 45.0
+    launch_el_flat_deg: float = 7.0
+    launch_el_sigma_deg: float = 20.0
+    launch_speed_ref: float = 8.0
     x_target: float = 1.6  # landing x behind the net, m (short serve; the receiver is weak in M1)
     x_sigma: float = 1.5
     net_height: float = 1.55  # conservative: the edge height
@@ -117,13 +133,17 @@ class ServeRewardParams:
 #   * serve_result is paid only if the server is still standing when the rally ends (see end_step).
 #   * post_stand: dense, per second, for the server after its hit while upright.
 #   * tunnel: event, the shuttle passed through the face without contact (pass-through is the main miss).
+#   * launch_dir (V2.1): event, launch direction of the serve; lowered in C so real outcomes decide.
 STAGE_WEIGHTS = {
     "A": dict(hold_ready=-0.5, legal_contact=2.0, swing_speed=0.5, face_quality=0.5, outcome_pred=2.0,
-              serve_fault=-5.0, no_hit=-3.0, fall=-10.0, serve_result=10.0, post_stand=1.0, tunnel=-1.0),
+              serve_fault=-5.0, no_hit=-3.0, fall=-10.0, serve_result=10.0, post_stand=1.0, tunnel=-1.0,
+              launch_dir=1.0),
     "B": dict(hold_ready=-0.2, legal_contact=1.0, swing_speed=1.5, face_quality=1.0, outcome_pred=4.0,
-              serve_fault=-5.0, no_hit=-3.0, fall=-10.0, serve_result=10.0, post_stand=1.0, tunnel=-2.0),
+              serve_fault=-5.0, no_hit=-3.0, fall=-10.0, serve_result=10.0, post_stand=1.0, tunnel=-2.0,
+              launch_dir=2.0),
     "C": dict(hold_ready=-0.1, legal_contact=0.5, swing_speed=1.0, face_quality=0.5, outcome_pred=4.0,
-              serve_fault=-5.0, no_hit=-3.0, fall=-10.0, serve_result=10.0, post_stand=0.5, tunnel=-2.0),
+              serve_fault=-5.0, no_hit=-3.0, fall=-10.0, serve_result=10.0, post_stand=0.5, tunnel=-2.0,
+              launch_dir=1.0),
 }
 
 
@@ -163,9 +183,22 @@ def swing_score(v_close: torch.Tensor, p) -> torch.Tensor:
 
 
 def face_quality(elevation, heading, p: ServeRewardParams) -> torch.Tensor:
-    de = (elevation - p.elevation_target_deg) / p.face_sigma_deg
+    """Gaussian core (V3) with an exponential tail in elevation (V2.1): ``max(core, tail)``."""
+    d = elevation - p.elevation_target_deg
+    de = d / p.face_sigma_deg
     dh = (heading - p.heading_target_deg) / p.face_sigma_deg
-    return torch.exp(-de * de) * torch.exp(-dh * dh)
+    head = torch.exp(-dh * dh)
+    core = torch.exp(-de * de) * head
+    tail = p.face_tail_weight * torch.exp(-d.abs() / p.face_tail_scale_deg) * head
+    return torch.maximum(core, tail)
+
+
+def outcome_guard(landing_xy, p: ServeRewardParams) -> torch.Tensor:
+    """Lateral (s2) and long-serve (s4) factors, shared by ``outcome_score`` and the reach term."""
+    x, y = landing_xy[..., 0], landing_xy[..., 1]
+    s2 = torch.exp(-torch.clamp(y.abs() - p.y_safe, min=0.0) / p.y_scale)
+    s4 = torch.exp(-torch.clamp(x - p.x_long_safe, min=0.0) / p.x_long_scale)
+    return s2 * s4
 
 
 def outcome_score(net_z, landing_xy, p: ServeRewardParams) -> torch.Tensor:
@@ -173,11 +206,40 @@ def outcome_score(net_z, landing_xy, p: ServeRewardParams) -> torch.Tensor:
     clearance = net_z - p.net_height
     s1 = torch.exp(-torch.clamp(p.net_margin - clearance, min=0.0) / p.net_scale)
     s1 = torch.where(torch.isfinite(net_z), s1, torch.zeros_like(s1))
-    x, y = landing_xy[..., 0], landing_xy[..., 1]
-    s2 = torch.exp(-torch.clamp(y.abs() - p.y_safe, min=0.0) / p.y_scale)
-    s3 = torch.exp(-(((x - p.x_target) / p.x_sigma) ** 2))
-    s4 = torch.exp(-torch.clamp(x - p.x_long_safe, min=0.0) / p.x_long_scale)
-    return s1 * s2 * (0.5 + 0.5 * s3) * s4
+    s3 = torch.exp(-(((landing_xy[..., 0] - p.x_target) / p.x_sigma) ** 2))
+    return s1 * (0.5 + 0.5 * s3) * outcome_guard(landing_xy, p)
+
+
+def reach_score(net_z, landing_xy, p: ServeRewardParams) -> torch.Tensor:
+    """Progress towards clearing the net by ``net_margin``, in [0, 1] (V2.1 2.1).
+
+    Over the net plane: missing height ``H_REQ - net_z``. Short of it: ``H_REQ`` plus the distance still
+    missing to the net (canonical x, net at 0). 1 once the net is cleared by the margin; 0 for a ball
+    landing at or behind the serve point.
+    """
+    h_req = p.net_height + p.net_margin
+    crossed = torch.isfinite(net_z)
+    d = torch.where(crossed, torch.clamp(h_req - torch.where(crossed, net_z, torch.zeros_like(net_z)), min=0.0),
+                    h_req + torch.clamp(-landing_xy[..., 0], min=0.0))
+    return torch.clamp(1.0 - d / (h_req + p.reach_x0), 0.0, 1.0)
+
+
+def outcome_pred_score(net_z, landing_xy, p: ServeRewardParams) -> torch.Tensor:
+    """``outcome_pred`` in [0, 1]: V3 outcome blended with the guarded reach (``reach_lambda``)."""
+    lam = p.reach_lambda
+    base = outcome_score(net_z, landing_xy, p)
+    if lam <= 0.0:
+        return base
+    return (1.0 - lam) * base + lam * reach_score(net_z, landing_xy, p) * outcome_guard(landing_xy, p)
+
+
+def launch_score(vel_c: torch.Tensor, p: ServeRewardParams):
+    """``launch_dir`` in [0, 1] and the launch elevation (deg) of canonical shuttle velocities (V2.1 2.3)."""
+    vh = torch.sqrt(vel_c[..., 0] ** 2 + vel_c[..., 1] ** 2)
+    el = torch.rad2deg(torch.atan2(vel_c[..., 2], vh.clamp_min(1e-6)))
+    off = torch.clamp((el - p.launch_el_target_deg).abs() - p.launch_el_flat_deg, min=0.0)
+    s = torch.exp(-((off / p.launch_el_sigma_deg) ** 2)) * torch.clamp(vel_c.norm(dim=-1) / p.launch_speed_ref, max=1.0)
+    return torch.where(vel_c[..., 0] > 0, s, torch.zeros_like(s)), el
 
 
 @dataclass
@@ -340,17 +402,22 @@ class ServeRewardComputer:
         self.tunnel_given |= tunnel
         role_vals["tunnel"][:, 0] = w["tunnel"] * tunnel.float()
 
-        # Outcome prediction one control step after the hit, unless the rally already ended on a fault.
+        # Outcome prediction and launch direction one control step after the hit, unless the rally already
+        # ended on a fault.
         due = self.outcome_pending & ~(s.just_resolved & (s.winner != server))
         score = torch.zeros(n, device=self.device)
+        launch = torch.zeros(n, device=self.device)
+        launch_el = torch.zeros(n, device=self.device)
         if bool(due.any()):
             ids = due.nonzero(as_tuple=False).squeeze(-1)
             pos_c = to_canonical(s.shuttle_pos[ids], server[ids])
             vel_c = to_canonical(s.shuttle_vel[ids], server[ids])
             net_z, land = predict_flight(pos_c, vel_c, p.drag_over_mass, p.gravity, dt=p.flight_dt,
                                          max_steps=int(4.0 / p.flight_dt))
-            score[ids] = outcome_score(net_z, land, p)
+            score[ids] = outcome_pred_score(net_z, land, p)
+            launch[ids], launch_el[ids] = launch_score(vel_c, p)
         role_vals["outcome_pred"][:, 0] = w["outcome_pred"] * score
+        role_vals["launch_dir"][:, 0] = w["launch_dir"] * launch
         self.outcome_pending = server_hit_now.clone()
 
         # Positive cap per rally, applied to the weighted positive terms together.
@@ -410,7 +477,7 @@ class ServeRewardComputer:
             self.values[k] = out
 
         self.done_now = s.just_resolved | return_now | self.fall_done
-        self._stats(s, contact, score, due, success, return_now, tunnel, server_down)
+        self._stats(s, contact, score, due, success, return_now, tunnel, server_down, launch_el)
         self.tunnel_now.zero_()
 
     # ------------------------------------------------------------------ bookkeeping
@@ -423,7 +490,7 @@ class ServeRewardComputer:
         self.pos_acc[ar, server] += add_roles[:, 0]
         self.pos_acc[ar, 1 - server] += add_roles[:, 1]
 
-    def _stats(self, s, contact, score, due, success, return_now, tunnel, server_down) -> None:
+    def _stats(self, s, contact, score, due, success, return_now, tunnel, server_down, launch_el) -> None:
         ar = torch.arange(s.server.shape[0], device=self.device)
         done = self.done_now
         server_hits = s.hit_count[ar, s.server] > 0
@@ -448,6 +515,9 @@ class ServeRewardComputer:
             "tunnel_n": f(tunnel),
             "vc_sum": (self.c_vc * contact.float()).sum(),
             "fall_after_hit": f(done & server_down & server_hits),
+            # Launch elevation, averaged over the scored launches (the step after the hit, rally not lost).
+            "launch_el_sum": (launch_el * due.float()).sum(),
+            "launch_n": f(due),
         }
         zero = torch.zeros((), device=self.device)
         self.iteration += torch.stack([add.get(k, zero) for k in STAT_KEYS])
@@ -476,12 +546,13 @@ class ServeRewardComputer:
         c = dict(zip(STAT_KEYS, counts.tolist() if hasattr(counts, "tolist") else list(counts)))
         r = max(c["rallies"], 1.0)
         k = max(c["contacts"], 1.0)
-        means = ("vn_sum", "el_sum", "hd_abs_sum", "outcome_sum", "vc_sum")
+        means = ("vn_sum", "el_sum", "hd_abs_sum", "outcome_sum", "vc_sum", "launch_el_sum", "launch_n")
         out = {key: c[key] / r for key in STAT_KEYS if key not in ("rallies", "contacts", *means)}
         out["fault"] = out["height"] + out["double"]
         out["tunnel"] = out.pop("tunnel_n")
         out.update(vn_mean=c["vn_sum"] / k, vc_mean=c["vc_sum"] / k, el_mean=c["el_sum"] / k,
-                   hd_abs_mean=c["hd_abs_sum"] / k, outcome_mean=c["outcome_sum"] / k, rallies=c["rallies"])
+                   hd_abs_mean=c["hd_abs_sum"] / k, outcome_mean=c["outcome_sum"] / k, rallies=c["rallies"],
+                   launch_el_mean=c.get("launch_el_sum", 0.0) / max(c.get("launch_n", 0.0), 1.0))
         return out
 
     def pop_iteration(self) -> dict:

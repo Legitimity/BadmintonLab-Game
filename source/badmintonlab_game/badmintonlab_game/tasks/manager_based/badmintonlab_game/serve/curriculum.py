@@ -64,7 +64,8 @@ class ServeCurriculum:
         if not self.blend_from or self.blend_left <= 0:
             return dict(target)
         f = self.blend_left / float(self.blend_iters)
-        return {k: f * self.blend_from[k] + (1.0 - f) * target[k] for k in TERMS}
+        # A term missing in blend_from (checkpoint from before the term existed) blends from its target.
+        return {k: f * self.blend_from.get(k, target[k]) + (1.0 - f) * target[k] for k in TERMS}
 
     def update(self, iteration: int, rates: dict) -> dict:
         """Returns the weights for the next iteration. Sets ``stop_reason`` to stop the run.

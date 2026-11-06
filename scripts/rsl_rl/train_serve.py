@@ -53,6 +53,12 @@ parser.add_argument(
     help="Override curriculum iteration counts, e.g. 'ema=100,blend=150,min=150' (min: every stage's minimum).",
 )
 parser.add_argument(
+    "--stage_weights",
+    default=None,
+    help="Override stage reward weights, e.g. 'B.launch_dir=3,C.launch_dir=1'. Reward parameters go through "
+    "hydra, e.g. env.serve_reward.reach_lambda=0.5.",
+)
+parser.add_argument(
     "--mini_batches",
     type=int,
     default=None,
@@ -75,6 +81,7 @@ from isaaclab_tasks.utils.hydra import hydra_task_config  # noqa: E402
 import badmintonlab_game.tasks  # noqa: E402,F401
 from badmintonlab_game.tasks.manager_based.badmintonlab_game.serve import player_cfg  # noqa: E402
 from badmintonlab_game.tasks.manager_based.badmintonlab_game.serve.curriculum import ServeCurriculum  # noqa: E402
+from badmintonlab_game.tasks.manager_based.badmintonlab_game.serve.serve_reward import STAGE_WEIGHTS  # noqa: E402
 from badmintonlab_game.tasks.manager_based.badmintonlab_game.serve.runner import (  # noqa: E402
     ServeRunner,
     find_latest,
@@ -219,6 +226,15 @@ def main(env_cfg, agent_cfg):
         agent_cfg.device = args_cli.device
     env_cfg.seed = agent_cfg.seed
     env_cfg.serve_reward.initial_stage = args_cli.stage
+    if args_cli.stage_weights:
+        # Before the env is built: the reward computer and the curriculum both read STAGE_WEIGHTS.
+        for item in args_cli.stage_weights.split(","):
+            key, value = (s.strip() for s in item.split("="))
+            stage, term = key.split(".")
+            if term not in STAGE_WEIGHTS[stage]:
+                raise KeyError(f"--stage_weights: unknown term {term!r}")
+            STAGE_WEIGHTS[stage][term] = float(value)
+        print(f"[INFO] stage weights overridden: {args_cli.stage_weights}")
     if args_cli.mini_batches is not None:
         agent_cfg.algorithm.num_mini_batches = args_cli.mini_batches
 
@@ -248,6 +264,9 @@ def main(env_cfg, agent_cfg):
             pose_init=not args_cli.no_pose_init,
             stage=args_cli.stage,
             curriculum=not args_cli.no_curriculum,
+            curriculum_iters=args_cli.curriculum_iters,
+            stage_weights=args_cli.stage_weights,
+            serve_reward={k: v for k, v in vars(env_cfg.serve_reward).items() if isinstance(v, (int, float, str, bool))},
             num_mini_batches=agent_cfg.algorithm.num_mini_batches,
             samples_per_iteration=2 * env_cfg.scene.num_envs * agent_cfg.num_steps_per_env,
         ),

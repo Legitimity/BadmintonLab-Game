@@ -196,10 +196,13 @@ def test_outcome_one_step_later_and_cap():
     assert ev(c, "outcome_pred").item() == 0.0
     pos, vel = _launch(10.0, 45)
     c.end_step(inputs(n, hit_count=hc, shuttle_pos=pos, shuttle_vel=vel))
-    # outcome_pred would be ~4 * 0.8, but only 5 - first is left under the cap of 5.
-    assert ev(c, "outcome_pred").item() == pytest.approx(5.0 - first, abs=1e-4)
+    # outcome_pred + launch_dir would be ~4 * 0.8 + 2, but only 5 - first is left under the cap of 5
+    # (V2.1: the two share the cap, scaled by the same factor).
+    second = ev(c, "outcome_pred").item() + ev(c, "launch_dir").item()
+    assert second == pytest.approx(5.0 - first, abs=1e-4)
+    assert ev(c, "launch_dir").item() > 0.0
     c.end_step(inputs(n, hit_count=hc, shuttle_pos=pos, shuttle_vel=vel))
-    assert ev(c, "outcome_pred").item() == 0.0
+    assert ev(c, "outcome_pred").item() == 0.0 and ev(c, "launch_dir").item() == 0.0
 
 
 def test_side1_server_uses_canonical_frame():
@@ -463,8 +466,10 @@ def test_stage_tables():
     assert a["fall"] == b["fall"] == c["fall"] == -10.0
     # Positive shaping per serve must stay below the result: max of the event terms < serve_result.
     for w in (a, b, c):
-        assert w["legal_contact"] + w["swing_speed"] + w["face_quality"] + w["outcome_pred"] < w["serve_result"]
-    assert set(a) == set(R.TERMS)
+        assert sum(w[k] for k in R.POSITIVE_TERMS) < w["serve_result"]
+    assert (a["launch_dir"], b["launch_dir"], c["launch_dir"]) == (1.0, 2.0, 1.0)
+    assert sum(b[k] for k in R.POSITIVE_TERMS) == pytest.approx(9.5)
+    assert set(a) == set(b) == set(c) == set(R.TERMS)
     s = C.DEFAULT_STAGES
     assert (s["A"].min_iters, s["A"].max_iters, s["B"].max_iters, s["C"].max_iters) == (200, 1500, 4000, 4000)
     assert s["C"].gate["in"] == (">=", 0.85)
@@ -485,6 +490,148 @@ def test_tunnel_detects_racket_sweeping_past_a_slow_shuttle():
     c.capture_tunnel(server, racket_now, q, shuttle_now, shuttle_prev, no_contact)
     c.end_step(inputs(n))
     assert ev(c, "tunnel").tolist() == pytest.approx([-2.0])
+
+
+def _flight(pos, vel, p):
+    return RULES.predict_flight(torch.tensor(pos), torch.tensor(vel), p.drag_over_mass, dt=p.flight_dt,
+                                max_steps=int(4.0 / p.flight_dt))
+
+
+# ------------------------------------------------------------------ V2.1 reward fix (P3_REWARD_FIX_AND_E1B)
+def test_reach_backward_short_net_and_clear():
+    p = R.ServeRewardParams()
+    # Backward / dropped at the serve point: 0.
+    for vel in ([-3.0, 0.0, 2.0], [0.0, 0.0, 0.0]):
+        nz, land = _flight([[-2.55, 0.0, 1.0]], [vel], p)
+        assert R.reach_score(nz, land, p).item() == 0.0
+    # Short of the net: the further forward it lands, the higher.
+    short = []
+    for vx in (1.0, 2.0, 3.0):
+        nz, land = _flight([[-2.55, 0.0, 1.0]], [[vx, 0.0, 1.0]], p)
+        assert torch.isinf(nz).all() and land[0, 0] < 0
+        short.append(R.reach_score(nz, land, p).item())
+    assert 0 < short[0] < short[1] < short[2]
+    # Over the net plane below the net: higher crossing, higher reach; above the short ones.
+    net_z = torch.tensor([0.3, 0.9, 1.5])
+    land = torch.tensor([[0.5, 0.0]] * 3)
+    r = R.reach_score(net_z, land, p)
+    assert short[2] < r[0] < r[1] < r[2] < 1.0
+    # Continuous at the net plane: a ball landing just before the net ~ one crossing at the floor.
+    a = R.reach_score(torch.tensor([-math.inf]), torch.tensor([[-1e-4, 0.0]]), p)
+    b = R.reach_score(torch.tensor([0.0]), torch.tensor([[0.1, 0.0]]), p)
+    assert a.item() == pytest.approx(b.item(), abs=1e-3)
+    # Clearing the net by >= 20 cm: 1.
+    r = R.reach_score(torch.tensor([1.75, 2.5]), torch.tensor([[1.5, 0.0], [3.0, 0.0]]), p)
+    assert r.tolist() == [1.0, 1.0]
+
+
+def test_outcome_pred_score_blend_and_v3_fallback():
+    p = R.ServeRewardParams()
+    nz, land = _flight([[-2.55, 0.0, 1.0]], [[2.0, 0.0, 1.0]], p)  # short of the net
+    assert R.outcome_score(nz, land, p).item() == 0.0
+    assert R.outcome_pred_score(nz, land, p).item() == pytest.approx(0.3 * R.reach_score(nz, land, p).item())
+    p0 = R.ServeRewardParams(reach_lambda=0.0)
+    pos, vel = _launch(10.0, 45)
+    nz, land = RULES.predict_flight(pos, vel, p.drag_over_mass, dt=p.flight_dt, max_steps=200)
+    assert R.outcome_pred_score(nz, land, p0).item() == R.outcome_score(nz, land, p0).item()
+    # A long serve keeps its guard: the reach share cannot pay an out-long serve.
+    nz, land = _flight([[-2.55, 0.0, 0.7]], [[30 * math.cos(0.44), 0.0, 30 * math.sin(0.44)]], p)
+    assert land[0, 0] > 6.7 and R.outcome_pred_score(nz, land, p).item() < 0.1
+
+
+def test_face_quality_tail():
+    p = R.ServeRewardParams()
+    p0 = R.ServeRewardParams(face_tail_weight=0.0)
+    t = p.elevation_target_deg
+    on = R.face_quality(torch.tensor([t]), torch.tensor([0.0]), p)
+    assert on.item() == R.face_quality(torch.tensor([t]), torch.tensor([0.0]), p0).item() == 1.0
+    # 0.4 * exp(-1) = 0.147 at 25 deg off (the design's "0.15", rounded); 0.08 at 40 deg.
+    q25 = R.face_quality(torch.tensor([t + 25.0, t - 25.0]), torch.zeros(2), p)
+    assert q25.min().item() >= 0.145 and q25.max().item() == pytest.approx(0.4 * math.exp(-1.0), abs=1e-6)
+    assert R.face_quality(torch.tensor([t + 40.0]), torch.zeros(1), p).item() == pytest.approx(0.0808, abs=1e-3)
+    d = torch.linspace(0.0, 60.0, 241)
+    for sign in (1.0, -1.0):
+        q = R.face_quality(t + sign * d, torch.zeros_like(d), p)
+        assert (q[1:] <= q[:-1] + 1e-7).all()
+    # The heading factor still applies to the tail.
+    assert R.face_quality(torch.tensor([t + 25.0]), torch.tensor([15.0]), p).item() == pytest.approx(
+        0.4 * math.exp(-1.0) * math.exp(-1.0), abs=1e-6)
+
+
+def _vel(speed, el_deg, head_deg=0.0):
+    e, h = math.radians(el_deg), math.radians(head_deg)
+    return [speed * math.cos(e) * math.cos(h), speed * math.cos(e) * math.sin(h), speed * math.sin(e)]
+
+
+def test_launch_score_values():
+    p = R.ServeRewardParams()
+    v = torch.tensor([_vel(8.0, 38.0), _vel(9.0, 45.0), _vel(8.0, 52.0), _vel(4.0, 45.0), _vel(8.0, 72.0),
+                      _vel(8.0, 45.0, 180.0), [0.0, 0.0, 8.0]])
+    s, el = R.launch_score(v, p)
+    assert s[:3].tolist() == pytest.approx([1.0, 1.0, 1.0], abs=1e-5)
+    assert s[3].item() == pytest.approx(0.5, abs=1e-5)  # half the reference speed
+    assert s[4].item() == pytest.approx(math.exp(-1.0), abs=1e-4)  # 72 deg: 20 deg past the flat band
+    assert s[5].item() == 0.0 and s[6].item() == 0.0  # backwards / straight up: vx <= 0
+    assert el[1].item() == pytest.approx(45.0, abs=1e-4)
+
+
+def _serve(c, vel, pos=(-2.3, 0.0, 1.0), resolved_fault=False):
+    """Hit, then the launch one control step later. Returns the second step's event values."""
+    n = 1
+    q = quat_for_normal(55, 0)
+    jh, hc = _hit(c, n, q, torch.zeros(3))
+    c.end_step(inputs(n, just_hit=jh, hit_count=hc))
+    first = {k: ev(c, k).item() for k in R.POSITIVE_TERMS}
+    kw = dict(just_resolved=torch.tensor([True]), winner=torch.tensor([1]), double_fault=torch.tensor([True])) \
+        if resolved_fault else {}
+    c.end_step(inputs(n, hit_count=hc, shuttle_pos=torch.tensor([list(pos)]), shuttle_vel=torch.tensor([vel]), **kw))
+    return first, {k: ev(c, k).item() for k in R.TERMS}
+
+
+def test_launch_dir_event_fault_and_cap():
+    c = make(1, "B", positive_cap=100.0)
+    _, second = _serve(c, _vel(9.0, 45.0))
+    assert second["launch_dir"] == pytest.approx(2.0, abs=1e-4)
+    stats = c.pop_iteration()
+    assert stats["launch_el_mean"] == pytest.approx(45.0, abs=1e-3)
+    # Not paid when the rally ended on a fault at that step.
+    c = make(1, "B")
+    _, second = _serve(c, _vel(9.0, 45.0), resolved_fault=True)
+    assert second["launch_dir"] == 0.0 and second["outcome_pred"] == 0.0
+    # Counted in the positive cap together with outcome_pred.
+    c = make(1, "B", positive_cap=4.0)
+    first, second = _serve(c, _vel(9.0, 45.0))
+    paid = sum(first.values()) + second["outcome_pred"] + second["launch_dir"]
+    assert paid == pytest.approx(4.0, abs=1e-4)
+
+
+# Exit velocities of the calibrated contact model (restitution 0.65, friction 0.11, shuttle falling at
+# 4.3 m/s, racket moving along the face normal), contact at (-2.3, 0, 1.0):
+#   face 55 deg / swing 3 m/s -> (5.20, 0, 5.19): over the net at 1.80 m, lands 1.25 m in
+#   face 78 deg / swing 2 m/s -> (1.25, 0, 5.90): lands 1.2 m short of the net
+#   "into the net": a steeper, slower launch (55 deg, 6.5 m/s) crossing the net plane at 1.21 m.
+TYPICAL = {
+    "in": [5.20, 0.0, 5.19],
+    "short": [1.25, 0.0, 5.90],
+    "net": [6.5 * math.cos(math.radians(55.0)), 0.0, 6.5 * math.sin(math.radians(55.0))],
+}
+
+
+def test_typical_serves_rank_and_spread():
+    p = R.ServeRewardParams()
+    nz = {k: _flight([[-2.3, 0.0, 1.0]], [v], p)[0].item() for k, v in TYPICAL.items()}
+    assert nz["in"] > p.net_height + 0.2 and math.isinf(nz["short"]) and 0.0 < nz["net"] < p.net_height
+    new, old = {}, {}
+    for name, vel in TYPICAL.items():
+        _, s = _serve(make(1, "B"), vel)
+        new[name] = s["outcome_pred"] + s["launch_dir"]
+        c_old = make(1, "B", reach_lambda=0.0, face_tail_weight=0.0)
+        c_old.set_weights({"launch_dir": 0.0})  # V3 reward
+        _, s = _serve(c_old, vel)
+        old[name] = s["outcome_pred"]
+    assert new["in"] > new["net"] > new["short"] > 0.0
+    assert new["in"] - new["short"] > old["in"] - old["short"]
+    assert old["short"] == 0.0
 
 
 def test_contact_elevation_uses_face_met_by_falling_shuttle():
