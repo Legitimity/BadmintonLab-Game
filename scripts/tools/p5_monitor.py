@@ -266,25 +266,31 @@ def check_training(st, sc):
         v = sc.get(name, {}).get(last)
         if v is not None and not math.isfinite(v) and name != "Teach/mse":
             request_stop(st, f"6.2: {name} is {v} at it={last}")
-    to = window_mean(sc.get("Recv/timeout", {}), last, 200)
-    if to is not None and to > 0.02 and last >= 200:
+    # Timeout: only over a full window of 200 iterations of this run, skipping its first 50 (RSL-RL starts the
+    # episodes at random lengths, so the first iterations of every (resumed) run are mostly time-outs: 1.0, 0.86, ...).
+    ts = sc.get("Recv/timeout", {})
+    first = min(ts) if ts else 0
+    steady = {k: v for k, v in ts.items() if k >= first + 50}
+    to = window_mean(steady, last, 200) if len(steady) >= 200 else None
+    if to is not None and to > 0.02:
         request_stop(st, f"6.2: timeout rate {to:.3f} > 0.02 (mean of 200 iterations) at it={last}")
     if level == 0 and iters >= 1000 and (ema("f_touch") or 0) < 0.3:
         alert(st, "L0_1000", f"7.1: L0 {iters} iterations, EMA f_touch={ema('f_touch')} < 0.3 (check targets / racket_near)")
     fell = window_mean(sc.get("Recv/f_fell", {}), last, 100)
-    if fell is not None and fell > 0.10 and last >= 300:
+    if fell is not None and fell > 0.10 and len(sc.get("Recv/f_fell", {})) >= 300:
         alert(st, f"fell_{last // 1000}", f"7.1: receiver fall (feeder) {fell:.3f} > 0.10 (doc: approach cap 0.7 m/s)")
     tun = window_mean(sc.get("Recv/f_tunnel", {}), last, 100)
-    if tun is not None and tun > 0.25 and last >= 300:
+    if tun is not None and tun > 0.25 and len(sc.get("Recv/f_tunnel", {})) >= 300:
         alert(st, f"tunnel_{last // 1000}", f"risk 5: receive tunnel {tun:.3f} > 0.25")
     mse = sc.get("Teach/mse", {})
-    if last >= 1000 and mse:
+    if len(mse) >= 1000:
         a, b = window_mean(mse, last - 500, 200), window_mean(mse, last, 200)
         if a and b and b > 2.0 * a and b > 0.05:
             alert(st, f"mse_{last // 1000}", f"7.1: Teach/mse rising {a:.3g} -> {b:.3g} (doc: beta floor 0.1 -> 0.3 if serve drops)")
-    for k in sorted(lvl):
-        if k > 0 and int(round(lvl[k])) != int(round(lvl.get(max(s for s in lvl if s < k), lvl[k]))):
-            alert(st, f"promo_{int(round(lvl[k]))}", f"curriculum: level L{int(round(lvl[k]))} from iteration {k}")
+    steps = sorted(lvl)
+    for a, b in zip(steps, steps[1:]):
+        if int(round(lvl[b])) != int(round(lvl[a])):
+            alert(st, f"promo_{int(round(lvl[b]))}", f"curriculum: level L{int(round(lvl[b]))} from iteration {b}")
 
 
 def main():
