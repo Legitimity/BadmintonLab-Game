@@ -30,11 +30,11 @@ UPPER_JOINTS = (
     "Right_Elbow_Yaw",
 )
 DENSE = ("track", "face_front", "base_height", "base_orientation", "feet_air_time", "step_height", "foot_posture",
-         "no_double_flight", "feet_slide", "acc_reg", "hold_ready")  # fmt: skip
+         "no_double_flight", "feet_slide", "acc_reg", "hold_ready", "approach")  # fmt: skip
 EVENTS = ("touchdown_speed", "gait_symmetry", "fall")
 TERMS = DENSE + EVENTS
 S1_WEIGHTS = dict(
-    track=2.0, face_front=0.5, base_height=-10.0, base_orientation=-2.0, feet_air_time=1.0, step_height=0.5,
+    track=4.0, approach=2.0, face_front=0.5, base_height=-10.0, base_orientation=-2.0, feet_air_time=1.0, step_height=0.5,
     foot_posture=-0.5, no_double_flight=-1.0, feet_slide=-0.1, acc_reg=-2.5e-7, hold_ready=0.3,
     touchdown_speed=-0.5, gait_symmetry=-0.2, fall=-10.0,
 )  # fmt: skip
@@ -221,6 +221,7 @@ class ReceiveBadmintonEnv(ServeBadmintonEnv):
         self.balls_done += ended.long()
         self.gap_left = torch.where(ended, torch.full_like(self.gap_left, self.gap_steps), self.gap_left)
         self._d = d
+        self._v_to = v
 
     def _yaw(self) -> torch.Tensor:
         q = self._robots[0].data.root_quat_w
@@ -236,6 +237,8 @@ class ReceiveBadmintonEnv(ServeBadmintonEnv):
         active = self.ball_active.float()
         far = (self.ball_active & (d > 0.3)).float()
         v["track"] = w["track"] * core.r_track(d) * active
+        # 11-08 local change (S1 300-iter check failed: v_to_station ~0): dense speed towards the station.
+        v["approach"] = w["approach"] * self._v_to.clamp(-0.5, 0.8) * far
         dpsi = _wrap(self._yaw() - self.ready_yaw)
         v["face_front"] = w["face_front"] * torch.exp(-((dpsi / 0.4) ** 2))
         z = robot.data.root_pos_w[:, 2] - self.scene.env_origins[:, 2]
