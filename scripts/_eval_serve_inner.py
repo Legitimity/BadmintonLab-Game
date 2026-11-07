@@ -74,6 +74,11 @@ def main():
     pre_z = torch.zeros(n, device=device)
     pre_hit = torch.zeros(n, dtype=torch.bool, device=device)
     pre_gz = torch.full((n,), -1.0, device=device)
+    pre_hit_opp = torch.zeros(n, dtype=torch.bool, device=device)
+    pre_x = torch.zeros(n, device=device)
+    shuttle = u.scene["shuttle"]
+    origin_x = u.scene.env_origins[:, 0]
+    sign_me = 1.0 if me == 0 else -1.0  # canonical x of our side: own half at x < 0
     original_reset = u._reset_idx
 
     def reset_with_snapshot(env_ids):
@@ -81,15 +86,22 @@ def main():
         pre_z[ids] = robot.data.root_pos_w[ids, 2] - origin_z[ids]
         pre_hit[ids] = u.just_hit[ids, me]
         pre_gz[ids] = robot.data.projected_gravity_b[ids, 2]
+        pre_hit_opp[ids] = u.just_hit[ids, other]
+        pre_x[ids] = sign_me * (shuttle.data.root_pos_w[ids, 0] - origin_x[ids])
         return original_reset(env_ids)
 
     u._reset_idx = reset_with_snapshot
     fall_t = torch.full((n,), -1.0, device=device)
     hit_t = torch.full((n,), -1.0, device=device)
     timing = {"serve": {"len": [], "hit": [], "fall": [], "fall_after_hit": []}, "receive": {"len": [], "hit": [], "fall": [], "fall_after_hit": []}}
-    keys = keys + ("fell_before_hit", "fell_after_hit")
+    extra = ("fell_before_hit", "fell_after_hit", "crossed", "return_in", "return_in_standing", "opp_hit_after")
+    recv_keys = ("opp_served", "r_touch", "r_crossed", "r_in", "r_fell", "r_fell_after_hit")
+    keys = keys + extra
     for s_ in stats.values():
-        s_.update({k: 0 for k in ("fell_before_hit", "fell_after_hit")})
+        s_.update({k: 0 for k in extra + recv_keys})
+    crossed = torch.zeros(n, dtype=torch.bool, device=device)
+    opp_after = torch.zeros(n, dtype=torch.bool, device=device)
+    opp_first = torch.zeros(n, dtype=torch.bool, device=device)
     wall = time.time()
     while total < args.rallies * n:
         with torch.inference_mode():
@@ -108,6 +120,13 @@ def main():
         now_fell = (z < args.fall_height) | (gz > -args.upright_cos)
         fall_t = torch.where(now_fell & (fall_t < 0), torch.full_like(fall_t, sim_t), fall_t)
         fell |= now_fell
+        # Receive metrics: the opponent served (touched first); after our first hit the shuttle reached the
+        # other half; the opponent hit it again after our hit.
+        opp_hit = torch.where(resolved, pre_hit_opp, u.just_hit[:, other])
+        opp_first |= opp_hit & ~ours_hit & ~new_hit
+        opp_after |= ours_hit & ~new_hit & opp_hit
+        x_c = torch.where(resolved, pre_x, sign_me * (shuttle.data.root_pos_w[:, 0] - origin_x))
+        crossed |= ours_hit & (x_c > 0.0)
         stuck = (sim_t - started) > args.watchdog_s
         done = resolved | stuck
         if done.any():
@@ -132,6 +151,19 @@ def main():
                 s["served_in_standing"] += int(won and bool(ours_hit[i]) and not bool(fell[i]))
                 s["fell"] += int(fell[i])
                 s["hits_ours"] += int(ours_hits[i])
+                s["crossed"] += int(bool(crossed[i]))
+                # Return in: it crossed and either landed in (rally won without an opponent hit) or was played back.
+                s["return_in"] += int(bool(crossed[i]) and (won or bool(opp_after[i])))
+                s["return_in_standing"] += int(bool(crossed[i]) and (won or bool(opp_after[i])) and not bool(fell[i]))
+                s["opp_hit_after"] += int(bool(opp_after[i]))
+                if role == "receive" and bool(opp_first[i]):
+                    # Receive metrics of 6.1, per legal opponent serve (the opponent touched the shuttle first).
+                    s["opp_served"] += 1
+                    s["r_touch"] += int(bool(ours_hit[i]) and not double)
+                    s["r_crossed"] += int(bool(crossed[i]))
+                    s["r_in"] += int(bool(crossed[i]) and (won or bool(opp_after[i])) and not bool(fell[i]))
+                    s["r_fell"] += int(fell[i])
+                    s["r_fell_after_hit"] += int(bool(fell[i]) and hit_t[i] >= 0 and fall_t[i] >= hit_t[i])
                 t0 = float(started[i])
                 tl = timing[role]
                 tl["len"].append(sim_t - t0)
@@ -148,6 +180,9 @@ def main():
             server[done] = u.next_hitter[done]
             ours_hit[done] = False
             ours_hits[done] = 0
+            crossed[done] = False
+            opp_after[done] = False
+            opp_first[done] = False
             fell[done] = False
             fall_t[done] = -1.0
             hit_t[done] = -1.0
@@ -164,6 +199,10 @@ def main():
         s["rates"] = {k: s[k] / r for k in keys if k != "rallies"}
         # Seconds from the rally start (hit, fall, rally length) and from our hit to the fall.
         s["timing_s"] = {k: summary(v) for k, v in timing[role].items()}
+    rv = stats["receive"]
+    m = max(rv["opp_served"], 1)
+    rv["recv"] = {"recv_rallies": rv["opp_served"], "recv_touch": rv["r_touch"] / m, "recv_crossed": rv["r_crossed"] / m,
+                  "recv_in": rv["r_in"] / m, "recv_fell": rv["r_fell"] / m, "recv_fell_after_hit": rv["r_fell_after_hit"] / m}
     out = dict(obs_dims=dims, num_envs=n, seed=args.seed, wall_s=time.time() - wall, **stats)
     print("[SERVE_EVAL]" + json.dumps(out), flush=True)
     env.close()

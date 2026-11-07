@@ -265,3 +265,65 @@ def test_flight_prediction_matches_fine_integration():
     fine_net, fine_land = rules.predict_flight(pos, vel, drag, dt=0.0005, max_steps=8000)
     assert torch.allclose(coarse_net, fine_net, atol=0.03)
     assert torch.allclose(coarse_land, fine_land, atol=0.05)
+
+
+@pytest.mark.parametrize("seed", range(3))
+def test_inject_serve_matches_a_real_serve_in_play(play, seed):
+    """P5 2.2: after ``inject_serve`` every ruling matches play after the feeder's real (legal) serve."""
+    cls, court_mod = play
+    n = 256
+    g = torch.Generator().manual_seed(100 + seed)
+    s = _make_play_self(cls, court_mod, n)
+    r = rules.MatchRules(n, "cpu", _court_geometry(court_mod))
+    feeder = torch.randint(0, 2, (n,), generator=g)
+    sign = torch.where(feeder == 0, -1.0, 1.0)
+    s.next_hitter[:] = feeder
+    r.next_hitter[:] = feeder
+    pos = torch.zeros((n, 3))
+    pos[:, 0] = 2.55 * sign
+    pos[:, 2] = 2.2
+    for t in (s.prev_shuttle_pos_w, s.curr_shuttle_pos_w, r.prev_pos, r.curr_pos):
+        t[:] = pos
+    origins = torch.zeros((n, 3))
+    k0 = torch.randint(5, 40, (n,), generator=g)
+    ar = torch.arange(n)
+    injected = 0
+    for step in range(400):
+        before = step < k0
+        at = step == k0
+        after = step > k0
+        # Drop on the feeder's side down to ~1.0 m (no landing, no fault), then a random walk.
+        drop = pos.clone()
+        drop[:, 0] = 2.55 * sign
+        drop[:, 1] = 0.0
+        drop[:, 2] = 2.2 - 1.2 * (step + 1) / (k0 + 1).float()
+        walk = pos + torch.randn((n, 3), generator=g) * torch.tensor([0.5, 0.5, 0.25])
+        pos = torch.where((before | at)[:, None], drop, walk)
+        contact = (torch.rand((n, 2), generator=g) < 0.06) & after[:, None]
+        contact[ar, feeder] &= step != k0 + 1  # a real serve contact ends after its step
+        play_contact = contact.clone()
+        play_contact[ar, feeder] |= at
+        for side in range(2):
+            s._contacts[side].data.force_matrix_w[:, 0, 0, 0] = play_contact[:, side].float() * 5.0
+        s._shuttle.data.root_pos_w = pos.clone()
+        cls._detect_landing(s)
+        r.detect_landing(pos[:, 2], 0.03)
+        cls._update_hits(s)
+        r.update_hits(contact, pos[:, 2])
+        ids = at.nonzero().flatten()
+        if ids.numel():
+            r.inject_serve(ids, feeder[ids])
+            injected += ids.numel()
+            # The real serve was legal and is the only difference: just_hit of that step.
+            assert bool(s.just_hit[ids, feeder[ids]].all()) and not bool(s.serve_height_fault[ids].any())
+            s.just_hit[ids] = r.just_hit[ids]
+        cls._update_rally_result(s)
+        r.update_rally_result(pos.clone(), origins)
+        _assert_same(s, r, f"divergence after injection, seed {seed} step {step}")
+        if step % 4 == 3:
+            s.just_hit.zero_()
+            r.just_hit.zero_()
+    assert injected == n
+    # Not vacuous: rallies were decided both ways after the injection, including receiver hits.
+    assert bool(r.rally_resolved.float().mean() > 0.9)
+    assert set(r.rally_winner.tolist()) >= {0, 1}

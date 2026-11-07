@@ -15,6 +15,17 @@ class ServePolicyVecEnvWrapper(SharedPolicyVecEnvWrapper):
         return TensorDict({"policy": policy, "critic": critic}, batch_size=[self.num_envs])
 
 
+class ReceivePolicyVecEnvWrapper(ServePolicyVecEnvWrapper):
+    """P5: adds the P5 critic group ``p5c`` and the sample weights ``aux`` = [learn_w, teach_w]."""
+
+    def _agent_obs(self, obs_dict: dict[str, torch.Tensor]) -> TensorDict:
+        td = super()._agent_obs(obs_dict)
+        td["p5c"] = torch.cat((obs_dict["p5c_0"], obs_dict["p5c_1"]), dim=0)
+        aux = self.unwrapped.p5_aux()
+        td["aux"] = torch.cat((aux[:, 0], aux[:, 1]), dim=0)
+        return td
+
+
 def hold_action(q_ready: torch.Tensor, offset: torch.Tensor, scale: torch.Tensor) -> torch.Tensor:
     """Raw action whose target is ``q_ready``: the inverse of ``raw * scale + offset``."""
     return (q_ready - offset) / scale

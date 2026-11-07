@@ -11,3 +11,13 @@ gym.register(
         "rsl_rl_cfg_entry_point": f"{__name__}.agents:ServePPORunnerCfg",
     },
 )
+
+gym.register(
+    id="BadmintonLab-Game-Receive",
+    entry_point=f"{__name__}.p5_env:ReceiveBadmintonEnv",
+    disable_env_checker=True,
+    kwargs={
+        "env_cfg_entry_point": f"{__name__}.p5_env_cfg:ReceiveEnvCfg",
+        "rsl_rl_cfg_entry_point": f"{__name__}.agents:ReceivePPORunnerCfg",
+    },
+)

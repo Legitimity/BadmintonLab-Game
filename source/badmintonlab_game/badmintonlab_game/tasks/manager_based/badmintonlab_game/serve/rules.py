@@ -135,6 +135,19 @@ class MatchRules:
         self.step_out_fault |= shot_fault & out_fault
         self.step_just_resolved |= self.rally_resolved & ~was_resolved
 
+    def inject_serve(self, env_ids: torch.Tensor, server: torch.Tensor) -> None:
+        """P5 feeder launch: the rule state after a legal serve by ``server`` (P5_RECEIVE_DESIGN 2.2).
+
+        Same as the state ``update_hits`` leaves after a valid opening hit, without a contact: no
+        serve-height check (it is not a real hit), no ``just_hit`` (no hit reward or statistic) and
+        ``in_contact`` untouched. The feeder's hit count lives in the environment (``hit_count``).
+        Every later ruling then matches play after a real serve (tests/test_rules_vs_play.py).
+        """
+        server = torch.as_tensor(server, device=self.next_hitter.device, dtype=torch.long)
+        live = ~self.rally_resolved[env_ids]
+        self.last_hitter[env_ids] = torch.where(live, server, self.last_hitter[env_ids])
+        self.next_hitter[env_ids] = torch.where(live, 1 - server, self.next_hitter[env_ids])
+
     def reset(self, env_ids: torch.Tensor, opening_hitter: torch.Tensor, shuttle_pos_w: torch.Tensor) -> None:
         self.just_hit[env_ids] = False
         self.next_hitter[env_ids] = opening_hitter

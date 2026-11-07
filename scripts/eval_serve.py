@@ -8,7 +8,10 @@ restores the originals afterwards; play's rule code is never modified.
         --ours exports/serve_1000 --opponent model_test --side 0 --num_envs 16 --rallies 200
 
 ``--opponent`` is ``model_test`` (the course model with play's default config), ``zero``
-(our config, zero action: tests our serve alone) or a directory with policy.pt + player_cfg.py.
+(our config, zero action: tests our serve alone), a ``.pt`` file (TorchScript with play's default config,
+e.g. the baseline ``/root/autodl-tmp/policy.pt``) or a directory with policy.pt + player_cfg.py.
+The ``receive`` block has ``crossed`` / ``return_in`` / ``return_in_standing`` (our return reached the other
+half and landed in or was played back) besides the serve counters.
 """
 
 from __future__ import annotations
@@ -65,7 +68,7 @@ def main():
         elif a.opponent == "model_test":
             opp_model = str(a.play_root / "model_test.pt")  # play's own default config stays in place
         else:
-            opp = Path(a.opponent)
+            opp = Path(a.opponent).resolve()
             targets[opp_side].write_text(cfg_for_side(opp / "player_cfg.py", opp_side), encoding="utf-8")
             opp_model = str(opp / "policy.pt")
         models = {a.side: str(a.ours / "policy.pt"), opp_side: opp_model}

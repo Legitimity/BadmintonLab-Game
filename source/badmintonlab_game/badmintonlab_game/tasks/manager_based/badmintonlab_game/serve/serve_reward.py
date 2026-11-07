@@ -120,6 +120,8 @@ class ServeRewardParams:
     hold_sigma2: float = 0.1  # rad^2, on the mean squared joint error
     positive_cap: float = 8.0  # per rally, on the weighted positive terms
     end_on_return: bool = True  # M1: the rally ends when the receiver touches a legal serve
+    # P5: False switches off hold_ready for the receiver (it would punish stepping, P5_RECEIVE_DESIGN 3).
+    receiver_hold: bool = True
     flight_dt: float = 0.02
     drag_over_mass: float = 0.00110 / 0.00519
     gravity: float = 9.81
@@ -300,6 +302,11 @@ class ServeRewardComputer:
         self.prev_face_n = z(n, 3)
         self.prev_face_valid = z(n, dt=torch.bool)
         self.iteration = torch.zeros(len(STAT_KEYS), device=device)
+        # P5: False in feeder rallies, where the opening hitter is the feeder: no server reward, statistic or
+        # fall termination for it. Set by the environment at reset; all True in P3.
+        self.natural = torch.ones(n, dtype=torch.bool, device=device)
+        # The serve statistics of a rally are counted once, also when the rally goes on after the return.
+        self.stat_given = z(n, dt=torch.bool)
         self.set_incoming_speed(4.3)
 
     # ------------------------------------------------------------------ weights
@@ -385,7 +392,7 @@ class ServeRewardComputer:
         # Dense: keep the ready pose. The server's swing joints are masked out, and the server
         # is free once it has hit (V3: "before the hit or while not serving").
         q_err = s.joint_pos - self.q_ready
-        active = (~server_hits, torch.ones_like(server_hits))
+        active = (~server_hits, torch.full_like(server_hits, bool(p.receiver_hold)))
         for role, who in ((0, server), (1, receiver)):
             err = q_err[ar, who] * self.hold_masks[role]
             mse = (err * err).sum(-1) / self.hold_masks[role].sum().clamp(min=1.0)
@@ -468,6 +475,12 @@ class ServeRewardComputer:
         self.result_given |= success | failure
         role_vals["serve_result"][:, 0] = w["serve_result"] * (success.float() - failure.float())
 
+        # Feeder rallies (P5): the feeder earns nothing and its fall does not end the rally.
+        nat = self.natural.float()
+        for k in TERMS:
+            role_vals[k][:, 0] = role_vals[k][:, 0] * nat
+        self.fall_done = self.fall_done & self.natural
+
         # Back to per-side columns, events scaled to cancel the RewardManager's dt.
         for k in TERMS:
             rv = role_vals[k] * (ev if k in EVENT_TERMS else 1.0)
@@ -492,7 +505,10 @@ class ServeRewardComputer:
 
     def _stats(self, s, contact, score, due, success, return_now, tunnel, server_down, launch_el) -> None:
         ar = torch.arange(s.server.shape[0], device=self.device)
-        done = self.done_now
+        done = self.done_now & ~self.stat_given & self.natural
+        self.stat_given |= self.done_now
+        contact, due, tunnel = contact & self.natural, due & self.natural, tunnel & self.natural
+        return_now = return_now & self.natural
         server_hits = s.hit_count[ar, s.server] > 0
         f = lambda m: m.float().sum()  # noqa: E731
         add = {
@@ -524,13 +540,13 @@ class ServeRewardComputer:
 
     def count_timeouts(self, timed_out: torch.Tensor) -> None:
         """Rallies cut by the episode timeout, e.g. a shuttle resting on a robot. Call before ``reset``."""
-        t = (timed_out & ~self.done_now).float().sum()
+        t = (timed_out & ~self.stat_given & self.natural).float().sum()
         self.iteration[STAT_KEYS.index("timeout")] += t
         self.iteration[STAT_KEYS.index("rallies")] += t
 
     def reset(self, env_ids: torch.Tensor) -> None:
         for t in (self.c_have, self.outcome_pending, self.no_hit_given, self.result_given, self.crossed,
-                  self.fell_server, self.return_done, self.fall_done, self.tunnel_given, self.tunnel_now):
+                  self.fell_server, self.return_done, self.fall_done, self.tunnel_given, self.tunnel_now, self.stat_given):
             t[env_ids] = False
         self.fall_given[env_ids] = False
         self.prev_face_valid[env_ids] = False
