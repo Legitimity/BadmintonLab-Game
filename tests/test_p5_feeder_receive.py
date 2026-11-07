@@ -9,7 +9,7 @@ from _serve_pkg import load
 
 m = load("serve_reward", "rules", "feeder", "receive")
 fd, rc, sr = m["feeder"], m["receive"], m["serve_reward"]
-DRAG, G = 0.00519, 9.81
+DRAG, G = 0.00110 / 0.00519, 9.81  # k / m, as ServeRewardParams.drag_over_mass
 
 
 @pytest.fixture(scope="module")
@@ -53,9 +53,10 @@ def test_launch_target_in_band_and_reach(table):
     tz = table.col("tgt_z")
     assert float(tz.min()) >= table.p.band_lo - 1e-6 and float(tz.max()) <= table.p.band_hi + 1e-6
     assert float(table.col("tgt_x").min()) > table.p.band_x_min - 1e-6
-    home = torch.tensor(fd.RECV_HOME, dtype=table.data.dtype)
+    assert table.p.home == fd.RACKET_HOME and table.p.reach == fd.RACKET_REACH
+    home = torch.tensor(table.p.home, dtype=table.data.dtype)
     d_min = torch.linalg.norm(torch.stack((table.col("tgt_x"), table.col("tgt_y")), -1) - home, dim=-1)
-    need = (d_min - fd.REACH).clamp(min=0)
+    need = (d_min - table.p.reach).clamp(min=0)
     assert torch.allclose(need, table.col("d_need"), atol=1e-4)
 
 
@@ -150,3 +151,27 @@ def test_fall_terminates_once():
     c.end_step(_inputs(1, fall_given=fg))
     assert not bool(c.fall_done[0])
     assert not math.isnan(sum(float(v.sum()) for v in c.values.values()))
+
+
+def test_stand_point_puts_resting_racket_on_target():
+    c, _ = _computer(1)
+    tgt = torch.tensor([[2.0, -0.3, 0.9]])
+    c.set_incoming(torch.ones(1, dtype=torch.bool), tgt, torch.full((1,), 5.0), torch.full((1,), 1.0))
+    stand = tgt[0, :2] + torch.tensor(fd.ROOT_FROM_RACKET)
+    # Receiver root exactly at the stand point: inside arrive_radius -> full score.
+    root = torch.tensor([[[-3.25, 0.6, 0.75], [stand[0], stand[1], 0.75]]])
+    c.end_step(_inputs(1, root_pos=root))
+    assert float(c.values["recv_approach"][0, 1]) == pytest.approx(1.0)
+    racket_rest = stand + torch.tensor(fd.RACKET_HOME) - torch.tensor(fd.RECV_HOME)
+    assert torch.allclose(racket_rest, tgt[0, :2], atol=1e-6)
+
+
+def test_racket_near_wide_kernel():
+    c, _ = _computer(1)
+    c.set_incoming(torch.ones(1, dtype=torch.bool), torch.tensor([[2.5, 0.0, 1.0]]), torch.full((1,), 0.7), torch.zeros(1))
+    rk = torch.tensor([[[-2.6, 0.2, 1.0], [2.0, -0.6, 1.0]]])
+    sh = torch.tensor([[2.0, -0.6 + 0.9, 1.0]])  # 0.9 m from the racket
+    c.end_step(_inputs(1, racket_pos=rk, shuttle_pos=sh))
+    p = c.p
+    want = (1 - p.near_wide_share) * math.exp(-(0.9 / p.near_sigma) ** 2) + p.near_wide_share * math.exp(-(0.9 / p.near_sigma_wide) ** 2)
+    assert float(c.values["recv_racket_near"][0, 1]) == pytest.approx(want, rel=1e-4) and want > 0.05

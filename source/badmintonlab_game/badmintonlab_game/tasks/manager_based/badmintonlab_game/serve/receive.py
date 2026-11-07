@@ -20,7 +20,7 @@ from dataclasses import dataclass
 
 import torch
 
-from .feeder import RECV_HOME
+from .feeder import RECV_HOME, ROOT_FROM_RACKET
 from .rules import predict_flight
 from .serve_reward import (
     ServeRewardParams,
@@ -71,9 +71,14 @@ class ReceiveParams:
     approach_hi: float = 1.0
     approach_scale: float = 1.0
     approach_min_need: float = 0.3  # only rallies with d_need above this
-    stand_back: float = 0.6  # stand point: target moved back towards the home by this
+    # Stand point = target + ROOT_FROM_RACKET: the root position that puts the resting racket on the target
+    # (the doc's "target moved back 0.6 m towards the home" assumed a racket in front of the root).
     arrive_radius: float = 0.15  # inside: full approach score (no sign flip on arrival)
     near_sigma: float = 0.15
+    # Pilot: with sigma 0.15 alone the term is ~0 at the P3 receiver's typical 0.9 m miss distance. A wide kernel
+    # (share ``near_wide_share``) gives a gradient from ~1 m: near = (1-s) exp(-(d/0.15)^2) + s exp(-(d/0.6)^2).
+    near_sigma_wide: float = 0.6
+    near_wide_share: float = 0.5
     near_time: float = 0.4  # racket_near once the ball is less than this from the target
     elevation_target_deg: float = 52.0
     x_target: float = 2.0
@@ -119,6 +124,7 @@ class ReceiveRewardComputer:
         z = lambda *s, dt=torch.float32: torch.zeros(*s, dtype=dt, device=device)  # noqa: E731
         self.values = {k: z(n, 2) for k in RECV_TERMS}
         self.home = torch.tensor(RECV_HOME, device=device)
+        self.root_from_racket = torch.tensor(ROOT_FROM_RACKET, device=device)
         # Incoming ball (server frame), set by the environment.
         self.active = z(n, dt=torch.bool)
         self.tgt = z(n, 3)
@@ -213,9 +219,7 @@ class ReceiveRewardComputer:
         # Approach: root velocity towards the stand point (server frame), rallies that need a move.
         root_c = to_canonical(s.root_pos[ar, recv], server)
         vel_c = to_canonical(s.root_vel[ar, recv], server)
-        tgt_xy = self.tgt[:, :2]
-        back = self.home - tgt_xy
-        stand = tgt_xy + p.stand_back * back / torch.linalg.norm(back, dim=-1, keepdim=True).clamp(min=1e-6)
+        stand = self.tgt[:, :2] + self.root_from_racket
         to_stand = stand - root_c[:, :2]
         dist = torch.linalg.norm(to_stand, dim=-1)
         toward = (vel_c[:, :2] * to_stand).sum(-1) / dist.clamp(min=1e-6)
@@ -227,7 +231,9 @@ class ReceiveRewardComputer:
         # Racket near the ball once the ball is less than near_time from the target.
         d_rb = torch.linalg.norm(s.racket_pos[ar, recv] - s.shuttle_pos, dim=-1)
         near = pre & (self.t_arrive - s.time_s < p.near_time)
-        vals["recv_racket_near"] = w["recv_racket_near"] * torch.exp(-(d_rb / p.near_sigma) ** 2) * near.float()
+        kern = ((1.0 - p.near_wide_share) * torch.exp(-(d_rb / p.near_sigma) ** 2)
+                + p.near_wide_share * torch.exp(-(d_rb / p.near_sigma_wide) ** 2))
+        vals["recv_racket_near"] = w["recv_racket_near"] * kern * near.float()
 
         # First legal hit of the receiver.
         hit_now = s.just_hit[ar, recv] & self.active & ~self.hit

@@ -5,8 +5,9 @@ the receiver on x>0. The receiver's ready root is the mirror of ``READY_ROOT``: 
 
 * ``scan_trajectories`` integrates shuttle flights with the training drag law and records the net
   crossing height, the landing point and the **intercept target**: the point inside the height band
-  ``[band_lo, band_hi]`` (and ``x > band_x_min``) with the smallest horizontal distance to ``RECV_HOME``,
-  its time and velocity. ``d_need = max(0, that distance - REACH)`` (``analysis/p5_reach.py``).
+  ``[band_lo, band_hi]`` (and ``x > band_x_min``) with the smallest horizontal distance to ``p.home``
+  (default ``RACKET_HOME``, the receiver's sweet spot at rest), its time and velocity.
+  ``d_need = max(0, that distance - p.reach)``. (``analysis/p5_reach.py`` used the root and 0.85 m.)
 * ``FeederTable`` is the offline grid (speed x elevation x azimuth x launch height x lateral offset),
   legal rows only (net clearance >= ``net_margin`` over the edge height, landing inside the receiver's
   singles court), sorted by ``d_need`` so a curriculum level is an index range.
@@ -24,7 +25,14 @@ from dataclasses import dataclass, field
 import torch
 
 RECV_HOME = (3.251, -0.605)  # receiver root, feeder frame (mirror of player_cfg.READY_ROOT)
-REACH = 0.85  # horizontal sweet-spot reach from the root, ready pose
+REACH = 0.85  # doc 1.1: horizontal sweet-spot reach from the root (not used for the table, see RACKET_HOME)
+# Pilot finding (P5 notes): the P3 receiver holds its sweet spot 0.77 m in front of and 0.62 m beside the root
+# (measured in Isaac, std 3 cm) and does not turn, so "within 0.85 m of the root" is not reachable (median closest
+# racket-ball distance 0.90 m on root-based L0). Targets and d_need are measured from the racket's rest point;
+# RACKET_REACH is what the arm adds around it.
+RACKET_HOME = (2.49, 0.01)
+RACKET_REACH = 0.3
+ROOT_FROM_RACKET = (RECV_HOME[0] - RACKET_HOME[0], RECV_HOME[1] - RACKET_HOME[1])
 LAUNCH_X = -2.55  # x of the drop point (mirrored per side by reset_shuttle_drop_state)
 DROP_Z = 2.2
 
@@ -48,8 +56,8 @@ class FeederParams:
     half_length: float = 6.7
     singles_half_width: float = 2.59
     net_height: float = 1.55
-    home: tuple = field(default=RECV_HOME)
-    reach: float = REACH
+    home: tuple = field(default=RACKET_HOME)
+    reach: float = RACKET_REACH
 
 
 def _grid(lo, hi, step):
