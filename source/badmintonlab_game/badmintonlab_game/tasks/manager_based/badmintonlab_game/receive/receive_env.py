@@ -1,0 +1,370 @@
+"""Receive-expert training environment, stage S1 footwork (P5 V3.1, arXiv 2511.11218 v4 stage 1).
+
+Robot 0 is the only learner (the receiver). Robot 1 is parked off-court and holds the ready pose.
+Each episode feeds up to ``balls_per_episode`` shuttles from the feeder table; the robot is not reset
+between balls. Rules are the ``play`` port in ``serve/rules.py`` (inherited from the serve env).
+"""
+
+from __future__ import annotations
+
+import math
+from collections.abc import Sequence
+
+import torch
+from isaaclab.utils.math import quat_apply_inverse
+
+from ..dual_agent_env import DualAgentBadmintonEnv
+from ..serve.serve_env import ServeBadmintonEnv
+from . import core
+from . import player_cfg as recv_player_cfg
+
+UPPER_JOINTS = (
+    "Waist",
+    "Left_Shoulder_Pitch",
+    "Left_Shoulder_Roll",
+    "Left_Elbow_Pitch",
+    "Left_Elbow_Yaw",
+    "Right_Shoulder_Pitch",
+    "Right_Shoulder_Roll",
+    "Right_Elbow_Pitch",
+    "Right_Elbow_Yaw",
+)
+DENSE = ("track", "face_front", "base_height", "base_orientation", "feet_air_time", "step_height", "foot_posture",
+         "no_double_flight", "feet_slide", "acc_reg", "hold_ready")  # fmt: skip
+EVENTS = ("touchdown_speed", "gait_symmetry", "fall")
+TERMS = DENSE + EVENTS
+S1_WEIGHTS = dict(
+    track=2.0, face_front=0.5, base_height=-10.0, base_orientation=-2.0, feet_air_time=1.0, step_height=0.5,
+    foot_posture=-0.5, no_double_flight=-1.0, feet_slide=-0.1, acc_reg=-2.5e-7, hold_ready=0.3,
+    touchdown_speed=-0.5, gait_symmetry=-0.2, fall=-10.0,
+)  # fmt: skip
+STAT_KEYS = ("balls", "station_ok", "face_ok", "d_sum", "head_sum", "touch", "episodes", "falls", "vel_sum", "vel_n", "fall_low", "fall_tilt", "fall_step_sum", "timeouts")
+
+
+def _wrap(a: torch.Tensor) -> torch.Tensor:
+    return torch.atan2(torch.sin(a), torch.cos(a))
+
+
+class ReceiveBadmintonEnv(ServeBadmintonEnv):
+    def __init__(self, cfg, render_mode=None, **kwargs):
+        super().__init__(cfg=cfg, render_mode=render_mode, **kwargs)
+        n, dev = self.num_envs, self.device
+        self.table = core.build_feeder_table(cfg.feeder_rows, seed=cfg.feeder_seed, device=dev)
+        self.level = 0
+        self._bounds = core.level_bounds(self.table, self.level)
+        self.weights = dict(S1_WEIGHTS)
+        self.balls_per_episode = int(cfg.balls_per_episode)
+        self.gap_steps = int(round(cfg.ball_gap_s / self.step_dt))
+        self.ball_timeout_steps = int(round(cfg.ball_timeout_s / self.step_dt))
+        z = lambda *s, **k: torch.zeros(*s, device=dev, **k)  # noqa: E731
+        self.ball_active = z(n, dtype=torch.bool)
+        self.ball_steps = z(n, dtype=torch.long)
+        self.gap_left = z(n, dtype=torch.long)
+        self.balls_done = z(n, dtype=torch.long)
+        self.arr_step = z(n, dtype=torch.long)
+        self.station = z(n, 2)
+        self.int_pos = z(n, 3)
+        self.t_arr = z(n)
+        self.ball_touched = z(n, dtype=torch.bool)
+        self.fell = z(n, dtype=torch.bool)
+        self.values = {k: z(n) for k in TERMS}
+        self.stats = z(len(STAT_KEYS))
+        self.arrival_d = []  # per-iteration list of tensors, popped by the runner
+        robot = self._robots[0]
+        self._foot_ids = robot.find_bodies(["left_foot_link", "right_foot_link"], preserve_order=True)[0]
+        self._feet = self.scene.sensors["feet_contact_0"]
+        self._feet_sensor_ids = self._feet.find_bodies(["left_foot_link", "right_foot_link"], preserve_order=True)[0]
+        q_ready = robot.data.default_joint_pos[0].clone()
+        ids, _ = robot.find_joints(list(recv_player_cfg.READY_JOINTS), preserve_order=True)
+        q_ready[ids] = torch.tensor(list(recv_player_cfg.READY_JOINTS.values()), device=dev)
+        self.q_ready = q_ready
+        self._upper_ids = robot.find_joints(list(UPPER_JOINTS), preserve_order=True)[0]
+        self.ready_yaw = float(recv_player_cfg.READY_ROOT["yaw"])
+        self.z_ready = float(cfg.z_ready)
+        self._hold_action_1 = None  # set by the wrapper
+
+    # The serve reward computer is not used here.
+    def _make_serve_reward(self):
+        return None
+
+    def set_level(self, level: int) -> None:
+        self.level = int(level)
+        self._bounds = core.level_bounds(self.table, self.level)
+
+    # ------------------------------------------------------------------ feeding
+    def _inject(self, ids: torch.Tensor) -> None:
+        if ids.numel() == 0:
+            return
+        lo, hi = self._bounds
+        rows = core.sample_rows(ids.numel(), lo, hi, 0.2, self.device)
+        t = self.table
+        origins = self.scene.env_origins[ids]
+        pos_w = t.launch_pos[rows] + origins
+        state = torch.zeros(ids.numel(), 13, device=self.device)
+        state[:, :3] = pos_w
+        state[:, 3] = 1.0
+        state[:, 7:10] = t.launch_vel[rows]
+        self._shuttle.write_root_state_to_sim(state, env_ids=ids)
+        opening = torch.ones_like(ids)
+        self.rules.reset(ids, opening, pos_w)
+        self.rules.next_hitter[ids] = 0
+        self.rules.last_hitter[ids] = 1  # a feed: no serve-height rule, receiver's turn, out faults count
+        self.initial_hitter[ids] = 1
+        self.station[ids] = t.station[rows]
+        self.int_pos[ids] = t.int_pos[rows]
+        self.t_arr[ids] = t.t_arr[rows]
+        self.arr_step[ids] = torch.round(t.t_arr[rows] / self.step_dt).long().clamp(min=1)
+        self.ball_active[ids] = True
+        self.ball_steps[ids] = 0
+        self.ball_touched[ids] = False
+        self._prev_phys_shuttle[ids] = pos_w
+        self.prev_shuttle_pos_w[ids] = pos_w
+        self.curr_shuttle_pos_w[ids] = pos_w
+
+    # ------------------------------------------------------------------ step
+    def step(self, action: torch.Tensor):
+        self.action_manager.process_action(action.to(self.device))
+        self.rules.begin_control_step()
+        self.recorder_manager.record_pre_step()
+        rendering = self.sim.has_gui() or self.sim.has_rtx_sensors()
+        for _ in range(self.cfg.decimation):
+            self._sim_step_counter += 1
+            self.action_manager.apply_action()
+            self._apply_shuttle_forces()
+            self.scene.write_data_to_sim()
+            self.sim.step(render=False)
+            self.recorder_manager.record_post_physics_decimation_step()
+            if self._sim_step_counter % self.cfg.sim.render_interval == 0 and rendering:
+                self.sim.render()
+            self.scene.update(dt=self.physics_dt)
+            self._physics_substep()
+
+        self.episode_length_buf += 1
+        self.common_step_counter += 1
+        self._finish_control_step()
+        self._ball_bookkeeping()
+        self._compute_values()
+        self.reset_buf = self.termination_manager.compute()
+        self.reset_terminated = self.termination_manager.terminated
+        self.reset_time_outs = self.termination_manager.time_outs
+        reward_0 = self.reward_manager.compute(dt=self.step_dt)
+        reward_1 = torch.zeros_like(reward_0)
+        self.agent_reward_buf = torch.stack((reward_0, reward_1), dim=1)
+        self.reward_buf = reward_0
+        ended = self.reset_buf
+        self.stats[STAT_KEYS.index("episodes")] += ended.float().sum()
+        self.stats[STAT_KEYS.index("falls")] += (ended & self.fell).float().sum()
+        self.stats[STAT_KEYS.index("fall_low")] += (ended & self._fell_low).float().sum()
+        self.stats[STAT_KEYS.index("fall_tilt")] += (ended & self._fell_tilt).float().sum()
+        self.stats[STAT_KEYS.index("fall_step_sum")] += ((ended & self.fell).float() * self.episode_length_buf.float()).sum()
+        self.stats[STAT_KEYS.index("timeouts")] += self.reset_time_outs.float().sum()
+        reset_ids = self.reset_buf.nonzero(as_tuple=False).squeeze(-1)
+        if len(reset_ids) > 0:
+            self.recorder_manager.record_pre_reset(reset_ids)
+            self._reset_idx(reset_ids)
+            self.scene.write_data_to_sim()
+            self.sim.forward()
+            self.recorder_manager.record_post_reset(reset_ids)
+        # Next ball for the courts whose gap has elapsed.
+        nxt = (~self.ball_active) & (self.gap_left <= 0) & (self.balls_done < self.balls_per_episode) & ~self.reset_buf
+        self._inject(nxt.nonzero(as_tuple=False).squeeze(-1))
+        if "interval" in self.event_manager.available_modes:
+            self.event_manager.apply(mode="interval", dt=self.step_dt)
+        self.obs_buf = self.observation_manager.compute(update_history=True)
+        return self.obs_buf, self.reward_buf, self.reset_terminated, self.reset_time_outs, self.extras
+
+    def _physics_substep(self) -> None:
+        pos_w = self._shuttle.data.root_pos_w
+        local_z = pos_w[:, 2] - self.scene.env_origins[:, 2]
+        self.rules.detect_landing(local_z, self.cfg.shuttle_landing_detection_height)
+        contacts = torch.stack(
+            [
+                torch.linalg.norm(contact.data.force_matrix_w, dim=-1).flatten(1).amax(dim=1) > self.cfg.hit_contact_threshold
+                for contact in self._contacts
+            ],
+            dim=1,
+        )
+        self.rules.update_hits(contacts, local_z)
+        self.ball_touched |= self.rules.just_hit[:, 0]
+        self._prev_phys_shuttle.copy_(pos_w)
+        self.rules.update_rally_result(pos_w, self.scene.env_origins)
+
+    def _ball_bookkeeping(self) -> None:
+        robot = self._robots[0]
+        root_xy = robot.data.root_pos_w[:, :2] - self.scene.env_origins[:, :2]
+        act = self.ball_active
+        self.ball_steps += act.long()
+        self.gap_left = torch.where(act, self.gap_left, (self.gap_left - 1).clamp(min=0))
+        arrive = act & (self.ball_steps == self.arr_step)
+        d = torch.linalg.norm(self.station - root_xy, dim=-1)
+        head = _wrap(self._yaw() - self.ready_yaw).abs()
+        a = arrive.float()
+        s = self.stats
+        s[STAT_KEYS.index("balls")] += a.sum()
+        s[STAT_KEYS.index("station_ok")] += (a * (d < 0.35).float()).sum()
+        s[STAT_KEYS.index("face_ok")] += (a * (head < math.radians(30.0)).float()).sum()
+        s[STAT_KEYS.index("d_sum")] += (a * d).sum()
+        s[STAT_KEYS.index("head_sum")] += (a * head).sum()
+        s[STAT_KEYS.index("touch")] += (a * self.ball_touched.float()).sum()
+        # Speed towards the station while far from it.
+        to = self.station - root_xy
+        u = to / d.clamp(min=1e-6).unsqueeze(-1)
+        v = (robot.data.root_lin_vel_w[:, :2] * u).sum(-1)
+        far = (act & (d > 0.3)).float()
+        s[STAT_KEYS.index("vel_sum")] += (far * v).sum()
+        s[STAT_KEYS.index("vel_n")] += far.sum()
+        self.arrival_d.append(torch.where(arrive, d, torch.full_like(d, -1.0)))
+        if len(self.arrival_d) > 64:
+            self.arrival_d = self.arrival_d[-64:]
+        ended = act & (self.rally_resolved | (self.ball_steps >= self.ball_timeout_steps))
+        self.ball_active &= ~ended
+        self.balls_done += ended.long()
+        self.gap_left = torch.where(ended, torch.full_like(self.gap_left, self.gap_steps), self.gap_left)
+        self._d = d
+
+    def _yaw(self) -> torch.Tensor:
+        q = self._robots[0].data.root_quat_w
+        w, x, y, z = q.unbind(-1)
+        return torch.atan2(2 * (w * z + x * y), 1 - 2 * (y * y + z * z))
+
+    def _compute_values(self) -> None:
+        robot = self._robots[0]
+        w = self.weights
+        dt = self.step_dt
+        v = self.values
+        d = self._d
+        active = self.ball_active.float()
+        far = (self.ball_active & (d > 0.3)).float()
+        v["track"] = w["track"] * core.r_track(d) * active
+        dpsi = _wrap(self._yaw() - self.ready_yaw)
+        v["face_front"] = w["face_front"] * torch.exp(-((dpsi / 0.4) ** 2))
+        z = robot.data.root_pos_w[:, 2] - self.scene.env_origins[:, 2]
+        v["base_height"] = w["base_height"] * (z - self.z_ready) ** 2
+        g = robot.data.projected_gravity_b
+        v["base_orientation"] = w["base_orientation"] * (g[:, :2] ** 2).sum(-1)
+        feet = self._feet.data
+        air = feet.current_air_time[:, self._feet_sensor_ids]
+        ctime = feet.current_contact_time[:, self._feet_sensor_ids]
+        contact = ctime > 0.0
+        single = contact.sum(-1) == 1
+        mode_t = torch.where(contact, ctime, air)
+        fat = torch.where(single, mode_t.min(dim=-1).values, torch.zeros_like(d)).clamp(max=0.4)
+        v["feet_air_time"] = w["feet_air_time"] * fat * far
+        foot_pos = robot.data.body_pos_w[:, self._foot_ids]
+        foot_vel = robot.data.body_lin_vel_w[:, self._foot_ids]
+        h = (foot_pos[..., 2] - foot_pos[..., 2].min(dim=-1, keepdim=True).values).clamp(min=0.0)
+        sh = (torch.exp(-(((h - 0.08) / 0.03) ** 2)) * (~contact).float()).sum(-1) * single.float()
+        v["step_height"] = w["step_height"] * sh * far
+        fq = robot.data.body_quat_w[:, self._foot_ids]
+        down = torch.zeros_like(foot_pos)
+        down[..., 2] = -1.0
+        gf = quat_apply_inverse(fq.reshape(-1, 4), down.reshape(-1, 3)).reshape(down.shape)
+        v["foot_posture"] = w["foot_posture"] * (gf[..., :2] ** 2).sum(-1).sum(-1)
+        v["no_double_flight"] = w["no_double_flight"] * (~contact).all(dim=-1).float()
+        v["feet_slide"] = w["feet_slide"] * (torch.linalg.norm(foot_vel[..., :2], dim=-1) * contact.float()).sum(-1)
+        v["acc_reg"] = w["acc_reg"] * (robot.data.joint_acc**2).sum(-1)
+        err = robot.data.joint_pos[:, self._upper_ids] - self.q_ready[self._upper_ids]
+        v["hold_ready"] = w["hold_ready"] * torch.exp(-(err**2).mean(-1) / 0.1)
+        first = self._feet.compute_first_contact(dt)[:, self._feet_sensor_ids]
+        v["touchdown_speed"] = w["touchdown_speed"] * ((foot_vel[..., 2] ** 2) * first.float()).sum(-1) / dt
+        last_air = feet.last_air_time[:, self._feet_sensor_ids]
+        sym = (last_air[:, 0] - last_air[:, 1]).abs() * first.any(dim=-1).float()
+        v["gait_symmetry"] = w["gait_symmetry"] * sym / dt
+        self._fell_low = z < self.cfg.fall_height
+        self._fell_tilt = g[:, 2] > -math.cos(math.radians(45.0))
+        fell = self._fell_low | self._fell_tilt
+        self.fell = fell
+        v["fall"] = w["fall"] * fell.float() / dt
+
+    def _reset_idx(self, env_ids: Sequence[int]):
+        DualAgentBadmintonEnv._reset_idx(self, env_ids)
+        ids = torch.as_tensor(env_ids, device=self.device, dtype=torch.long)
+        self.balls_done[ids] = 0
+        self.gap_left[ids] = 0
+        self.ball_active[ids] = False
+        self.fell[ids] = False
+        self._inject(ids)
+
+    def pop_stats(self) -> dict:
+        c = dict(zip(STAT_KEYS, self.stats.tolist()))
+        self.stats.zero_()
+        ds = torch.cat(self.arrival_d) if self.arrival_d else torch.zeros(0, device=self.device)
+        self.arrival_d = []
+        ds = ds[ds >= 0]
+        b = max(c["balls"], 1.0)
+        out = dict(
+            balls=c["balls"],
+            station_ok=c["station_ok"] / b,
+            face_ok=c["face_ok"] / b,
+            d_mean=c["d_sum"] / b,
+            d_p50=float(ds.median()) if ds.numel() else float("nan"),
+            head_deg=math.degrees(c["head_sum"] / b),
+            touch=c["touch"] / b,
+            fall=c["falls"] / max(c["episodes"], 1.0),
+            episodes=c["episodes"],
+            v_to_station=c["vel_sum"] / max(c["vel_n"], 1.0),
+            fall_low=c["fall_low"],
+            fall_tilt=c["fall_tilt"],
+            fall_t=c["fall_step_sum"] * self.step_dt / max(c["falls"], 1.0),
+            timeouts=c["timeouts"],
+        )
+        return out
+
+
+# ---------------------------------------------------------------------- manager terms
+def recv_term(env, term: str) -> torch.Tensor:
+    """Reward-manager getter; use weight 1.0 (the stage weight is already applied)."""
+    if not hasattr(env, "values"):
+        return torch.zeros(env.num_envs, device=env.device)
+    return env.values[term]
+
+
+def recv_fall_done(env) -> torch.Tensor:
+    if not hasattr(env, "fell"):
+        return torch.zeros(env.num_envs, dtype=torch.bool, device=env.device)
+    return env.fell
+
+
+def recv_balls_done(env) -> torch.Tensor:
+    if not hasattr(env, "balls_done"):
+        return torch.zeros(env.num_envs, dtype=torch.bool, device=env.device)
+    return (env.balls_done >= env.balls_per_episode) & ~env.ball_active
+
+
+# ---------------------------------------------------------------------- critic terms
+def critic_targets(env) -> torch.Tensor:
+    """[station rel root (2, trunk frame xy), true intercept rel root (3), time to arrival, active,
+    balls left / 6, level / 3, time since injection] = 10."""
+    n = env.num_envs
+    if not hasattr(env, "station"):
+        return torch.zeros(n, 10, device=env.device)
+    robot = env._robots[0]
+    origin = env.scene.env_origins
+    st = torch.zeros(n, 3, device=env.device)
+    st[:, :2] = env.station
+    st_b = quat_apply_inverse(robot.data.root_quat_w, st + origin - robot.data.root_pos_w)[:, :2]
+    ip_b = quat_apply_inverse(robot.data.root_quat_w, env.int_pos + origin - robot.data.root_pos_w)
+    t_left = (env.arr_step - env.ball_steps).float() * env.step_dt
+    act = env.ball_active.float()
+    left = (env.balls_per_episode - env.balls_done).float() / max(env.balls_per_episode, 1)
+    return torch.cat(
+        (
+            st_b * act[:, None],
+            ip_b * act[:, None],
+            (t_left * act).unsqueeze(-1),
+            act.unsqueeze(-1),
+            left.unsqueeze(-1),
+            torch.full((n, 1), env.level / 3.0, device=env.device),
+            (env.ball_steps.float() * env.step_dt * act).unsqueeze(-1),
+        ),
+        dim=-1,
+    )
+
+
+def critic_feet(env) -> torch.Tensor:
+    """[contact L, contact R, air time L, air time R] = 4."""
+    if not hasattr(env, "_feet"):
+        return torch.zeros(env.num_envs, 4, device=env.device)
+    data = env._feet.data
+    ids = env._feet_sensor_ids
+    return torch.cat(((data.current_contact_time[:, ids] > 0).float(), data.current_air_time[:, ids].clamp(max=1.0)), dim=-1)
