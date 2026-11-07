@@ -74,7 +74,7 @@ LOCK = os.path.join(args.play, ".eval.lock")
 OPP = {"zero": "zero", "p3": args.p3_final, "model_test": "model_test", "baseline": args.baseline}
 # 7.2 tiers: minimum (B, simple receive) and expected.
 TIER = dict(serve_in=0.85, touch=0.30, fah=0.05, fell_before=0.10, baseline_crossed=0.15)
-TAGS = ("Recv/", "P5Curr/", "Teach/", "Policy/", "Serve/", "Loss/", "Critic/", "Norm/", "Reward/")
+TAGS = ("Recv/", "P5Curr/", "Teach/", "Policy/", "Serve/", "Loss/", "Critic/", "Norm/", "Reward/", "Rollout/")
 
 
 def say(msg):
@@ -330,6 +330,15 @@ def check_training(st, sc):
         ok = (nt or 0) >= 0.3 and (ft or 0) >= 0.3
         alert(st, "check_1200", f"6.1 it 1200: touch natural {nt} feeder {ft}, explained_var_recv {ev}: "
               f"{'ok' if ok else 'NOT MET'}")
+    # V2 2.5 adjustment rules (alerts only; one change at a time, decided by hand).
+    fell = ema("fell")
+    if last >= 300 and fell is not None and fell > 0.03:
+        alert(st, f"w_fall_{last // 500}", f"2.5: receiver fall EMA {fell:.3f} > 0.03 -> raise w_fall to 1.0 (not w_body)")
+    if last >= 600 and fell is not None and fell < 0.005:
+        e_old, e_new = ema("st_err_p50", last - 300), ema("st_err_p50")
+        if None not in (e_old, e_new) and e_new >= e_old:
+            alert(st, f"w_fall_low_{last // 500}", f"2.5: receiver fall {fell:.4f} < 0.5 % and st_err not falling "
+                  f"({e_old:.3f} -> {e_new:.3f}): too cautious, w_fall to 0.5")
     for name in ("serve", "recv"):
         o = window_mean(sc.get(f"Norm/over5_{name}", {}), last, 50)
         if o is not None and o > 0.01:

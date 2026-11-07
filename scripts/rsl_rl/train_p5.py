@@ -1,6 +1,7 @@
 """Train the P5 receive task, V2 (P5_RECEIVE_DESIGN_V2). Warm start from P3 final (c7 3000), teacher = its export.
 
-Defaults are V2: multi-critic (serve / recv / body, weights 1.0 / 1.0 / 0.5), 50 critic-only iterations, natural
+Defaults are V2: multi-critic (serve / recv / fall / body; w_g per stage, V2 2.5: R0 1.0 / 1.0 / 0.8 / 0.2, R1 and R2
+1.0 / 1.5 / 0.5 / 0.2, blended over 300 iterations with the receive weights), 50 critic-only iterations, natural
 share 0.5 in [0.4, 0.6], R0 -> R1 -> R2, feeder L0-L2 (L3 from R2), entropy 0, std 0.30 in [0.15, 0.35],
 beta 1.0 -> 0.2 over 2000 updates, actor normaliser frozen at P3's statistics.
 
@@ -57,8 +58,10 @@ parser.add_argument("--std_max", type=float, default=0.35)
 parser.add_argument("--entropy_coef", type=float, default=0.0)
 parser.add_argument("--critic_only_iters", type=int, default=50)
 parser.add_argument("--critic", default="multi", choices=("multi", "single"),
-                    help="multi: 3 value heads, per-group advantages (pilot M); single: one head, summed reward (S).")
-parser.add_argument("--group_weights", default="1.0,1.0,0.5", help="w_serve,w_recv,w_body (multi only)")
+                    help="multi: one value head per reward group, per-group advantages (pilot M); single: one head, "
+                         "the groups summed (control S).")
+parser.add_argument("--group_weights", default=None,
+                    help="V2 2.5 overrides of the stage group weights, e.g. 'fall=1.0' (all stages) or 'R0.fall=1.0,R1.recv=2.0'")
 parser.add_argument("--no_freeze_actor_norm", action="store_true", help="Keep updating the actor normaliser (V1).")
 parser.add_argument("--natural_share", type=float, default=0.5)
 parser.add_argument("--natural_min", type=float, default=0.4)
@@ -92,6 +95,7 @@ from badmintonlab_game.tasks.manager_based.badmintonlab_game.serve.p5_runner imp
 from badmintonlab_game.tasks.manager_based.badmintonlab_game.serve.receive import (  # noqa: E402
     RECV_STAGE_WEIGHTS,
     RECV_STAGES,
+    REWARD_GROUPS,
 )
 from badmintonlab_game.tasks.manager_based.badmintonlab_game.serve.runner import (  # noqa: E402
     find_latest,
@@ -158,6 +162,14 @@ def _curriculum() -> P5Curriculum:
             i = RECV_STAGES.index(name)
             stages[i] = dataclasses.replace(stages[i], **{f"{what}_iters": v})
         cur.stages = tuple(stages)
+    if args_cli.group_weights:
+        table = {k: list(v) for k, v in cur.group_weight_table.items()}
+        for item in args_cli.group_weights.split(","):
+            key, value = (x.strip() for x in item.split("="))
+            stage, group = key.split(".") if "." in key else (None, key)
+            for name in ([stage] if stage else RECV_STAGES):
+                table[name][REWARD_GROUPS.index(group)] = float(value)
+        cur.group_weight_table = {k: tuple(v) for k, v in table.items()}
     return cur
 
 
@@ -176,7 +188,6 @@ def main(env_cfg, agent_cfg):
     env_cfg.seed = agent_cfg.seed
     env_cfg.p5.natural_share = args_cli.natural_share
     agent_cfg.algorithm.entropy_coef = args_cli.entropy_coef
-    group_weights = tuple(float(x) for x in args_cli.group_weights.split(","))
     if args_cli.recv_weights:
         for item in args_cli.recv_weights.split(","):
             key, value = (s.strip() for s in item.split("="))
@@ -202,7 +213,8 @@ def main(env_cfg, agent_cfg):
         time_budget_hours=args_cli.time_budget_hours, resume=resume_path, init_checkpoint=args_cli.init_checkpoint,
         ppo_ext=ppo_ext, std_init=args_cli.std_init, natural_share=args_cli.natural_share,
         natural_min=args_cli.natural_min, natural_max=args_cli.natural_max, critic=args_cli.critic,
-        group_weights=group_weights, freeze_actor_norm=not args_cli.no_freeze_actor_norm,
+        reward_groups=REWARD_GROUPS, group_weights=args_cli.group_weights,
+        group_weight_table=None if args_cli.critic == "single" else _curriculum().group_weight_table, freeze_actor_norm=not args_cli.no_freeze_actor_norm,
         entropy_coef=args_cli.entropy_coef, blend_iters=args_cli.blend_iters, face_anneal_iters=args_cli.face_anneal_iters,
         stage_iters=args_cli.stage_iters, recv_weights=args_cli.recv_weights, recv_stage_weights=RECV_STAGE_WEIGHTS,
         gamma=agent_cfg.algorithm.gamma, lam=agent_cfg.algorithm.lam,
@@ -221,7 +233,7 @@ def main(env_cfg, agent_cfg):
         runner = P5Runner(env, agent_cfg.to_dict(), log_dir=log_dir, device=agent_cfg.device,
                           time_budget_hours=args_cli.time_budget_hours, ppo_ext=ppo_ext, p5_curriculum=curriculum,
                           control_file=os.path.join(log_dir, "p5_control.json"), group_mode=args_cli.critic,
-                          group_weights=group_weights, freeze_actor_normalizer=not args_cli.no_freeze_actor_norm)
+                          freeze_actor_normalizer=not args_cli.no_freeze_actor_norm)
         runner.install_signal_handlers()
         if resume_path:
             print(f"[INFO] Resuming from: {resume_path}")

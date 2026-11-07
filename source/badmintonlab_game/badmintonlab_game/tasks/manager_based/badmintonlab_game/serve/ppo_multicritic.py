@@ -4,10 +4,15 @@
   reward group on a shared trunk) and whose actor normaliser can be frozen (V2 5).
 * ``MultiCriticStorage``: rewards / values / returns ``(T, N, G)``, ``group_mask (T, N, G)``; per-group GAE with
   the same ``gamma``, ``lam`` and ``dones``; per-group normalisation of the advantages over the whole rollout on the
-  samples with ``group_mask * learn_w = 1`` (the others get 0, a group without samples gets 0, no NaN); the
-  combined advantage ``A = sum_g w_g * A_g`` is not normalised again.
+  samples with ``group_mask * learn_w = 1`` (the others get 0, a group without samples gets 0, no NaN; a group
+  whose advantage std is below ``adv_std_min`` = 1e-4, e.g. G_fall in a rollout without a fall, gets 0 instead
+  of amplified numerical noise); the combined advantage ``A = sum_g w_g * A_g`` is not normalised again.
+  The number of groups G is ``len(group_names)`` (default ``receive.REWARD_GROUPS``: serve, recv, fall, body).
 * ``MultiCriticPPO``: ``PPOExt`` (sample mask, teacher, std clamp, critic warm-up) with the grouped storage, time-out
-  bootstrap per group (``r_g += gamma * V_g``), value loss ``sum_g mean_{mask_g}(clipped loss_g)``.
+  bootstrap per group (``r_g += gamma * V_g``), value loss ``sum_g mean_{mask_g}(clipped loss_g)``. ``w_g`` can
+  change between rollouts (``set_group_weights``: V2 2.5 stage weights, set by the runner from the curriculum).
+  Logs ``Rollout/events_<group>`` (non-zero group rewards on learned samples; ``events_fall`` = fall events of the
+  rollout) in both modes.
 
 Group rewards come from ``extras["group_rewards"]`` ``(N, G_env)``; the group mask of a sample is read from its
 stored observation ``aux[:, 2:2+G_env]`` (state of the action, i.e. the rally the reward belongs to).
@@ -25,9 +30,11 @@ from rsl_rl.modules import ActorCritic
 from rsl_rl.storage import RolloutStorage
 
 from .ppo_ext import PPOExt
+from .receive import REWARD_GROUPS
 
-GROUPS = ("serve", "recv", "body")
-DEFAULT_GROUP_WEIGHTS = (1.0, 1.0, 0.5)
+GROUPS = REWARD_GROUPS
+DEFAULT_GROUP_WEIGHTS = (1.0, 1.0, 0.8, 0.2)  # V2 2.5, R0
+ADV_STD_MIN = 1e-4
 
 
 class MultiCriticActorCritic(ActorCritic):
@@ -76,8 +83,10 @@ class MultiCriticStorage(RolloutStorage):
         self.step += 1
 
     @torch.no_grad()
-    def compute_group_returns(self, last_values, gamma: float, lam: float, weights, learn_w) -> None:
-        """``last_values`` (N, G); ``weights`` (G,); ``learn_w`` (T, N, 1)."""
+    def compute_group_returns(self, last_values, gamma: float, lam: float, weights, learn_w,
+                              adv_std_min: float = 0.0) -> None:
+        """``last_values`` (N, G); ``weights`` (G,); ``learn_w`` (T, N, 1). Groups with fewer than 2 samples or an
+        advantage std below ``adv_std_min`` get a zero normalised advantage."""
         adv = torch.zeros_like(last_values)
         for step in reversed(range(self.num_transitions_per_env)):
             next_values = last_values if step == self.num_transitions_per_env - 1 else self.values[step + 1]
@@ -91,8 +100,8 @@ class MultiCriticStorage(RolloutStorage):
         mean = (raw * m).sum((0, 1)) / cnt.clamp(min=1.0)
         var = ((raw - mean) ** 2 * m).sum((0, 1)) / (cnt - 1.0).clamp(min=1.0)  # unbiased, as torch.std in RSL-RL
         std = var.sqrt()
-        ok = (cnt > 1.0).float()
-        self.group_adv = (raw - mean) / (std + 1e-8) * m * ok
+        ok = ((cnt > 1.0) & (std >= adv_std_min)).float()
+        self.group_adv = (raw - mean) / std.clamp(min=1e-8) * m * ok
         w = torch.as_tensor(weights, dtype=raw.dtype, device=raw.device).view(1, 1, -1)
         self.advantages = (self.group_adv * w).sum(-1, keepdim=True)
         # Explained variance of the values on the group's samples.
@@ -102,7 +111,8 @@ class MultiCriticStorage(RolloutStorage):
         res_mean = (res * m).sum((0, 1)) / cnt.clamp(min=1.0)
         var_res = ((res - res_mean) ** 2 * m).sum((0, 1)) / cnt.clamp(min=1.0)
         ev = torch.where(var_ret > 1e-12, 1.0 - var_res / var_ret.clamp(min=1e-12), torch.zeros_like(var_ret))
-        self.stats = dict(adv_std=std * ok, adv_mean=mean, explained_var=ev, share=cnt / float(m[..., 0].numel()),
+        self.stats = dict(adv_std=std * (cnt > 1.0).float(), adv_mean=mean, explained_var=ev,
+                          share=cnt / float(m[..., 0].numel()), adv_zeroed=1.0 - ok,
                           reward_mean=(self.rewards * m).sum((0, 1)) / cnt.clamp(min=1.0))
 
     def mini_batch_generator(self, num_mini_batches: int, num_epochs: int = 8) -> Generator:
@@ -127,8 +137,11 @@ class MultiCriticStorage(RolloutStorage):
 
 class MultiCriticPPO(PPOExt):
     def __init__(self, policy, group_mode: str = "multi", group_weights=DEFAULT_GROUP_WEIGHTS, group_names=GROUPS,
-                 **kwargs):
+                 adv_std_min: float = ADV_STD_MIN, **kwargs):
         super().__init__(policy, **kwargs)
+        self.adv_std_min = float(adv_std_min)
+        self.env_group_names = tuple(group_names)
+        self._events = None
         if self.normalize_advantage_per_mini_batch:
             raise ValueError("MultiCriticPPO normalises the advantages per group over the rollout")
         if group_mode not in ("multi", "single"):
@@ -146,6 +159,15 @@ class MultiCriticPPO(PPOExt):
         if self.num_values != len(self.group_names):
             raise ValueError(f"policy has {self.num_values} value heads, {group_mode} mode needs {len(self.group_names)}")
 
+    def set_group_weights(self, weights) -> None:
+        """V2 2.5: ``w_g`` for the next rollouts (multi mode; control S ignores them, its groups are summed)."""
+        if self.group_mode != "multi":
+            return
+        w = tuple(float(x) for x in weights)
+        if len(w) != len(self.group_names):
+            raise ValueError(f"{len(w)} weights for groups {self.group_names}")
+        self.group_weights = w
+
     def init_storage(self, training_type, num_envs, num_transitions_per_env, obs, actions_shape) -> None:
         self.storage = MultiCriticStorage(training_type, num_envs, num_transitions_per_env, obs, actions_shape,
                                           self.device, num_groups=self.num_values)
@@ -160,6 +182,10 @@ class MultiCriticPPO(PPOExt):
         n = rewards.shape[0]
         gr = extras.get("group_rewards")
         gr = rewards.view(-1, 1).float() if gr is None else gr.to(self.device).float()
+        if gr.shape[-1] == self.env_groups:
+            learn = self._aux(self.transition.observations, n)[:, 0:1]
+            ev = ((gr != 0).float() * learn).sum(0)
+            self._events = ev if self._events is None else self._events + ev
         if self.group_mode == "single":
             r = gr.sum(-1, keepdim=True)
             m = torch.ones(n, 1, device=self.device)
@@ -186,11 +212,17 @@ class MultiCriticPPO(PPOExt):
             learn = st.observations[self.aux_group][..., 0:1].float()
         else:
             learn = torch.ones(st.num_transitions_per_env, st.num_envs, 1, device=self.device)
-        st.compute_group_returns(last_values, self.gamma, self.lam, self.group_weights, learn)
+        st.compute_group_returns(last_values, self.gamma, self.lam, self.group_weights, learn, self.adv_std_min)
         stats = {}
         for key, v in st.stats.items():
             for i, name in enumerate(self.group_names):
                 stats[f"Critic/{key}_{name}"] = float(v[i])
+        for i, name in enumerate(self.group_names if self.group_mode == "multi" else ()):
+            stats[f"Critic/w_{name}"] = self.group_weights[i]
+        if self._events is not None:
+            for i, name in enumerate(self.env_group_names):
+                stats[f"Rollout/events_{name}"] = float(self._events[i])
+            self._events = None
         stats.update(self.normalizer_range(st))
         self._rollout_stats = stats
 
@@ -206,7 +238,8 @@ class MultiCriticPPO(PPOExt):
         out = {}
         if aux.shape[-1] < 4:
             return out
-        for name, col in (("serve", 2), ("recv", 3)):
+        cols = {g: 2 + i for i, g in enumerate(self.env_group_names) if g in ("serve", "recv")}
+        for name, col in cols.items():
             sel = (aux[:, col] * aux[:, 0]) > 0
             if bool(sel.any()):
                 z = x[sel].abs()

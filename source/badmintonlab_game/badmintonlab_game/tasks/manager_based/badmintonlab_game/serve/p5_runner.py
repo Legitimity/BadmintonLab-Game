@@ -71,10 +71,12 @@ class P5Runner(ServeRunner):
         alg = train_cfg["algorithm"]
         alg["class_name"] = "MultiCriticPPO"
         alg.update(ppo_ext or {})
-        alg.update(group_mode=group_mode, group_weights=tuple(group_weights))
+        # V2 2.5: w_g per curriculum stage (``group_weights`` only without a curriculum).
+        weights = tuple(p5_curriculum.group_weights() if p5_curriculum is not None else group_weights)
+        alg.update(group_mode=group_mode, group_weights=weights)
         pol = train_cfg["policy"]
         pol["class_name"] = "MultiCriticActorCritic"
-        pol.update(num_values=len(group_weights) if group_mode == "multi" else 1,
+        pol.update(num_values=len(weights) if group_mode == "multi" else 1,
                    freeze_actor_normalizer=bool(freeze_actor_normalizer))
         self.p5_curriculum = p5_curriculum
         self.control_file = control_file
@@ -90,6 +92,7 @@ class P5Runner(ServeRunner):
         u.set_natural_share(cur.natural_share)
         u.recv_reward.set_weights(cur.weights())
         u.recv_reward.set_face_tolerance(cur.face_tolerance())
+        self.alg.set_group_weights(cur.group_weights())
 
     def _read_control(self, it: int) -> None:
         if not self.control_file or self.p5_curriculum is None or it % self.CONTROL_INTERVAL:
@@ -197,6 +200,7 @@ class P5Runner(ServeRunner):
             self._read_control(it)
             u.recv_reward.set_weights(cur.update(it, rates))
             u.recv_reward.set_face_tolerance(cur.face_tolerance())
+            self.alg.set_group_weights(cur.group_weights())
             u.set_level(cur.level)
             u.set_natural_share(cur.natural_share)
             values.update(cur.log_values())
@@ -234,7 +238,9 @@ class P5Runner(ServeRunner):
               + f" | mse={teach.get('Teach/mse', float('nan')):.2e} beta={teach.get('Teach/beta', 0):.3f}"
               + f" std={teach.get('Policy/std_mean', float('nan')):.3f} co={int(teach.get('Policy/critic_only', 0))}"
               + f" learn={teach.get('Policy/learn_share', float('nan')):.3f}"
-              + f" teach={teach.get('Teach/samples_share', float('nan')):.3f}",
+              + f" teach={teach.get('Teach/samples_share', float('nan')):.3f}"
+              + f" falls={teach.get('Rollout/events_fall', float('nan')):.0f}"
+              + (f" w={','.join(f'{w:.2f}' for w in self.alg.group_weights)}" if self.alg.group_mode == "multi" else ""),
               flush=True)
 
     def verify_summary(self) -> dict:

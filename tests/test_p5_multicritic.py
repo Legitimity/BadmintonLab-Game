@@ -16,7 +16,7 @@ from _serve_pkg import load  # noqa: E402
 
 M = load("ppo_ext", "ppo_multicritic", "serve_reward", "receive")
 MC, RC = M["ppo_multicritic"], M["receive"]
-N_ENV, T, A, G = 16, 8, 3, 3
+N_ENV, T, A, G = 16, 8, 3, 4
 GROUPS = {"policy": ["policy"], "critic": ["policy", "critic"]}
 KW = dict(num_learning_epochs=2, num_mini_batches=2, learning_rate=1e-3, schedule="adaptive", desired_kl=0.01,
           gamma=0.99, lam=0.95, entropy_coef=0.0, device="cpu")
@@ -112,12 +112,13 @@ def test_per_group_normalisation_and_empty_group():
     _fill(alg, aux=aux)
     st = alg.storage
     m = st.group_mask * st.observations["aux"][..., 0:1]
-    for gi in (0, 2):
+    for gi in (0, 2, 3):
         a = st.group_adv[..., gi][m[..., gi] > 0]
         assert abs(float(a.mean())) < 1e-5 and float(a.std()) == pytest.approx(1.0, rel=1e-4)
         assert torch.count_nonzero(st.group_adv[..., gi][m[..., gi] == 0]) == 0
     assert torch.count_nonzero(st.group_adv[..., 1]) == 0 and torch.isfinite(st.advantages).all()
-    want = st.group_adv[..., 0] * 1.0 + st.group_adv[..., 1] * 1.0 + st.group_adv[..., 2] * 0.5
+    want = (st.group_adv[..., 0] * 1.0 + st.group_adv[..., 1] * 1.0 + st.group_adv[..., 2] * 0.8
+            + st.group_adv[..., 3] * 0.2)
     assert torch.allclose(st.advantages[..., 0], want)
     assert alg._rollout_stats["Critic/adv_std_recv"] == 0.0 and alg._rollout_stats["Critic/share_recv"] == 0.0
 
@@ -134,7 +135,8 @@ def test_gae_is_per_group_with_shared_dones():
             p.zero_()
     _fill(alg, group_rewards=gr, dones=dones)
     st = alg.storage
-    assert torch.count_nonzero(st.returns[..., 0]) == 0 and torch.count_nonzero(st.returns[..., 2]) == 0
+    for gi in (0, 2, 3):
+        assert torch.count_nonzero(st.returns[..., gi]) == 0
     # Values 0: return_t = sum_k (gamma lam)^k r ... cut at the done of step 3.
     gl = 0.99 * 0.95
     assert float(st.returns[3, 0, 1]) == pytest.approx(1.0)
@@ -169,7 +171,7 @@ def test_value_loss_is_masked_per_group():
     ret[-1] = 50.0  # learn_w 0: must not count anywhere
     alg.use_clipped_value_loss = False
     loss = alg.value_loss(v, v, ret, lw, mask)
-    assert float(loss) == pytest.approx(3.0)
+    assert float(loss) == pytest.approx(float(G))  # each group: masked mean 1
     assert alg._batch_stats["Critic/value_loss_serve"] == pytest.approx(1.0)
 
 
@@ -206,7 +208,7 @@ def test_critic_only_moves_no_actor_parameter_even_with_adam_moments():
         assert alg.last_stats["Policy/critic_only"] == 1.0
     assert all(torch.equal(a, b) for a, b in zip(actor0, alg.actor_parameters()))
     assert not all(torch.equal(a, b) for a, b in zip(critic0, alg.policy.critic.parameters()))
-    assert {"Critic/value_loss_serve", "Critic/explained_var_recv", "Critic/adv_std_body"} <= set(alg.last_stats)
+    assert {"Critic/value_loss_serve", "Critic/explained_var_recv", "Critic/adv_std_body", "Critic/value_loss_fall"} <= set(alg.last_stats)
 
 
 def test_frozen_actor_normaliser():
@@ -229,25 +231,75 @@ def test_head_count_must_match_mode():
 
 # ---------------------------------------------------------------------- reward groups
 def test_reward_group_mapping():
+    """V2 2.1 (2026-11-07): fall alone in G_fall; the dense anti_fall height cost stays in G_body."""
+    assert RC.REWARD_GROUPS == ("serve", "recv", "fall", "body")
     serve = ("serve_legal_contact", "serve_swing_speed", "serve_face_quality", "serve_outcome_pred", "serve_launch_dir",
              "serve_serve_result", "serve_serve_fault", "serve_no_hit", "serve_tunnel")
-    body = ("serve_hold_ready", "serve_post_stand", "serve_fall", "anti_fall", "root_orientation", "racket_ground",
+    body = ("serve_hold_ready", "serve_post_stand", "anti_fall", "root_orientation", "racket_ground",
             "joint_limit", "action_rate", "foot_slip", "recv_post_stand")
-    assert all(RC.reward_group(t) == 0 for t in serve)
-    assert all(RC.reward_group(t) == 2 for t in body)
-    assert all(RC.reward_group(t) == 1 for t in RC.RECV_TERMS if t != "recv_post_stand")
+    assert all(RC.reward_group(t) == RC.G_SERVE for t in serve)
+    assert RC.reward_group("serve_fall") == RC.G_FALL
+    assert all(RC.reward_group(t) == RC.G_BODY for t in body)
+    assert all(RC.reward_group(t) == RC.G_RECV for t in RC.RECV_TERMS if t != "recv_post_stand")
 
 
 def test_group_mask_by_role():
     server = torch.tensor([0, 1, 0, 1])
     natural = torch.tensor([True, True, False, False])
     m = RC.group_mask(server, natural)
-    # natural, server 0: side 0 serve+body, side 1 recv+body
-    assert m[0, 0].tolist() == [1, 0, 1] and m[0, 1].tolist() == [0, 1, 1]
-    assert m[1, 1].tolist() == [1, 0, 1] and m[1, 0].tolist() == [0, 1, 1]
-    # feeder rally: the feeder (server) has nothing, the receiver recv + body
-    assert m[2, 0].tolist() == [0, 0, 0] and m[2, 1].tolist() == [0, 1, 1]
-    assert m[3, 1].tolist() == [0, 0, 0] and m[3, 0].tolist() == [0, 1, 1]
+    # natural, server 0: side 0 serve+fall+body, side 1 recv+fall+body
+    assert m[0, 0].tolist() == [1, 0, 1, 1] and m[0, 1].tolist() == [0, 1, 1, 1]
+    assert m[1, 1].tolist() == [1, 0, 1, 1] and m[1, 0].tolist() == [0, 1, 1, 1]
+    # feeder rally: the feeder (server) has nothing, the receiver recv + fall + body
+    assert m[2, 0].tolist() == [0, 0, 0, 0] and m[2, 1].tolist() == [0, 1, 1, 1]
+    assert m[3, 1].tolist() == [0, 0, 0, 0] and m[3, 0].tolist() == [0, 1, 1, 1]
+
+
+def test_rollout_without_fall_zeroes_fall_advantage():
+    """V2 2.4: no fall in the rollout -> G_fall rewards all 0, the value head may be non-zero (A_fall = value
+    differences); a tiny std (< 1e-4) zeroes A_fall, no NaN; fall events are counted in both modes."""
+    gr = torch.randn(T, N_ENV, G, generator=torch.Generator().manual_seed(4))
+    gr[..., RC.G_FALL] = 0.0
+    dones = torch.zeros(T, N_ENV, dtype=torch.long)
+    alg = _alg(_mc_policy())
+    with torch.no_grad():  # value head of G_fall: constant 1e-6 -> A_fall ~ 1e-8
+        alg.policy.critic[-1].weight[RC.G_FALL].zero_()
+        alg.policy.critic[-1].bias[RC.G_FALL].fill_(1e-6)
+    _fill(alg, group_rewards=gr, dones=dones)
+    st = alg.storage
+    assert torch.isfinite(st.advantages).all()
+    assert torch.count_nonzero(st.group_adv[..., RC.G_FALL]) == 0
+    assert alg._rollout_stats["Critic/adv_zeroed_fall"] == 1.0
+    assert alg._rollout_stats["Critic/adv_zeroed_serve"] == 0.0
+    assert alg._rollout_stats["Rollout/events_fall"] == 0.0
+    # Non-trivial fall head without falls: A_fall = value differences, normalised (not zeroed).
+    alg = _alg(_mc_policy())
+    _fill(alg, group_rewards=gr, dones=dones)
+    assert alg._rollout_stats["Critic/adv_zeroed_fall"] == 0.0 and torch.isfinite(alg.storage.advantages).all()
+    # Fall events: two learned falls and one on a feeder sample (not counted); control S counts them too.
+    gr2 = gr.clone()
+    gr2[2, 0, RC.G_FALL] = gr2[5, 3, RC.G_FALL] = gr2[5, 4, RC.G_FALL] = -10.0
+    aux = torch.cat((torch.ones(N_ENV, 1), torch.zeros(N_ENV, 1), torch.ones(N_ENV, G)), -1)
+    aux[4, 0] = 0.0
+    for mode, heads in (("multi", G), ("single", 1)):
+        alg = _alg(_mc_policy(num_values=heads), mode=mode)
+        _fill(alg, group_rewards=gr2, dones=dones, aux=aux)
+        assert alg._rollout_stats["Rollout/events_fall"] == 2.0, mode
+
+
+def test_group_weights_change_between_rollouts():
+    alg = _alg(_mc_policy())
+    alg.set_group_weights((1.0, 1.5, 0.5, 0.2))
+    _fill(alg)
+    st = alg.storage
+    w = torch.tensor([1.0, 1.5, 0.5, 0.2])
+    assert torch.allclose(st.advantages[..., 0], (st.group_adv * w).sum(-1))
+    assert alg._rollout_stats["Critic/w_recv"] == 1.5
+    with pytest.raises(ValueError):
+        alg.set_group_weights((1.0, 1.0, 0.5))
+    s = _alg(_mc_policy(num_values=1), mode="single")
+    s.set_group_weights((5.0, 5.0, 5.0, 5.0))  # ignored: S sums the raw group rewards
+    assert s.group_weights == (1.0,)
 
 
 def test_every_serve_term_has_a_group():

@@ -16,8 +16,8 @@ class ServePolicyVecEnvWrapper(SharedPolicyVecEnvWrapper):
 
 
 class ReceivePolicyVecEnvWrapper(ServePolicyVecEnvWrapper):
-    """P5: adds the P5 critic group ``p5c``, ``aux`` = [learn_w, teach_w, m_serve, m_recv, m_body] and
-    ``extras["group_rewards"]`` (2N, 3), same sample order as the rewards (side 0 courts, then side 1)."""
+    """P5: adds the P5 critic group ``p5c``, ``aux`` = [learn_w, teach_w, m_serve, m_recv, m_fall, m_body] and
+    ``extras["group_rewards"]`` (2N, G), same sample order as the rewards (side 0 courts, then side 1)."""
 
     def _agent_obs(self, obs_dict: dict[str, torch.Tensor]) -> TensorDict:
         td = super()._agent_obs(obs_dict)

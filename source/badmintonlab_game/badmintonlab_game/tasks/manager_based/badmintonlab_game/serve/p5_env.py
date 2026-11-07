@@ -9,10 +9,10 @@
 * The rule state of a launch is ``MatchRules.inject_serve`` plus ``hit_count[feeder] = 1``.
 * Natural serves announce their incoming ball one control step after the server's first hit (flight scan of
   the post-contact state, same drag law), feeder rallies at the launch.
-* ``p5_aux()``: (N, 2, 5) per side ``[learn_w, teach_w, m_serve, m_recv, m_body]``. ``learn_w`` = 0 for the
+* ``p5_aux()``: (N, 2, 2 + G) per side ``[learn_w, teach_w, m_serve, m_recv, m_fall, m_body]``. ``learn_w`` = 0 for the
   feeder; ``teach_w`` = 1 for the server of a natural rally from reset until ``teach_after_hit`` s after its first
   hit; ``m_*`` the V2 reward-group applicability (``receive.group_mask``).
-* V2 reward groups: ``group_reward_buf`` (N, 2, 3) = the RewardManager terms summed per group
+* V2 reward groups (``receive.REWARD_GROUPS``, G = 4): ``group_reward_buf`` (N, 2, G) = the RewardManager terms summed per group
   (``receive.reward_group``) times the applicability; ``agent_reward_buf`` is its sum.
 * Feeder landing check (2.2): the landing point of feeder rallies the receiver did not touch, against the
   table; ``pop_verify()`` returns per-level counts. ``verify_mode`` also moves the receiver off court.
@@ -30,6 +30,7 @@ from isaaclab.utils.math import quat_from_euler_xyz
 
 from .feeder import LAUNCH_X, FeederParams, FeederTable, drop_time, legal_mask, scan_trajectories
 from .receive import (
+    G_BODY,
     REWARD_GROUPS,
     RECV_STAT_KEYS,
     ReceiveParams,
@@ -320,7 +321,7 @@ class ReceiveBadmintonEnv(ServeBadmintonEnv):
         return {f"L{i}_{k}": row[j] for i, row in enumerate(v) for j, k in enumerate(VERIFY_KEYS)}
 
     def _group_rewards(self, total: torch.Tensor) -> None:
-        """``group_reward_buf`` (N, 2, 3) from the managers' per-term step rewards, times the applicability of the
+        """``group_reward_buf`` (N, 2, G) from the managers' per-term step rewards, times the applicability of the
         state before the reset (the rally the reward belongs to). ``total`` (N, 2) is the managers' sum."""
         n = self.num_envs
         out = torch.zeros(n, 2, len(REWARD_GROUPS), device=self.device)
@@ -329,7 +330,7 @@ class ReceiveBadmintonEnv(ServeBadmintonEnv):
         mask = group_mask(self.initial_hitter, self.natural)
         self.group_reward_buf = out * mask
         err = (out.sum(-1) - total).abs().max()
-        learned = mask[..., 2:3]  # body mask = learn_w
+        learned = mask[..., G_BODY:G_BODY + 1]  # body mask = learn_w
         outside = (out * (1.0 - mask)).abs()
         self._outside_acc += torch.stack(((outside * learned).sum(), (outside * (1.0 - learned)).sum(), out.abs().sum(),
                                           torch.zeros_like(err)))
@@ -345,8 +346,8 @@ class ReceiveBadmintonEnv(ServeBadmintonEnv):
         return {"outside_share": a[0] / tot, "feeder_share": a[1] / tot, "sum_err": a[3]}
 
     def p5_aux(self) -> torch.Tensor:
-        """(N, 2, 5): per side ``[learn_w, teach_w, m_serve, m_recv, m_body]`` of the current state (after any
-        reset). The group masks are ``receive.group_mask`` (body = learn_w)."""
+        """(N, 2, 2 + G): per side ``[learn_w, teach_w, m_serve, m_recv, m_fall, m_body]`` of the current state
+        (after any reset). The group masks are ``receive.group_mask`` (fall = body = learn_w)."""
         n = self.num_envs
         side = torch.arange(2, device=self.device).expand(n, 2)
         server = self.initial_hitter.unsqueeze(1)

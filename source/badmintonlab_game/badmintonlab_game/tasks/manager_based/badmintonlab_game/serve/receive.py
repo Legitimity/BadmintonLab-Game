@@ -469,31 +469,39 @@ class ReceiveRewardComputer:
         return out
 
 
-REWARD_GROUPS = ("serve", "recv", "body")
-# V2 2.1: the P3 C serve terms (RewardManager names, prefix serve_); everything that is neither these nor a recv_*
-# term (fall, post_stand, hold_ready, the parent's default costs) and recv_post_stand is G_body.
+REWARD_GROUPS = ("serve", "recv", "fall", "body")
+NUM_GROUPS = len(REWARD_GROUPS)
+G_SERVE, G_RECV, G_FALL, G_BODY = (REWARD_GROUPS.index(g) for g in ("serve", "recv", "fall", "body"))
+# V2 2.1 (2026-11-07): the P3 C serve terms (RewardManager names, prefix serve_) are G_serve; the recv_* terms
+# except recv_post_stand are G_recv; the fall event (serve_fall, -10, both roles, terminates) alone is G_fall;
+# everything else (post_stand, hold_ready, the parent's default costs incl. the dense anti_fall height cost, and
+# recv_post_stand) is G_body.
 SERVE_GROUP_TERMS = tuple(f"serve_{t}" for t in ("legal_contact", "swing_speed", "face_quality", "outcome_pred",
                                                   "launch_dir", "serve_result", "serve_fault", "no_hit", "tunnel"))
+FALL_GROUP_TERMS = ("serve_fall",)
 BODY_RECV_TERMS = ("recv_post_stand",)
 
 
 def reward_group(term_name: str) -> int:
     """Index in ``REWARD_GROUPS`` of a RewardManager term."""
     if term_name in SERVE_GROUP_TERMS:
-        return 0
+        return G_SERVE
+    if term_name in FALL_GROUP_TERMS:
+        return G_FALL
     if term_name.startswith("recv_") and term_name not in BODY_RECV_TERMS:
-        return 1
-    return 2
+        return G_RECV
+    return G_BODY
 
 
 def group_mask(server: torch.Tensor, natural: torch.Tensor) -> torch.Tensor:
-    """(N, 2, 3) applicability per side: serve = server of a natural rally, recv = receiver (both rally types),
-    body = every learned sample (all but the feeder)."""
+    """(N, 2, G) applicability per side, columns in ``REWARD_GROUPS`` order: serve = server of a natural rally,
+    recv = receiver (both rally types), fall and body = every learned sample (all but the feeder)."""
     n = server.shape[0]
     side = torch.arange(2, device=server.device).expand(n, 2)
     is_srv = side == server.unsqueeze(1)
     nat = natural.unsqueeze(1)
-    return torch.stack((is_srv & nat, ~is_srv, ~(is_srv & ~nat)), dim=-1).float()
+    cols = {G_SERVE: is_srv & nat, G_RECV: ~is_srv, G_FALL: ~(is_srv & ~nat), G_BODY: ~(is_srv & ~nat)}
+    return torch.stack([cols[i] for i in range(NUM_GROUPS)], dim=-1).float()
 
 
 def recv_term(env, term: str, side: int) -> torch.Tensor:

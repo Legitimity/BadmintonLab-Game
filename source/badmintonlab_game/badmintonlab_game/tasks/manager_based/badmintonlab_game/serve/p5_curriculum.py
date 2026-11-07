@@ -5,6 +5,8 @@
   ``tf_err_p50 <= 35`` deg and ``fell <= 0.03``; R1 needs ``touch >= 0.5``; R2 runs to the end. A stage passes
   its gate after ``min_iters``; at ``max_iters`` it is promoted anyway (event ``max_<stage>``, the monitor alerts).
 * **Weights** of the receive terms switch linearly from the previous stage over ``blend_iters`` after a promotion.
+* **Group weights** ``w_g`` of the multi-critic advantage (V2 2.5, order ``receive.REWARD_GROUPS`` = serve, recv,
+  fall, body): R0 1.0 / 1.0 / 0.8 / 0.2, R1 and R2 1.0 / 1.5 / 0.5 / 0.2; blended with the receive weights.
 * **Face tolerance** (flat part of the recv_face heading factor) anneals per stage from ``face_tol[s][0]`` to
   ``face_tol[s][1]`` over ``face_anneal_iters`` iterations of the stage (R1 90 -> 45, R2 45 -> 25); its own counter,
   independent of the blend.
@@ -18,7 +20,7 @@ from __future__ import annotations
 import math
 from dataclasses import dataclass, field
 
-from .receive import RECV_STAGE_WEIGHTS, RECV_STAGES, RECV_TERMS
+from .receive import NUM_GROUPS, RECV_STAGE_WEIGHTS, RECV_STAGES, RECV_TERMS, REWARD_GROUPS
 
 
 @dataclass
@@ -34,6 +36,8 @@ DEFAULT_STAGES = (
     StageSpec(300, None, None),
 )
 DEFAULT_FACE_TOL = ((90.0, 90.0), (90.0, 45.0), (45.0, 25.0))
+# V2 2.5: per stage, (w_serve, w_recv, w_fall, w_body).
+DEFAULT_GROUP_WEIGHTS = {"R0": (1.0, 1.0, 0.8, 0.2), "R1": (1.0, 1.5, 0.5, 0.2), "R2": (1.0, 1.5, 0.5, 0.2)}
 LOGGED_EMA = ("st_err_p50", "tf_err_p50", "tf_lit_p50", "fell", "touch", "crossed", "in", "f_touch", "n_touch",
               "f_crossed", "n_crossed", "hd_abs_med", "vc_med")
 
@@ -46,6 +50,7 @@ class P5Curriculum:
     blend_iters: int = 300
     face_tol: tuple = DEFAULT_FACE_TOL
     face_anneal_iters: int = 1000
+    group_weight_table: dict = field(default_factory=lambda: {k: tuple(v) for k, v in DEFAULT_GROUP_WEIGHTS.items()})
     early_level: int = 2
     r2_level: int = 3
     natural_min: float = 0.4
@@ -64,6 +69,9 @@ class P5Curriculum:
 
     def __post_init__(self):
         self.natural_share = self.clamp_share(self.natural_share)
+        for k, v in self.group_weight_table.items():
+            if k not in RECV_STAGES or len(v) != NUM_GROUPS:
+                raise ValueError(f"group weights {k}: {v} (need {NUM_GROUPS} for stages {RECV_STAGES})")
 
     @property
     def alpha(self) -> float:
@@ -99,6 +107,15 @@ class P5Curriculum:
             return {k: float(cur[k]) for k in RECV_TERMS}
         prev = RECV_STAGE_WEIGHTS[RECV_STAGES[self.blend_from]]
         return {k: (1.0 - f) * prev[k] + f * cur[k] for k in RECV_TERMS}
+
+    def group_weights(self) -> tuple:
+        """``w_g`` (``REWARD_GROUPS`` order), blended like the receive weights."""
+        cur = self.group_weight_table[self.stage_name]
+        f = self.blend()
+        if f >= 1.0:
+            return tuple(float(x) for x in cur)
+        prev = self.group_weight_table[RECV_STAGES[self.blend_from]]
+        return tuple((1.0 - f) * a + f * b for a, b in zip(prev, cur))
 
     def face_tolerance(self) -> float:
         a, b = self.face_tol[self.stage]
@@ -149,6 +166,7 @@ class P5Curriculum:
         out.update({"P5Curr/stage": float(self.stage), "P5Curr/iters_in_stage": float(self.iters_in_stage),
                     "P5Curr/blend": self.blend(), "P5Curr/face_tol": self.face_tolerance(),
                     "P5Curr/level": float(self.level), "P5Curr/natural_share": self.natural_share})
+        out.update({f"P5Curr/w_{g}": w for g, w in zip(REWARD_GROUPS, self.group_weights())})
         return out
 
     def state_dict(self) -> dict:

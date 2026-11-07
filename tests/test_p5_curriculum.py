@@ -80,6 +80,29 @@ def test_blend_and_face_tolerance_count_separately():
     assert c.face_tolerance() == 45.0
 
 
+def test_group_weights_per_stage_blend_with_receive_weights():
+    """V2 2.5: R0 1.0/1.0/0.8/0.2, R1 = R2 1.0/1.5/0.5/0.2 (serve, recv, fall, body), switched with the same blend."""
+    assert cur_mod.DEFAULT_GROUP_WEIGHTS == {"R0": (1.0, 1.0, 0.8, 0.2), "R1": (1.0, 1.5, 0.5, 0.2),
+                                             "R2": (1.0, 1.5, 0.5, 0.2)}
+    c = _small(blend_iters=10)
+    assert c.group_weights() == (1.0, 1.0, 0.8, 0.2)
+    for it in range(10):
+        c.update(it, R0_OK)
+    for it in range(10, 15):
+        c.update(it, {"rallies": 100.0, "touch": 0.0})
+    assert c.blend() == 0.5
+    assert all(abs(a - b) < 1e-9 for a, b in zip(c.group_weights(), (1.0, 1.25, 0.65, 0.2)))
+    assert abs(c.log_values()["P5Curr/w_fall"] - 0.65) < 1e-9
+    for it in range(15, 25):
+        c.update(it, {"rallies": 100.0, "touch": 0.0})
+    assert c.group_weights() == (1.0, 1.5, 0.5, 0.2)
+    try:
+        cur_mod.P5Curriculum(group_weight_table={"R0": (1.0, 1.0, 0.5)})
+        raise AssertionError("3 weights accepted")
+    except ValueError:
+        pass
+
+
 def test_stage_weights_table():
     w = recv.RECV_STAGE_WEIGHTS
     assert set(w) == {"R0", "R1", "R2"} and all(set(v) == set(recv.RECV_TERMS) for v in w.values())
