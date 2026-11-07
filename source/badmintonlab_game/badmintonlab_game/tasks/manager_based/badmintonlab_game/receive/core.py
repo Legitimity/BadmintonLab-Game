@@ -191,13 +191,13 @@ class ReceiveCurriculum:
     level_ema: int = 100
     level_min: int = 100
     level_station: float = 0.4
-    level_fall: float = 0.02  # 11-08: per ball (was 0.05 per 6-ball episode)
+    level_fall: float = 0.03  # 11-08: per fed ball, = spec "fall < 3%"
     gate_ema: int = 200
     gate_min: int = 300
     gate_max: int = 4000  # 11-08: raised from 2000 (L1 alone took ~800 iters)
     gate_station: float = 0.5
     gate_face: float = 0.5
-    gate_fall: float = 0.015  # 11-08: per ball
+    gate_fall: float = 0.03  # 11-08: per fed ball, = spec
     iters_in_level: int = 0
     iters_in_stage: int = 0
     ema: dict = field(default_factory=dict)
