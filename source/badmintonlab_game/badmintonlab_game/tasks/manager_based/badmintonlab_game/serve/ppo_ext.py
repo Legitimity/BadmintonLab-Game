@@ -170,12 +170,29 @@ class PPOExt(PPO):
         parts = dict(value_function=value_loss, surrogate=surrogate_loss, entropy=entropy, teach=teach_loss)
         return loss, parts, teach_mse, n_teach
 
+    @torch.no_grad()
+    def _renormalize_advantages(self) -> None:
+        """``compute_returns`` normalised the advantages over all samples, masked ones included; redo it with the
+        ``learn_w`` weights so the learned samples have mean 0 / std 1 (an affine map of the raw advantages)."""
+        if self.normalize_advantage_per_mini_batch or self.storage.observations is None:
+            return
+        if self.aux_group not in self.storage.observations.keys():
+            return
+        w = self.storage.observations[self.aux_group][..., 0:1].float()
+        if float(w.sum()) <= 1.0 or bool((w == 1).all()):
+            return
+        a = self.storage.advantages
+        mean = self._wmean(a, w)
+        std = self._wmean((a - mean).pow(2), w).sqrt()
+        self.storage.advantages = (a - mean) / (std + 1e-8)
+
     # ------------------------------------------------------------------ update
     def update(self) -> dict[str, float]:
         if self.rnd or self.symmetry or self.policy.is_recurrent:
             raise NotImplementedError("PPOExt supports plain feed-forward PPO only")
         critic_only = self.updates < self.critic_only_iters
         actor_params = self.actor_parameters() if critic_only else []
+        self._renormalize_advantages()
         sums = dict(value_function=0.0, surrogate=0.0, entropy=0.0, teach=0.0)
         mse_sum, mse_n, n_upd, n_samples, learn_sum = 0.0, 0.0, 0, 0, 0.0
         generator = self.storage.mini_batch_generator(self.num_mini_batches, self.num_learning_epochs)

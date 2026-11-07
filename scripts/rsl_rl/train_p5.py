@@ -46,6 +46,8 @@ parser.add_argument("--beta_start", type=float, default=1.0)
 parser.add_argument("--beta_end", type=float, default=0.1)
 parser.add_argument("--beta_iters", type=int, default=2000)
 parser.add_argument("--std_init", type=float, default=0.3)
+parser.add_argument("--init_lr", type=float, default=None, help="Learning rate after the warm start (default: P3's).")
+parser.add_argument("--fresh_optimizer", action="store_true", help="Do not load P3's Adam state at the warm start.")
 parser.add_argument("--std_min", type=float, default=0.15)
 parser.add_argument("--std_max", type=float, default=0.40)
 parser.add_argument("--critic_only_iters", type=int, default=30)
@@ -215,7 +217,8 @@ def main(env_cfg, agent_cfg):
                 print(f"[INFO] resumed curriculum overridden: level {curriculum.level} (max {curriculum.max_level}), natural "
                       f"share {curriculum.natural_share:.2f} in [{curriculum.natural_min}, {curriculum.natural_max}]")
         else:
-            report = runner.warm_start(args_cli.init_checkpoint, std=args_cli.std_init)
+            report = runner.warm_start(args_cli.init_checkpoint, std=args_cli.std_init,
+                                       load_optimizer=not args_cli.fresh_optimizer, lr=args_cli.init_lr)
             with open(os.path.join(log_dir, "warm_start.json"), "w") as f:
                 json.dump(report, f, indent=1, default=str)
         dump_yaml(os.path.join(log_dir, "params", "env.yaml"), env_cfg)

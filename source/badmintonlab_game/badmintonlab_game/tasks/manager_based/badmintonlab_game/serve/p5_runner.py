@@ -82,16 +82,52 @@ class P5Runner(ServeRunner):
                   flush=True)
 
     # ------------------------------------------------------------------ warm start
-    def warm_start(self, path: str, std: float | None = 0.3) -> dict:
+    def warm_start(self, path: str, std: float | None = 0.3, load_optimizer: bool = True, lr: float | None = None) -> dict:
+        """P3 -> P5. With ``load_optimizer`` the Adam moments and the adapted learning rate of P3 are kept (a fresh
+        Adam at the default 1e-3 makes sign-sized steps on every weight and wrecked the warm-started actor in the
+        first pilot: receiver falls 0.02 -> 0.99 in 5 iterations). ``lr`` overrides the learning rate."""
         ck = torch.load(path, map_location=self.device, weights_only=False)
         state, report = pad_state_dict(ck["model_state_dict"], self.alg.policy.state_dict())
         self.alg.policy.load_state_dict(state)
+        if load_optimizer and "optimizer_state_dict" in ck:
+            report["optimizer"] = self._load_padded_optimizer(ck["optimizer_state_dict"])
+        if lr is not None:
+            self.alg.learning_rate = float(lr)
+            for g in self.alg.optimizer.param_groups:
+                g["lr"] = float(lr)
         if std is not None:
             self.alg.reset_std(std)
-        report.update(source=path, source_iter=ck.get("iter"), std=self.alg.std_mean())
+        report.update(source=path, source_iter=ck.get("iter"), std=self.alg.std_mean(), lr=self.alg.learning_rate)
         print(f"[P5] warm start from {path}: {report['copied']} tensors copied, padded {report['padded']}, "
-              f"missing {report['missing']}, std {report['std']:.3f}", flush=True)
+              f"missing {report['missing']}, optimizer {report.get('optimizer')}, lr {report['lr']:.2e}, "
+              f"std {report['std']:.3f}", flush=True)
         return report
+
+    def _load_padded_optimizer(self, src: dict) -> str:
+        opt = self.alg.optimizer
+        params = [p for g in opt.param_groups for p in g["params"]]
+        if len(src["param_groups"]) != len(opt.param_groups) or len(params) != sum(len(g["params"]) for g in src["param_groups"]):
+            return "skipped (parameter count differs)"
+        padded = 0
+        for i, prm in enumerate(params):
+            st = src["state"].get(i)
+            if st is None:
+                continue
+            new = {}
+            for k, v in st.items():
+                if torch.is_tensor(v) and v.dim() > 0 and v.shape != prm.shape:
+                    if v.dim() != prm.dim() or any(a > b for a, b in zip(v.shape, prm.shape)):
+                        return f"skipped (state shape {tuple(v.shape)} vs {tuple(prm.shape)})"
+                    t = torch.zeros_like(prm)
+                    t[tuple(slice(0, s) for s in v.shape)] = v
+                    new[k] = t
+                    padded += 1
+                else:
+                    new[k] = v.to(self.device) if torch.is_tensor(v) else v
+            src["state"][i] = new
+        opt.load_state_dict(src)
+        self.alg.learning_rate = float(opt.param_groups[0]["lr"])
+        return f"loaded ({padded} moment tensors padded)"
 
     # ------------------------------------------------------------------ metrics
     def _serve_metrics(self, it: int) -> None:

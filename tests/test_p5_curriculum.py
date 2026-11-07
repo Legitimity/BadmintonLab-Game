@@ -80,6 +80,24 @@ def test_natural_share_clamp_and_state_roundtrip():
     assert c2.state_dict() == d
 
 
+def test_padded_optimizer_load_keeps_moments_and_lr():
+    from types import SimpleNamespace
+
+    runner_cls = load("runner", "ppo_ext", "p5_runner")["p5_runner"].P5Runner
+    a = [torch.nn.Parameter(torch.randn(4, 3)), torch.nn.Parameter(torch.randn(4))]
+    b = [torch.nn.Parameter(torch.randn(4, 5)), torch.nn.Parameter(torch.randn(4))]
+    oa = torch.optim.Adam(a, lr=1e-5)
+    (a[0].sum() + a[1].pow(2).sum()).backward()
+    oa.step()
+    ob = torch.optim.Adam(b, lr=1e-3)
+    fake = SimpleNamespace(alg=SimpleNamespace(optimizer=ob, learning_rate=1e-3), device="cpu")
+    msg = runner_cls._load_padded_optimizer(fake, oa.state_dict())
+    assert msg.startswith("loaded") and fake.alg.learning_rate == 1e-5 and ob.param_groups[0]["lr"] == 1e-5
+    m = ob.state[b[0]]["exp_avg"]
+    assert m.shape == (4, 5) and torch.equal(m[:, :3], oa.state[a[0]]["exp_avg"]) and torch.count_nonzero(m[:, 3:]) == 0
+    assert torch.equal(ob.state[b[1]]["exp_avg_sq"], oa.state[a[1]]["exp_avg_sq"])
+
+
 def test_pad_state_dict_critic_and_normaliser():
     from rsl_rl.modules import ActorCritic
     from tensordict import TensorDict
