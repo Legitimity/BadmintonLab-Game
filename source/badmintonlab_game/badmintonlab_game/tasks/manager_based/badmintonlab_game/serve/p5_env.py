@@ -9,8 +9,11 @@
 * The rule state of a launch is ``MatchRules.inject_serve`` plus ``hit_count[feeder] = 1``.
 * Natural serves announce their incoming ball one control step after the server's first hit (flight scan of
   the post-contact state, same drag law), feeder rallies at the launch.
-* ``p5_aux()``: (N, 2, 2) per side ``[learn_w, teach_w]``. ``learn_w`` = 0 for the feeder; ``teach_w`` = 1 for
-  the server of a natural rally from reset until ``teach_after_hit`` s after its first hit.
+* ``p5_aux()``: (N, 2, 5) per side ``[learn_w, teach_w, m_serve, m_recv, m_body]``. ``learn_w`` = 0 for the
+  feeder; ``teach_w`` = 1 for the server of a natural rally from reset until ``teach_after_hit`` s after its first
+  hit; ``m_*`` the V2 reward-group applicability (``receive.group_mask``).
+* V2 reward groups: ``group_reward_buf`` (N, 2, 3) = the RewardManager terms summed per group
+  (``receive.reward_group``) times the applicability; ``agent_reward_buf`` is its sum.
 * Feeder landing check (2.2): the landing point of feeder rallies the receiver did not touch, against the
   table; ``pop_verify()`` returns per-level counts. ``verify_mode`` also moves the receiver off court.
 """
@@ -26,11 +29,25 @@ import torch
 from isaaclab.utils.math import quat_from_euler_xyz
 
 from .feeder import LAUNCH_X, FeederParams, FeederTable, drop_time, legal_mask, scan_trajectories
-from .receive import RECV_STAT_KEYS, ReceiveParams, ReceiveRewardComputer, ReceiveStepInputs
+from .receive import (
+    REWARD_GROUPS,
+    RECV_STAT_KEYS,
+    ReceiveParams,
+    ReceiveRewardComputer,
+    ReceiveStepInputs,
+    group_mask,
+    reward_group,
+)
 from .serve_env import ServeBadmintonEnv
 from .serve_reward import to_canonical
 
 VERIFY_KEYS = ("n", "ok", "err_sum")
+
+
+def _yaw(q: torch.Tensor) -> torch.Tensor:
+    """Yaw of (w, x, y, z) quaternions."""
+    w, x, y, z = q.unbind(-1)
+    return torch.atan2(2.0 * (w * z + x * y), 1.0 - 2.0 * (y * y + z * z))
 
 
 class ReceiveBadmintonEnv(ServeBadmintonEnv):
@@ -60,6 +77,16 @@ class ReceiveBadmintonEnv(ServeBadmintonEnv):
         self._verify = torch.zeros(len(self.feeder_params.levels), len(VERIFY_KEYS), device=dev)
         # Natural serves: legal incoming = clears the net edge, lands in the receiver's singles court.
         self._nat_params = FeederParams(net_margin=0.0, floor=self.feeder_params.floor)
+        # V2 reward groups: group index of every RewardManager term, per side.
+        self._term_group = []
+        for mgr in (self.reward_manager, self.player_1_reward_manager):
+            names = list(mgr.active_terms)
+            self._term_group.append(torch.tensor([reward_group(t) for t in names], dtype=torch.long, device=dev))
+        groups = {g: [t for t in self.reward_manager.active_terms if REWARD_GROUPS[reward_group(t)] == g]
+                  for g in REWARD_GROUPS}
+        print(f"[P5] reward groups (side 0): {groups}", flush=True)
+        self.group_reward_buf = z(n, 2, len(REWARD_GROUPS))
+        self._outside_acc = torch.zeros(4, device=dev)  # dropped (learned), dropped (feeder), total, max sum error
         # The P5 state of a court (rally type, feeder pose, launch) is drawn by _reset_idx, first at env.reset().
 
     # ------------------------------------------------------------------ feeder table
@@ -123,7 +150,8 @@ class ReceiveBadmintonEnv(ServeBadmintonEnv):
         reward_0 = self.reward_manager.compute(dt=self.step_dt)
         reward_1 = self.player_1_reward_manager.compute(dt=self.step_dt)
         self.approach_reward_event.zero_()
-        self.agent_reward_buf = torch.stack((reward_0, reward_1), dim=1)
+        self._group_rewards(torch.stack((reward_0, reward_1), dim=1))
+        self.agent_reward_buf = self.group_reward_buf.sum(-1)
         self.reward_buf = self.agent_reward_buf.mean(dim=1)
         self.extras["rally_resolved"] = self.rally_resolved.clone()
         self.extras["rally_winner"] = self.rally_winner.clone()
@@ -273,6 +301,7 @@ class ReceiveBadmintonEnv(ServeBadmintonEnv):
             fall_given=self.serve_reward.fall_given,
             time_s=t,
             natural=self.natural,
+            root_yaw=torch.stack([_yaw(r.data.root_quat_w) for r in self._robots], dim=1),
         ))
 
         # Feeder landing check: untouched feeder balls that landed, against the table.
@@ -290,8 +319,34 @@ class ReceiveBadmintonEnv(ServeBadmintonEnv):
         self._verify.zero_()
         return {f"L{i}_{k}": row[j] for i, row in enumerate(v) for j, k in enumerate(VERIFY_KEYS)}
 
+    def _group_rewards(self, total: torch.Tensor) -> None:
+        """``group_reward_buf`` (N, 2, 3) from the managers' per-term step rewards, times the applicability of the
+        state before the reset (the rally the reward belongs to). ``total`` (N, 2) is the managers' sum."""
+        n = self.num_envs
+        out = torch.zeros(n, 2, len(REWARD_GROUPS), device=self.device)
+        for side, mgr in enumerate((self.reward_manager, self.player_1_reward_manager)):
+            out[:, side].index_add_(1, self._term_group[side], mgr._step_reward * self.step_dt)
+        mask = group_mask(self.initial_hitter, self.natural)
+        self.group_reward_buf = out * mask
+        err = (out.sum(-1) - total).abs().max()
+        learned = mask[..., 2:3]  # body mask = learn_w
+        outside = (out * (1.0 - mask)).abs()
+        self._outside_acc += torch.stack(((outside * learned).sum(), (outside * (1.0 - learned)).sum(), out.abs().sum(),
+                                          torch.zeros_like(err)))
+        self._outside_acc[3] = torch.maximum(self._outside_acc[3], err)
+
+    def pop_outside(self) -> dict:
+        """Shares of the |reward| dropped by the group masks: on learned samples (a term in the wrong group or
+        role, should be 0) and on the feeder (its own costs, expected); max |sum of the groups - managers' total|
+        (every term in one group: ~0)."""
+        a = self._outside_acc.tolist()
+        self._outside_acc.zero_()
+        tot = max(a[2], 1e-9)
+        return {"outside_share": a[0] / tot, "feeder_share": a[1] / tot, "sum_err": a[3]}
+
     def p5_aux(self) -> torch.Tensor:
-        """(N, 2, 2): per side ``[learn_w, teach_w]`` of the current state (after any reset)."""
+        """(N, 2, 5): per side ``[learn_w, teach_w, m_serve, m_recv, m_body]`` of the current state (after any
+        reset). The group masks are ``receive.group_mask`` (body = learn_w)."""
         n = self.num_envs
         side = torch.arange(2, device=self.device).expand(n, 2)
         server = self.initial_hitter.unsqueeze(1)
@@ -300,7 +355,8 @@ class ReceiveBadmintonEnv(ServeBadmintonEnv):
         t = self.episode_length_buf.float() * self.step_dt
         window = (self.server_hit_t < 0) | (t - self.server_hit_t < self.p5.teach_after_hit)
         teach = is_server & (self.natural & window).unsqueeze(1)
-        return torch.stack((learn.float(), teach.float()), dim=-1)
+        mask = group_mask(self.initial_hitter, self.natural)
+        return torch.cat((torch.stack((learn.float(), teach.float()), dim=-1), mask), dim=-1)
 
     def p5_critic_obs(self, side: int) -> torch.Tensor:
         """(N, 11): rally type (2), role (2), target - root in own frame (3), time to target, d_need, valid, level."""
@@ -345,6 +401,10 @@ class ReceiveBadmintonEnv(ServeBadmintonEnv):
         self._prev_phys_vel[ids] = 0.0
         if self.p5.verify_mode:
             levels = torch.randint(0, len(self.feeder_params.levels), (k,), device=self.device)
+            rows = self.table.sample(levels, k)
+        elif self.p5.level_mode == "uniform":
+            # V2 4.3: every level up to the current one equally often (each from its own band, 70/30 below).
+            levels = torch.randint(0, self.feeder_level + 1, (k,), device=self.device)
             rows = self.table.sample(levels, k)
         else:
             rows = self.table.sample(self.feeder_level, k)

@@ -1,15 +1,19 @@
-"""Train the P5 receive task (P5_RECEIVE_DESIGN). Warm start from P3 final, teacher = P3 final export.
+"""Train the P5 receive task, V2 (P5_RECEIVE_DESIGN_V2). Warm start from P3 final (c7 3000), teacher = its export.
+
+Defaults are V2: multi-critic (serve / recv / body, weights 1.0 / 1.0 / 0.5), 50 critic-only iterations, natural
+share 0.5 in [0.4, 0.6], R0 -> R1 -> R2, feeder L0-L2 (L3 from R2), entropy 0, std 0.30 in [0.15, 0.35],
+beta 1.0 -> 0.2 over 2000 updates, actor normaliser frozen at P3's statistics.
 
 Smoke::
 
     python scripts/rsl_rl/train_p5.py --headless --num_envs 4 --max_iterations 2 --run_name p5_smoke --swanlab_mode disabled
 
-Pilot part 1 (feeder only, L0-L1)::
+Pilot M / control S (V2 6)::
 
-    python scripts/rsl_rl/train_p5.py --headless --num_envs 2048 --run_name p5_pilot_a --natural_share 0 \
-        --natural_min 0 --max_level 1 --time_budget_hours 1.5
+    python scripts/rsl_rl/train_p5.py --headless --num_envs 2048 --run_name p5v2_M --time_budget_hours 3
+    python scripts/rsl_rl/train_p5.py --headless --num_envs 2048 --run_name p5v2_S --critic single --time_budget_hours 3
 
-Feeder landing check (2.2): ``env.p5.verify_mode=True`` (receiver off court, levels drawn uniformly).
+Feeder landing check (V1 2.2): ``env.p5.verify_mode=True`` (receiver off court, levels drawn uniformly).
 """
 
 import argparse
@@ -43,24 +47,26 @@ parser.add_argument("--init_checkpoint", default=str(P3_CKPT), help="Warm start 
 parser.add_argument("--teacher", default=str(P3_EXPORT), help="TorchScript teacher; 'none' disables the teacher term.")
 parser.add_argument("--teacher_sigma", type=float, default=0.3)
 parser.add_argument("--beta_start", type=float, default=1.0)
-parser.add_argument("--beta_end", type=float, default=0.1)
+parser.add_argument("--beta_end", type=float, default=0.2)
 parser.add_argument("--beta_iters", type=int, default=2000)
 parser.add_argument("--std_init", type=float, default=0.3)
 parser.add_argument("--init_lr", type=float, default=None, help="Learning rate after the warm start (default: P3's).")
 parser.add_argument("--fresh_optimizer", action="store_true", help="Do not load P3's Adam state at the warm start.")
 parser.add_argument("--std_min", type=float, default=0.15)
-parser.add_argument("--std_max", type=float, default=0.35,
-                    help="Doc 4.3 says 0.40; tightened to 0.35 (P3 drifted 0.30 -> 0.43 with entropy_coef 0.001).")
-parser.add_argument("--critic_only_iters", type=int, default=30)
+parser.add_argument("--std_max", type=float, default=0.35)
+parser.add_argument("--entropy_coef", type=float, default=0.0)
+parser.add_argument("--critic_only_iters", type=int, default=50)
+parser.add_argument("--critic", default="multi", choices=("multi", "single"),
+                    help="multi: 3 value heads, per-group advantages (pilot M); single: one head, summed reward (S).")
+parser.add_argument("--group_weights", default="1.0,1.0,0.5", help="w_serve,w_recv,w_body (multi only)")
+parser.add_argument("--no_freeze_actor_norm", action="store_true", help="Keep updating the actor normaliser (V1).")
 parser.add_argument("--natural_share", type=float, default=0.5)
-parser.add_argument("--natural_min", type=float, default=0.3, help="0 for the feeder-only pilot.")
-parser.add_argument("--natural_max", type=float, default=0.7)
-parser.add_argument("--level", type=int, default=0, help="Start level (not when resuming).")
-parser.add_argument("--max_level", type=int, default=3)
-parser.add_argument("--r1_iters", type=int, default=1500)
-parser.add_argument("--reward_blend_iters", type=int, default=300)
-parser.add_argument("--level_iters", default=None, help="'min=300,max=3000,ema=200'")
-parser.add_argument("--recv_weights", default=None, help="e.g. 'R1.recv_approach=2.0,R2.recv_approach=1.0'")
+parser.add_argument("--natural_min", type=float, default=0.4)
+parser.add_argument("--natural_max", type=float, default=0.6)
+parser.add_argument("--blend_iters", type=int, default=300)
+parser.add_argument("--face_anneal_iters", type=int, default=1000)
+parser.add_argument("--stage_iters", default=None, help="'R0.min=300,R0.max=1500,R1.min=300,R1.max=2000,ema=200'")
+parser.add_argument("--recv_weights", default=None, help="e.g. 'R0.recv_approach=3.0'")
 parser.add_argument("--mini_batches", type=int, default=None)
 parser.add_argument("--swanlab_mode", default="cloud", choices=("cloud", "local", "offline", "disabled"))
 parser.add_argument("--swanlab_project", default="BadmintonLab-Game")
@@ -83,7 +89,10 @@ from isaaclab_tasks.utils.hydra import hydra_task_config  # noqa: E402
 import badmintonlab_game.tasks  # noqa: E402,F401
 from badmintonlab_game.tasks.manager_based.badmintonlab_game.serve.p5_curriculum import P5Curriculum  # noqa: E402
 from badmintonlab_game.tasks.manager_based.badmintonlab_game.serve.p5_runner import P5Runner  # noqa: E402
-from badmintonlab_game.tasks.manager_based.badmintonlab_game.serve.receive import RECV_STAGE_WEIGHTS  # noqa: E402
+from badmintonlab_game.tasks.manager_based.badmintonlab_game.serve.receive import (  # noqa: E402
+    RECV_STAGE_WEIGHTS,
+    RECV_STAGES,
+)
 from badmintonlab_game.tasks.manager_based.badmintonlab_game.serve.runner import (  # noqa: E402
     find_latest,
     finish_run_meta,
@@ -136,15 +145,19 @@ def _stop_swanlab(proc, log_dir: str) -> None:
 
 
 def _curriculum() -> P5Curriculum:
-    cur = P5Curriculum(level=args_cli.level, max_level=args_cli.max_level, r1_iters=args_cli.r1_iters,
-                       blend_iters=args_cli.reward_blend_iters, natural_min=args_cli.natural_min,
-                       natural_max=args_cli.natural_max, natural_share=args_cli.natural_share)
-    if args_cli.level_iters:
-        kv = {k.strip(): int(v) for k, v in (x.split("=") for x in args_cli.level_iters.split(","))}
+    cur = P5Curriculum(blend_iters=args_cli.blend_iters, face_anneal_iters=args_cli.face_anneal_iters,
+                       natural_min=args_cli.natural_min, natural_max=args_cli.natural_max,
+                       natural_share=args_cli.natural_share)
+    if args_cli.stage_iters:
+        kv = {k.strip(): int(v) for k, v in (x.split("=") for x in args_cli.stage_iters.split(","))}
         if "ema" in kv:
-            cur.ema_iters = kv["ema"]
-        cur.levels = tuple(dataclasses.replace(s, min_iters=kv.get("min", s.min_iters), max_iters=kv.get("max", s.max_iters))
-                           for s in cur.levels)
+            cur.ema_iters = kv.pop("ema")
+        stages = list(cur.stages)
+        for key, v in kv.items():
+            name, what = key.split(".")
+            i = RECV_STAGES.index(name)
+            stages[i] = dataclasses.replace(stages[i], **{f"{what}_iters": v})
+        cur.stages = tuple(stages)
     return cur
 
 
@@ -162,7 +175,8 @@ def main(env_cfg, agent_cfg):
         agent_cfg.algorithm.num_mini_batches = args_cli.mini_batches
     env_cfg.seed = agent_cfg.seed
     env_cfg.p5.natural_share = args_cli.natural_share
-    env_cfg.p5.level = args_cli.level
+    agent_cfg.algorithm.entropy_coef = args_cli.entropy_coef
+    group_weights = tuple(float(x) for x in args_cli.group_weights.split(","))
     if args_cli.recv_weights:
         for item in args_cli.recv_weights.split(","):
             key, value = (s.strip() for s in item.split("="))
@@ -187,9 +201,11 @@ def main(env_cfg, agent_cfg):
         task=args_cli.task, num_envs=env_cfg.scene.num_envs, seed=agent_cfg.seed, max_iterations=agent_cfg.max_iterations,
         time_budget_hours=args_cli.time_budget_hours, resume=resume_path, init_checkpoint=args_cli.init_checkpoint,
         ppo_ext=ppo_ext, std_init=args_cli.std_init, natural_share=args_cli.natural_share,
-        natural_min=args_cli.natural_min, level=args_cli.level, max_level=args_cli.max_level, r1_iters=args_cli.r1_iters,
-        level_iters=args_cli.level_iters, recv_weights=args_cli.recv_weights,
-        recv_stage_weights=RECV_STAGE_WEIGHTS,
+        natural_min=args_cli.natural_min, natural_max=args_cli.natural_max, critic=args_cli.critic,
+        group_weights=group_weights, freeze_actor_norm=not args_cli.no_freeze_actor_norm,
+        entropy_coef=args_cli.entropy_coef, blend_iters=args_cli.blend_iters, face_anneal_iters=args_cli.face_anneal_iters,
+        stage_iters=args_cli.stage_iters, recv_weights=args_cli.recv_weights, recv_stage_weights=RECV_STAGE_WEIGHTS,
+        gamma=agent_cfg.algorithm.gamma, lam=agent_cfg.algorithm.lam,
         serve_reward={k: v for k, v in vars(env_cfg.serve_reward).items() if isinstance(v, (int, float, str, bool))},
         recv_reward={k: v for k, v in vars(env_cfg.recv_reward).items() if isinstance(v, (int, float, str, bool))},
         p5={k: v for k, v in vars(env_cfg.p5).items() if isinstance(v, (int, float, str, bool))},
@@ -204,19 +220,17 @@ def main(env_cfg, agent_cfg):
         curriculum = _curriculum()
         runner = P5Runner(env, agent_cfg.to_dict(), log_dir=log_dir, device=agent_cfg.device,
                           time_budget_hours=args_cli.time_budget_hours, ppo_ext=ppo_ext, p5_curriculum=curriculum,
-                          control_file=os.path.join(log_dir, "p5_control.json"))
+                          control_file=os.path.join(log_dir, "p5_control.json"), group_mode=args_cli.critic,
+                          group_weights=group_weights, freeze_actor_normalizer=not args_cli.no_freeze_actor_norm)
         runner.install_signal_handlers()
         if resume_path:
             print(f"[INFO] Resuming from: {resume_path}")
             runner.load(resume_path)
             if args_cli.resume_path and os.path.abspath(args_cli.resume_path) == resume_path:
                 curriculum.natural_min, curriculum.natural_max = args_cli.natural_min, args_cli.natural_max
-                curriculum.max_level = args_cli.max_level
-                curriculum.r1_iters = args_cli.r1_iters
-                curriculum.level = min(curriculum.level, curriculum.max_level)
                 curriculum.natural_share = curriculum.clamp_share(args_cli.natural_share)
                 runner.apply_p5()
-                print(f"[INFO] resumed curriculum overridden: level {curriculum.level} (max {curriculum.max_level}), natural "
+                print(f"[INFO] resumed curriculum: stage {curriculum.stage_name} ({curriculum.iters_in_stage} its), natural "
                       f"share {curriculum.natural_share:.2f} in [{curriculum.natural_min}, {curriculum.natural_max}]")
         else:
             report = runner.warm_start(args_cli.init_checkpoint, std=args_cli.std_init,

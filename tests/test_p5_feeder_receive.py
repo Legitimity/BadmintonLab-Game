@@ -61,9 +61,17 @@ def test_launch_target_in_band_and_reach(table):
 
 
 # ---------------------------------------------------------------------- receive reward
-def _computer(n=3):
+# The V1 R1 weights the tests below were written for (V2 starts in R0, where recv_contact is 0).
+V1_R1 = dict(recv_approach=1.0, recv_station=0.0, recv_torso_face=0.0, recv_racket_near=1.0, recv_contact=2.0,
+             recv_swing=0.5, recv_face=0.5, recv_outcome_pred=3.0, recv_launch_dir=1.0, recv_result=10.0,
+             recv_miss=-3.0, recv_tunnel=-2.0, recv_post_stand=0.5)
+
+
+def _computer(n=3, weights=V1_R1):
     sp = sr.ServeRewardParams()
-    return rc.ReceiveRewardComputer(n, "cpu", rc.ReceiveParams(), sp, step_dt=0.02), sp
+    c = rc.ReceiveRewardComputer(n, "cpu", rc.ReceiveParams(), sp, step_dt=0.02)
+    c.set_weights(weights)
+    return c, sp
 
 
 def _inputs(n=3, **kw):
@@ -218,3 +226,109 @@ def test_contact_log_medians():
     r = c.pop_iteration()
     assert r["hd_abs_med"] in (10.0, 60.0) and r["hd25_share"] == 0.5 and r["vc_med"] in (5.0, 8.0)
     assert math.isnan(c.pop_iteration()["hd_abs_med"])
+
+
+# ---------------------------------------------------------------------- V2 receive terms (P5_RECEIVE_DESIGN_V2 4)
+def _at_stand(c, tgt, server=0):
+    """Root of the receiver at the stand point of ``tgt`` (server frame), ready yaw; world inputs for ``server``."""
+    stand = tgt[0, :2] + torch.tensor(fd.ROOT_FROM_RACKET)
+    sgn = 1.0 - 2.0 * server
+    root = torch.zeros(1, 2, 3)
+    root[0, 1 - server] = torch.tensor([sgn * float(stand[0]), sgn * float(stand[1]), 0.75])
+    root[0, server] = torch.tensor([-sgn * 3.25, -sgn * 0.6, 0.75])
+    yaw = torch.zeros(1, 2)
+    yaw[0, 1 - server] = fd.RECV_YAW + math.pi * server
+    return root, yaw
+
+
+def test_station_and_torso_face_at_stand_point_both_servers():
+    tgt = torch.tensor([[2.0, -0.3, 0.9]])
+    for server in (0, 1):
+        c, _ = _computer(1, weights={**V1_R1, "recv_station": 1.0, "recv_torso_face": 1.0})
+        c.set_incoming(torch.ones(1, dtype=torch.bool), tgt, torch.full((1,), 0.7), torch.full((1,), 1.0))
+        root, yaw = _at_stand(c, tgt, server)
+        c.end_step(_inputs(1, server=torch.full((1,), server), root_pos=root, root_yaw=yaw))
+        r = 1 - server
+        assert float(c.values["recv_station"][0, r]) == pytest.approx(1.0, abs=1e-5), server
+        # P3's ready pose at the stand point points the resting racket at the target: full torso score.
+        assert float(c.values["recv_torso_face"][0, r]) == pytest.approx(1.0, abs=1e-4), server
+        assert torch.count_nonzero(c.values["recv_torso_face"][:, server]) == 0
+
+
+def test_torso_face_modes_and_turn():
+    tgt = torch.tensor([[2.0, -0.3, 0.9]])
+
+    def run(mode, dyaw=0.0):
+        c, _ = _computer(1, weights={**V1_R1, "recv_torso_face": 1.0})
+        c.p = rc.ReceiveParams(torso_face_mode=mode)
+        c.set_incoming(torch.ones(1, dtype=torch.bool), tgt, torch.full((1,), 0.7), torch.full((1,), 1.0))
+        root, yaw = _at_stand(c, tgt)
+        c.end_step(_inputs(1, root_pos=root, root_yaw=yaw + torch.tensor([[0.0, dyaw]])))
+        return float(c.values["recv_torso_face"][0, 1])
+
+    bearing = math.degrees(fd.RACKET_BEARING)
+    assert bearing == pytest.approx(-36.5, abs=0.5)
+    assert run("literal") == pytest.approx(math.exp(-(bearing / 40.0) ** 2), rel=1e-3)
+    assert run("racket", math.radians(40.0)) == pytest.approx(math.exp(-1.0), rel=1e-3)
+    assert run("racket", math.radians(-40.0)) == pytest.approx(math.exp(-1.0), rel=1e-3)
+    c, _ = _computer(1, weights={**V1_R1, "recv_torso_face": 1.0})
+    c.set_incoming(torch.ones(1, dtype=torch.bool), tgt, torch.full((1,), 0.7), torch.full((1,), 1.0))
+    c.end_step(_inputs(1))  # no root_yaw: off
+    assert float(c.values["recv_torso_face"][0, 1]) == 0.0
+
+
+def test_station_only_inside_near_window_and_needs_a_move():
+    tgt = torch.tensor([[2.0, -0.3, 0.9]])
+    for t_arr, need, want in ((0.7, 1.0, 1.0), (2.0, 1.0, 0.0), (0.7, 0.0, 0.0)):
+        c, _ = _computer(1, weights={**V1_R1, "recv_station": 1.0})
+        c.set_incoming(torch.ones(1, dtype=torch.bool), tgt, torch.full((1,), t_arr), torch.full((1,), need))
+        root, yaw = _at_stand(c, tgt)
+        c.end_step(_inputs(1, root_pos=root, root_yaw=yaw))
+        assert float(c.values["recv_station"][0, 1]) == pytest.approx(want, abs=1e-5), (t_arr, need)
+
+
+def test_arrival_statistics_once_per_rally():
+    tgt = torch.tensor([[2.0, -0.3, 0.9]])
+    c, _ = _computer(1)
+    c.set_incoming(torch.ones(1, dtype=torch.bool), tgt, torch.full((1,), 0.6), torch.full((1,), 1.0))
+    root, yaw = _at_stand(c, tgt)
+    root[0, 1, 0] += 0.3  # 0.3 m behind the stand point
+    for t in (0.58, 0.6, 0.62, 0.64):
+        c.end_step(_inputs(1, root_pos=root, root_yaw=yaw, time_s=torch.full((1,), t)))
+    r = c.pop_iteration()
+    assert r["arr_n"] == 1.0 and r["st_err_p50"] == pytest.approx(0.3, abs=1e-5)
+    assert r["tf_lit_p50"] > r["tf_err_p50"] >= 0.0
+    assert r["face_tol"] == c.p.heading_flat_deg
+    c.set_face_tolerance(60.0)
+    assert c.pop_iteration()["face_tol"] == 60.0 and math.isnan(c.pop_iteration()["st_err_p50"])
+
+
+def test_face_tolerance_widens_heading_window():
+    c, _ = _computer(1)
+    el = torch.full((2,), c.p.elevation_target_deg)
+    hd = torch.tensor([60.0, 100.0])
+    c.set_face_tolerance(90.0)
+    f = c.face_score(el, hd)
+    assert float(f[0]) == pytest.approx(1.0) and float(f[1]) == pytest.approx(math.exp(-(10 / 25) ** 2), rel=1e-5)
+
+
+def test_return_8ms_45deg_towards_net_is_predicted_in():
+    """V2 3.3: the receiver (side 1, contact 2.5 m from the net, 1.0 m high) hits 8 m/s at 45 deg straight
+    towards the net: predicted over the net and in the singles court, high outcome score."""
+    c, sp = _computer(1)
+    c.set_incoming(torch.ones(1, dtype=torch.bool), torch.tensor([[2.5, -0.3, 1.0]]), torch.ones(1), torch.zeros(1))
+    c.c_have[0] = True
+    c.end_step(_inputs(1, just_hit=torch.tensor([[False, True]])))
+    v = 8.0 / math.sqrt(2.0)
+    pos_w, vel_w = torch.tensor([[2.5, -0.3, 1.0]]), torch.tensor([[-v, 0.0, v]])
+    c.end_step(_inputs(1, shuttle_pos=pos_w, shuttle_vel=vel_w))
+    pos_c, vel_c = sr.to_canonical(pos_w, torch.ones(1, dtype=torch.long)), sr.to_canonical(vel_w, torch.ones(1, dtype=torch.long))
+    assert float(pos_c[0, 0]) == pytest.approx(-2.5) and float(vel_c[0, 0]) > 0  # striker at x<0, towards the net
+    net_z, land = m["rules"].predict_flight(pos_c, vel_c, c.sp.drag_over_mass, c.sp.gravity, dt=c.sp.flight_dt, max_steps=200)
+    assert float(net_z) > c.sp.net_height + 0.2 and 0.0 < float(land[0, 0]) < 6.7 and abs(float(land[0, 1])) < 2.59
+    score = float(sr.outcome_pred_score(net_z, land, c.sp))
+    assert score > 0.9
+    got = float(c.values["recv_outcome_pred"][0, 1])
+    assert got == pytest.approx(V1_R1["recv_outcome_pred"] * score, rel=1e-4) or \
+        got == pytest.approx(V1_R1["recv_outcome_pred"] * score / 0.02, rel=1e-4)
+    assert float(c.values["recv_launch_dir"][0, 1]) > 0.0

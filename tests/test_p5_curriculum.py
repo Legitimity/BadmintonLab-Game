@@ -1,4 +1,7 @@
-"""CPU tests: P5 curriculum (levels, EMA gates, R1 -> R2 blend, natural share) and the P3 -> P5 warm-start padding."""
+"""CPU tests: P5 V2 curriculum (R0 -> R1 -> R2 gates, blend, face tolerance, feeder level, natural share) and the
+P3 -> P5 warm-start padding (V2 3.2: P3 optimizer state and learning rate kept)."""
+
+import math
 
 import torch
 
@@ -7,77 +10,108 @@ from _serve_pkg import load
 m = load("serve_reward", "receive", "p5_curriculum")
 cur_mod, recv = m["p5_curriculum"], m["receive"]
 
-
-def _rates(touch, crossed, n=100.0):
-    return {"f_rallies": n, "f_touch": touch, "f_crossed": crossed}
+R0_OK = {"rallies": 100.0, "st_err_p50": 0.2, "tf_err_p50": 20.0, "fell": 0.01, "touch": 0.1}
 
 
-def test_level_needs_min_iters_and_gate():
-    c = cur_mod.P5Curriculum(ema_iters=10)
-    c.levels = tuple(cur_mod.LevelSpec(min_iters=20, max_iters=100, gate=s.gate) for s in c.levels)
-    for it in range(19):
-        c.update(it, _rates(0.9, 0.9))
-        assert c.level == 0
-    c.update(19, _rates(0.9, 0.9))
-    assert c.level == 1 and c.events == ["passed_L0"] and c.iters_in_level == 0
+def _small(**kw):
+    c = cur_mod.P5Curriculum(ema_iters=5, **kw)
+    c.stages = (cur_mod.StageSpec(10, 40, c.stages[0].gate), cur_mod.StageSpec(10, 50, c.stages[1].gate),
+                cur_mod.StageSpec(10, None, None))
+    return c
 
 
-def test_gate_not_met_alerts_at_max_once_and_stays():
-    c = cur_mod.P5Curriculum(ema_iters=5)
-    c.levels = tuple(cur_mod.LevelSpec(min_iters=5, max_iters=30, gate=s.gate) for s in c.levels)
+def test_r0_gate_needs_all_three_and_min_iters():
+    c = _small()
+    assert c.stage_name == "R0" and c.level == 2
+    for it in range(9):
+        c.update(it, R0_OK)
+        assert c.stage == 0
+    c.update(9, R0_OK)
+    assert c.stage_name == "R1" and c.events == ["passed_R0"] and c.iters_in_stage == 0 and c.level == 2
+    for bad in ({"st_err_p50": 0.5}, {"tf_err_p50": 50.0}, {"fell": 0.05}):
+        c2 = _small()
+        for it in range(30):
+            c2.update(it, {**R0_OK, **bad})
+        assert c2.stage == 0, bad
+
+
+def test_max_iters_promotes_with_alert_and_r2_opens_l3():
+    c = _small()
     events = []
-    for it in range(80):
-        c.update(it, _rates(0.9, 0.1))  # crossed below 0.3
+    for it in range(40):
+        c.update(it, {"rallies": 100.0, "st_err_p50": 1.0, "tf_err_p50": 90.0, "fell": 0.0, "touch": 0.0})
         events += c.events
-    assert c.level == 0 and events == ["max_L0"]
+    assert events == ["max_R0"] and c.stage_name == "R1" and "max_R0" in c.alerted
+    for it in range(40, 60):
+        c.update(it, {"rallies": 100.0, "touch": 0.6})
+        events += c.events
+    assert c.stage_name == "R2" and events[-1] == "passed_R1" and c.level == 3
+    for it in range(60, 200):
+        c.update(it, {"rallies": 100.0, "touch": 0.9})
+    assert c.stage_name == "R2"  # no gate after R2
 
 
-def test_max_level_cap_and_l3_no_gate():
-    c = cur_mod.P5Curriculum(ema_iters=2, max_level=1)
-    c.levels = tuple(cur_mod.LevelSpec(min_iters=2, max_iters=100, gate=s.gate) for s in c.levels)
-    for it in range(50):
-        c.update(it, _rates(1.0, 1.0))
-    assert c.level == 1
-    c2 = cur_mod.P5Curriculum(ema_iters=2, level=3)
-    for it in range(50):
-        c2.update(it, _rates(1.0, 1.0))
-    assert c2.level == 3 and not c2.alerted
+def test_nan_gate_metric_does_not_pass():
+    c = _small()
+    for it in range(30):
+        c.update(it, {**R0_OK, "st_err_p50": float("nan")})
+    assert c.stage == 0 and "st_err_p50" not in c.ema
+
+
+def test_blend_and_face_tolerance_count_separately():
+    c = _small(blend_iters=10, face_anneal_iters=20)
+    r0, r1 = recv.RECV_STAGE_WEIGHTS["R0"], recv.RECV_STAGE_WEIGHTS["R1"]
+    assert c.weights() == {k: float(r0[k]) for k in recv.RECV_TERMS} and c.face_tolerance() == 90.0
+    for it in range(10):
+        c.update(it, R0_OK)
+    assert c.stage_name == "R1"
+    for it in range(10, 15):
+        w = c.update(it, {"rallies": 100.0, "touch": 0.0})
+    assert c.blend() == 0.5
+    for k in recv.RECV_TERMS:
+        assert abs(w[k] - 0.5 * (r0[k] + r1[k])) < 1e-9
+    assert abs(c.face_tolerance() - (90.0 - 45.0 * 5 / 20)) < 1e-9
+    for it in range(15, 25):
+        w = c.update(it, {"rallies": 100.0, "touch": 0.0})
+    assert c.blend() == 1.0 and all(abs(w[k] - r1[k]) < 1e-9 for k in recv.RECV_TERMS)
+    assert abs(c.face_tolerance() - (90.0 - 45.0 * 15 / 20)) < 1e-9
+    for it in range(25, 40):
+        c.update(it, {"rallies": 100.0, "touch": 0.0})
+    assert c.face_tolerance() == 45.0
+
+
+def test_stage_weights_table():
+    w = recv.RECV_STAGE_WEIGHTS
+    assert set(w) == {"R0", "R1", "R2"} and all(set(v) == set(recv.RECV_TERMS) for v in w.values())
+    col = lambda k: tuple(w[s][k] for s in ("R0", "R1", "R2"))  # noqa: E731
+    assert col("recv_approach") == (2.0, 1.0, 0.3) and col("recv_station") == (1.0, 0.5, 0.2)
+    assert col("recv_torso_face") == (1.0, 0.5, 0.2) and col("recv_racket_near") == (0.5, 1.0, 0.5)
+    assert col("recv_contact") == (0.0, 2.0, 1.0) and col("recv_face") == (0.0, 0.5, 1.0)
+    assert col("recv_swing") == (0.0, 0.3, 0.5) and col("recv_outcome_pred") == (0.0, 1.0, 4.0)
+    assert col("recv_launch_dir") == (0.0, 0.5, 1.0) and col("recv_result") == (0.0, 5.0, 10.0)
+    assert col("recv_miss") == (-1.0, -2.0, -3.0) and col("recv_tunnel") == (0.0, -1.0, -2.0)
 
 
 def test_few_rallies_do_not_move_ema():
     c = cur_mod.P5Curriculum(min_rallies=32)
-    c.update(0, _rates(0.9, 0.9, n=10))
+    c.update(0, {"rallies": 10.0, "touch": 0.9})
     assert c.ema == {} and c.ema_count == 0
-    c.update(1, _rates(0.5, 0.2, n=64))
-    assert abs(c.ema["f_touch"] - 0.5) < 1e-9
-
-
-def test_reward_blend():
-    c = cur_mod.P5Curriculum(r1_iters=10, blend_iters=10)
-    r1, r2 = recv.RECV_STAGE_WEIGHTS["R1"], recv.RECV_STAGE_WEIGHTS["R2"]
-    assert c.weights() == {k: float(r1[k]) for k in recv.RECV_TERMS}
-    for it in range(15):
-        w = c.update(it, {})
-    assert c.stage() == "R1>R2"
-    for k in recv.RECV_TERMS:
-        assert abs(w[k] - 0.5 * (r1[k] + r2[k])) < 1e-9
-    for it in range(15, 30):
-        w = c.update(it, {})
-    assert c.stage() == "R2" and all(abs(w[k] - r2[k]) < 1e-9 for k in recv.RECV_TERMS)
+    c.update(1, {"rallies": 64.0, "touch": 0.5})
+    assert abs(c.ema["touch"] - 0.5) < 1e-9
 
 
 def test_natural_share_clamp_and_state_roundtrip():
     c = cur_mod.P5Curriculum(natural_share=0.9)
-    assert c.natural_share == 0.7
-    assert c.set_natural_share(0.1) and c.natural_share == 0.3
-    c0 = cur_mod.P5Curriculum(natural_min=0.0, natural_share=0.0)
-    assert c0.natural_share == 0.0
+    assert c.natural_share == 0.6
+    assert c.set_natural_share(0.1) and c.natural_share == 0.4
     for it in range(5):
-        c.update(it, _rates(0.4, 0.2))
+        c.update(it, R0_OK)
     d = c.state_dict()
     c2 = cur_mod.P5Curriculum()
     c2.load_state_dict(d)
     assert c2.state_dict() == d
+    c2.load_state_dict({**d, "level": 1, "iters_in_level": 7})  # a V1 checkpoint's keys are ignored
+    assert c2.level == 2 and math.isfinite(c2.face_tolerance())
 
 
 def test_padded_optimizer_load_keeps_moments_and_lr():
@@ -96,6 +130,23 @@ def test_padded_optimizer_load_keeps_moments_and_lr():
     m = ob.state[b[0]]["exp_avg"]
     assert m.shape == (4, 5) and torch.equal(m[:, :3], oa.state[a[0]]["exp_avg"]) and torch.count_nonzero(m[:, 3:]) == 0
     assert torch.equal(ob.state[b[1]]["exp_avg_sq"], oa.state[a[1]]["exp_avg_sq"])
+
+
+def test_padded_optimizer_value_head_rows():
+    """1 -> 3 value head: P3's moments in row 0, zeros for the new heads."""
+    from types import SimpleNamespace
+
+    runner_cls = load("runner", "ppo_ext", "p5_runner")["p5_runner"].P5Runner
+    a = [torch.nn.Parameter(torch.randn(1, 6)), torch.nn.Parameter(torch.randn(1))]
+    b = [torch.nn.Parameter(torch.randn(3, 6)), torch.nn.Parameter(torch.randn(3))]
+    oa = torch.optim.Adam(a, lr=2e-5)
+    (a[0].pow(2).sum() + a[1].sum()).backward()
+    oa.step()
+    ob = torch.optim.Adam(b, lr=1e-3)
+    fake = SimpleNamespace(alg=SimpleNamespace(optimizer=ob, learning_rate=1e-3), device="cpu")
+    assert runner_cls._load_padded_optimizer(fake, oa.state_dict()).startswith("loaded")
+    m = ob.state[b[0]]["exp_avg"]
+    assert torch.equal(m[:1], oa.state[a[0]]["exp_avg"]) and torch.count_nonzero(m[1:]) == 0
 
 
 def test_pad_state_dict_critic_and_normaliser():

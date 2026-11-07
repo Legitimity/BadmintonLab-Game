@@ -1,7 +1,8 @@
-"""P5 runner: ``ServeRunner`` with ``PPOExt``, the P3 warm start, the P5 curriculum and the receive metrics.
+"""P5 runner: ``ServeRunner`` with ``MultiCriticPPO`` (V2; ``group_mode="single"`` = control S), the P3 warm
+start, the V2 curriculum and the receive metrics.
 
 No Isaac dependency (the environment is duck-typed: ``recv_reward``, ``set_level``, ``set_natural_share``,
-``pop_verify``).
+``pop_verify``, optional ``pop_outside``).
 """
 
 from __future__ import annotations
@@ -14,15 +15,26 @@ import torch
 
 from .p5_curriculum import P5Curriculum
 from .ppo_ext import PPOExt
+from .ppo_multicritic import DEFAULT_GROUP_WEIGHTS, MultiCriticActorCritic, MultiCriticPPO, pad_value_head
 from .runner import ServeRunner
 
-_opr.PPOExt = PPOExt  # OnPolicyRunner resolves the algorithm class by name in its own module
+# OnPolicyRunner resolves the policy and algorithm classes by name in its own module.
+_opr.PPOExt = PPOExt
+_opr.MultiCriticPPO = MultiCriticPPO
+_opr.MultiCriticActorCritic = MultiCriticActorCritic
+
+
+def _last_critic_layer(dst: dict) -> int:
+    idx = [int(k.split(".")[1]) for k in dst if k.startswith("critic.") and k.split(".")[1].isdigit()]
+    return max(idx) if idx else -1
 
 
 def pad_state_dict(src: dict, dst: dict) -> tuple[dict, dict]:
     """P3 state into the P5 ``ActorCritic``: equal shapes copied; the first critic layer and the critic
-    normaliser get the old input columns, new columns are zero weights and mean 0 / var 1 / std 1."""
+    normaliser get the old input columns, new columns are zero weights and mean 0 / var 1 / std 1; a 1 -> G value
+    head keeps P3's head as head 0 (``G_serve``), the other heads zero."""
     out, report = {}, {"copied": 0, "padded": [], "missing": [], "unused": sorted(set(src) - set(dst))}
+    last = _last_critic_layer(dst)
     for k, v in dst.items():
         s = src.get(k)
         if s is None:
@@ -31,6 +43,10 @@ def pad_state_dict(src: dict, dst: dict) -> tuple[dict, dict]:
         elif s.shape == v.shape:
             out[k] = s.to(v.device, v.dtype)
             report["copied"] += 1
+        elif k in (f"critic.{last}.weight", f"critic.{last}.bias") and s.shape[0] < v.shape[0] \
+                and s.shape[1:] == v.shape[1:]:
+            out[k] = pad_value_head(s, v)
+            report["padded"].append(f"{k} {tuple(s.shape)}->{tuple(v.shape)}")
         elif k == "critic.0.weight" and s.shape[0] == v.shape[0] and s.shape[1] < v.shape[1]:
             t = torch.zeros_like(v)
             t[:, : s.shape[1]] = s
@@ -50,10 +66,16 @@ class P5Runner(ServeRunner):
     CONTROL_INTERVAL = 10
 
     def __init__(self, env, train_cfg, log_dir=None, device="cpu", time_budget_hours=None, ppo_ext: dict | None = None,
-                 p5_curriculum: P5Curriculum | None = None, control_file: str | None = None):
+                 p5_curriculum: P5Curriculum | None = None, control_file: str | None = None, group_mode: str = "multi",
+                 group_weights=DEFAULT_GROUP_WEIGHTS, freeze_actor_normalizer: bool = True):
         alg = train_cfg["algorithm"]
-        alg["class_name"] = "PPOExt"
+        alg["class_name"] = "MultiCriticPPO"
         alg.update(ppo_ext or {})
+        alg.update(group_mode=group_mode, group_weights=tuple(group_weights))
+        pol = train_cfg["policy"]
+        pol["class_name"] = "MultiCriticActorCritic"
+        pol.update(num_values=len(group_weights) if group_mode == "multi" else 1,
+                   freeze_actor_normalizer=bool(freeze_actor_normalizer))
         self.p5_curriculum = p5_curriculum
         self.control_file = control_file
         super().__init__(env, train_cfg, log_dir=log_dir, device=device, time_budget_hours=time_budget_hours)
@@ -67,6 +89,7 @@ class P5Runner(ServeRunner):
         u.set_level(cur.level)
         u.set_natural_share(cur.natural_share)
         u.recv_reward.set_weights(cur.weights())
+        u.recv_reward.set_face_tolerance(cur.face_tolerance())
 
     def _read_control(self, it: int) -> None:
         if not self.control_file or self.p5_curriculum is None or it % self.CONTROL_INTERVAL:
@@ -97,11 +120,42 @@ class P5Runner(ServeRunner):
                 g["lr"] = float(lr)
         if std is not None:
             self.alg.reset_std(std)
+        report["serve_head_max_err"] = self.serve_head_error(ck["model_state_dict"])
         report.update(source=path, source_iter=ck.get("iter"), std=self.alg.std_mean(), lr=self.alg.learning_rate)
         print(f"[P5] warm start from {path}: {report['copied']} tensors copied, padded {report['padded']}, "
               f"missing {report['missing']}, optimizer {report.get('optimizer')}, lr {report['lr']:.2e}, "
               f"std {report['std']:.3f}", flush=True)
         return report
+
+    @staticmethod
+    def _critic64(state: dict, x: torch.Tensor, eps: float, normalize: bool) -> torch.Tensor:
+        """The critic MLP of ``state`` in float64 on ``x`` (its first columns), with its normaliser."""
+        w0 = state["critic.0.weight"]
+        h = x[:, : w0.shape[1]].double()
+        if normalize and "critic_obs_normalizer._mean" in state:
+            h = (h - state["critic_obs_normalizer._mean"].to(h)) / (state["critic_obs_normalizer._std"].to(h) + eps)
+        last = _last_critic_layer(state)
+        for i in range(0, last + 1, 2):
+            h = h @ state[f"critic.{i}.weight"].to(h).T + state[f"critic.{i}.bias"].to(h)
+            if i < last:
+                h = torch.nn.functional.elu(h)
+        return h
+
+    @torch.no_grad()
+    def serve_head_error(self, p3_state: dict, obs=None) -> dict:
+        """V2 2.4 / P5-1: value head 0 of the warm-started critic against the P3 critic (its own normaliser, its
+        inputs = the first columns) on ``obs`` (default: the current observations), both in float64 (``max_err``)
+        and the float32 forward of the policy (``max_err_f32``, includes TF32 matmul rounding on the GPU)."""
+        pol = self.alg.policy
+        obs = self.env.get_observations().to(self.device) if obs is None else obs
+        x = pol.get_critic_obs(obs)
+        norm = bool(getattr(pol, "critic_obs_normalization", False))
+        eps = pol.critic_obs_normalizer.eps if norm else 0.0
+        ref = self._critic64(p3_state, x, eps, norm)[:, 0]
+        new = self._critic64(pol.state_dict(), x, eps, norm)[:, 0]
+        v32 = pol.evaluate(obs)[:, 0].double()
+        return dict(max_err=float((new - ref).abs().max()), max_err_f32=float((v32 - ref).abs().max()),
+                    value_abs_max=float(ref.abs().max()), n=int(x.shape[0]))
 
     def _load_padded_optimizer(self, src: dict) -> str:
         opt = self.alg.optimizer
@@ -136,17 +190,21 @@ class P5Runner(ServeRunner):
         rates = u.recv_reward.pop_iteration()
         values = {f"Recv/{k}": v for k, v in rates.items()}
         values.update(getattr(self.alg, "last_stats", {}))
+        if hasattr(u, "pop_outside"):
+            values.update({f"Reward/{k}": v for k, v in u.pop_outside().items()})
         cur = self.p5_curriculum
         if cur is not None:
             self._read_control(it)
             u.recv_reward.set_weights(cur.update(it, rates))
+            u.recv_reward.set_face_tolerance(cur.face_tolerance())
             u.set_level(cur.level)
             u.set_natural_share(cur.natural_share)
             values.update(cur.log_values())
             for event in cur.events:
-                print(f"[P5Curriculum] {event} at iteration {it}: level={cur.level} ema="
-                      f"{ {k: round(v, 3) for k, v in cur.ema.items() if k.startswith('f_')} }", flush=True)
-                if self.log_dir is not None and event.startswith("passed_"):
+                gate = ("st_err_p50", "tf_err_p50", "fell", "touch", "crossed")
+                print(f"[P5Curriculum] {event} at iteration {it}: now {cur.stage_name}, level L{cur.level}, ema="
+                      f"{ {k: round(cur.ema[k], 3) for k in gate if k in cur.ema} }", flush=True)
+                if self.log_dir is not None:
                     self.save(os.path.join(self.log_dir, f"model_{event}_{it}.pt"))
         values.update({f"Recv/weight_{k}": v for k, v in u.recv_reward.weights.items()})
         ver = u.pop_verify()
@@ -163,10 +221,16 @@ class P5Runner(ServeRunner):
             for key, value in values.items():
                 self.writer.add_scalar(key, value, it)
         keys = ("f_rallies", "f_touch", "f_crossed", "f_in", "f_fell", "f_tunnel", "f_need_mean", "n_rallies", "n_touch",
-                "n_crossed", "n_in", "vc_mean", "vc_med", "hd_abs_med", "hd25_share", "approach_mean", "timeout")
+                "n_crossed", "n_in", "n_fell", "vc_med", "hd_abs_med", "hd25_share", "approach_mean", "st_err_p50",
+                "tf_err_p50", "tf_lit_p50", "timeout")
         teach = self.alg.last_stats if hasattr(self.alg, "last_stats") else {}
+        crit = " ".join(f"{g}:vl={teach.get(f'Critic/value_loss_{g}', float('nan')):.3g}"
+                        f",ev={teach.get(f'Critic/explained_var_{g}', float('nan')):.2f}"
+                        f",as={teach.get(f'Critic/adv_std_{g}', float('nan')):.3g}"
+                        for g in getattr(self.alg, "group_names", ()))
+        stage = f" {cur.stage_name} b={cur.blend():.2f} tol={cur.face_tolerance():.0f}" if cur is not None else ""
         print("[Recv] " + " ".join(f"{k}={rates[k]:.3f}" for k in keys if k in rates)
-              + f" | L={u.feeder_level} nat={u.natural_share:.2f}"
+              + f" | L={u.feeder_level} nat={u.natural_share:.2f}{stage} | {crit}"
               + f" | mse={teach.get('Teach/mse', float('nan')):.2e} beta={teach.get('Teach/beta', 0):.3f}"
               + f" std={teach.get('Policy/std_mean', float('nan')):.3f} co={int(teach.get('Policy/critic_only', 0))}"
               + f" learn={teach.get('Policy/learn_share', float('nan')):.3f}"

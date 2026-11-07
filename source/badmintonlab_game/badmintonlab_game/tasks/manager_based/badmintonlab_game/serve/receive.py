@@ -12,16 +12,22 @@ after a natural serve. Targets are in the server's (feeder's) canonical frame (`
 
 The receiver's fall is scored by the serve computer's ``fall`` term (both roles); this module only asks
 for the termination (``fall_done``). ``recv_result`` is outside the positive cap, like ``serve_result``.
+
+V2 (P5_RECEIVE_DESIGN_V2 4): stages R0 (footwork and turn: ``recv_approach``, ``recv_station``,
+``recv_torso_face``, ``recv_racket_near``), R1 (touch), R2 (return); ``recv_face``'s heading tolerance is set
+from outside (``set_face_tolerance``). ``pop_iteration`` adds the R0 gate statistics at the arrival time
+(``st_err_p50`` m, ``tf_err_p50`` deg; ``tf_lit_p50`` = the doc's literal torso angle, logged only).
 """
 
 from __future__ import annotations
 
 import dataclasses
+import math
 from dataclasses import dataclass
 
 import torch
 
-from .feeder import RECV_HOME, ROOT_FROM_RACKET
+from .feeder import RACKET_BEARING, RECV_HOME, ROOT_FROM_RACKET
 from .rules import predict_flight
 from .serve_reward import (
     face_elevation_quality,
@@ -36,6 +42,8 @@ from .serve_reward import (
 
 RECV_TERMS = (
     "recv_approach",
+    "recv_station",
+    "recv_torso_face",
     "recv_racket_near",
     "recv_contact",
     "recv_swing",
@@ -47,17 +55,26 @@ RECV_TERMS = (
     "recv_tunnel",
     "recv_post_stand",
 )
-RECV_POSITIVE = ("recv_approach", "recv_racket_near", "recv_contact", "recv_swing", "recv_face", "recv_outcome_pred",
-                 "recv_launch_dir")
-RECV_DENSE = ("recv_approach", "recv_racket_near", "recv_post_stand")
+RECV_POSITIVE = ("recv_approach", "recv_station", "recv_torso_face", "recv_racket_near", "recv_contact", "recv_swing",
+                 "recv_face", "recv_outcome_pred", "recv_launch_dir")
+RECV_DENSE = ("recv_approach", "recv_station", "recv_torso_face", "recv_racket_near", "recv_post_stand")
 RECV_EVENTS = tuple(t for t in RECV_TERMS if t not in RECV_DENSE)
 
-_COMMON = dict(recv_swing=0.5, recv_face=0.5, recv_launch_dir=1.0, recv_result=10.0, recv_miss=-3.0, recv_tunnel=-2.0,
-               recv_post_stand=0.5)
+# V2 4.2. recv_post_stand (receiver upright after its hit) is a posture term: reward group G_body, not G_recv,
+# constant over the stages.
+RECV_STAGES = ("R0", "R1", "R2")
 RECV_STAGE_WEIGHTS = {
-    "R1": dict(recv_approach=1.0, recv_racket_near=1.0, recv_contact=2.0, recv_outcome_pred=3.0, **_COMMON),
-    "R2": dict(recv_approach=0.5, recv_racket_near=0.5, recv_contact=1.0, recv_outcome_pred=4.0, **_COMMON),
+    "R0": dict(recv_approach=2.0, recv_station=1.0, recv_torso_face=1.0, recv_racket_near=0.5, recv_contact=0.0,
+               recv_face=0.0, recv_swing=0.0, recv_outcome_pred=0.0, recv_launch_dir=0.0, recv_result=0.0,
+               recv_miss=-1.0, recv_tunnel=0.0, recv_post_stand=0.5),
+    "R1": dict(recv_approach=1.0, recv_station=0.5, recv_torso_face=0.5, recv_racket_near=1.0, recv_contact=2.0,
+               recv_face=0.5, recv_swing=0.3, recv_outcome_pred=1.0, recv_launch_dir=0.5, recv_result=5.0,
+               recv_miss=-2.0, recv_tunnel=-1.0, recv_post_stand=0.5),
+    "R2": dict(recv_approach=0.3, recv_station=0.2, recv_torso_face=0.2, recv_racket_near=0.5, recv_contact=1.0,
+               recv_face=1.0, recv_swing=0.5, recv_outcome_pred=4.0, recv_launch_dir=1.0, recv_result=10.0,
+               recv_miss=-3.0, recv_tunnel=-2.0, recv_post_stand=0.5),
 }
+HD_LOG_DEG = 25.0  # hd25_share is always "|heading| < 25 deg", whatever the annealed tolerance
 
 # Per-rally receive statistics; prefix f_ = feeder rallies, n_ = natural rallies (only rallies with a legal
 # incoming ball count).
@@ -90,12 +107,22 @@ class ReceiveParams:
     # Horizontal heading of the striking face for recv_face (receiver frame, 0 = towards the net): full score
     # within heading_flat_deg, Gaussian of width heading_sigma_deg outside. Replaces face_quality's 15 deg heading
     # Gaussian, which scored ~0 at the pilot's 50-75 deg and gave no gradient.
+    # V2: heading_flat_deg is the annealed tolerance (R1 90 -> 45, R2 45 -> 25), set by the curriculum.
     heading_flat_deg: float = 25.0
     heading_sigma_deg: float = 25.0
+    # V2 recv_station: exp(-d^2 / station_sigma^2), d = |root - stand point|, from near_time before the arrival.
+    station_sigma: float = 0.3
+    # V2 recv_torso_face: exp(-(theta / torso_sigma_deg)^2). "racket": theta is the yaw error w.r.t. the yaw that
+    # points the resting racket bearing (feeder.RACKET_BEARING, -36.5 deg) at the intercept target, so the P3 pose
+    # at the stand point scores 1 (consistent with the stand point, which assumes no turn). "literal": the torso's
+    # forward axis against the root -> target direction (the doc's wording); ~0.4 at the stand point.
+    torso_sigma_deg: float = 40.0
+    torso_face_mode: str = "racket"
+    torso_min_dist: float = 0.2  # closer than this to the target: theta = 0 (bearing undefined)
     positive_cap: float = 8.0
     terminate_on_fall: bool = True
     flight_dt: float = 0.02
-    initial_stage: str = "R1"
+    initial_stage: str = "R0"
     # Pilot A: launch_score ignores the heading and P3's swing sends the return sideways (vy ~ +3, vx ~ 1 m/s,
     # never over the net) at near-full launch_dir. For the return it is scaled by cos(heading)^power.
     launch_heading_power: float = 2.0
@@ -118,6 +145,7 @@ class ReceiveStepInputs:
     fall_given: torch.Tensor  # (N, 2) bool, latched falls (serve computer)
     time_s: torch.Tensor  # (N,) episode time after this step
     natural: torch.Tensor  # (N,) bool
+    root_yaw: torch.Tensor | None = None  # (N, 2) world yaw of the root (= trunk); None: torso terms off
 
 
 class ReceiveRewardComputer:
@@ -160,14 +188,30 @@ class ReceiveRewardComputer:
         self.fall_done = z(n, dt=torch.bool)
         self.counted = z(n, dt=torch.bool)
         self.natural = torch.ones(n, dtype=torch.bool, device=device)
+        self.arr_given = z(n, dt=torch.bool)
         self.iteration = torch.zeros(len(RECV_STAT_KEYS), device=device)
         self._contact_log: list[torch.Tensor] = []  # (k, 2): |heading|, v_close of receiver contacts
+        self._arrive_log: list[torch.Tensor] = []  # (k, 3): stand error m, |torso error| deg, |literal error| deg
 
     def set_weights(self, weights: dict) -> None:
         unknown = set(weights) - set(RECV_TERMS)
         if unknown:
             raise KeyError(f"Unknown receive reward terms: {sorted(unknown)}")
         self.weights.update({k: float(v) for k, v in weights.items()})
+
+    def set_face_tolerance(self, deg: float) -> None:
+        """Flat part of the recv_face heading factor (V2 annealing)."""
+        self.p.heading_flat_deg = float(deg)
+
+    def torso_errors(self, yaw_c: torch.Tensor, root_xy: torch.Tensor, tgt_xy: torch.Tensor):
+        """(racket-compensated, literal) torso yaw errors in degrees, server frame inputs."""
+        d = tgt_xy - root_xy
+        bearing = torch.atan2(d[:, 1], d[:, 0])
+        far = torch.linalg.norm(d, dim=-1) >= self.p.torso_min_dist
+        wrap = lambda a: torch.remainder(a + math.pi, 2.0 * math.pi) - math.pi  # noqa: E731
+        lit = torch.where(far, wrap(yaw_c - bearing), torch.zeros_like(yaw_c))
+        rac = torch.where(far, wrap(yaw_c - (bearing - RACKET_BEARING)), torch.zeros_like(yaw_c))
+        return torch.rad2deg(rac), torch.rad2deg(lit)
 
     def face_score(self, elevation, heading):
         """Elevation part of ``face_quality`` (core + tail) times the wide heading factor."""
@@ -245,15 +289,33 @@ class ReceiveRewardComputer:
         do_approach = pre & (self.d_need > p.approach_min_need)
         vals["recv_approach"] = w["recv_approach"] * approach * do_approach.float()
 
+        # V2: at the stand point from near_time before the arrival (rallies that need a move), torso turned to
+        # the intercept target before the hit.
+        near = pre & (self.t_arrive - s.time_s < p.near_time)
+        vals["recv_station"] = w["recv_station"] * torch.exp(-(dist / p.station_sigma) ** 2) * (near & do_approach).float()
+        if s.root_yaw is not None:
+            yaw_c = s.root_yaw[ar, recv] + math.pi * server.float()
+            th_rac, th_lit = self.torso_errors(yaw_c, root_c[:, :2], self.tgt[:, :2])
+        else:
+            th_rac = th_lit = torch.full((n,), 180.0, device=self.device)
+        th = th_rac if p.torso_face_mode == "racket" else th_lit
+        torso_ok = (pre & (s.root_yaw is not None)).float()
+        vals["recv_torso_face"] = w["recv_torso_face"] * torch.exp(-(th / p.torso_sigma_deg) ** 2) * torso_ok
+
         # Racket near the ball once the ball is less than near_time from the target.
         d_rb = torch.linalg.norm(s.racket_pos[ar, recv] - s.shuttle_pos, dim=-1)
-        near = pre & (self.t_arrive - s.time_s < p.near_time)
         kern = ((1.0 - p.near_wide_share) * torch.exp(-(d_rb / p.near_sigma) ** 2)
                 + p.near_wide_share * torch.exp(-(d_rb / p.near_sigma_wide) ** 2))
         vals["recv_racket_near"] = w["recv_racket_near"] * kern * near.float()
 
         # First legal hit of the receiver.
         hit_now = s.just_hit[ar, recv] & self.active & ~self.hit
+        # R0 gate statistics: stand error and torso errors at the arrival time (or at the hit, if earlier).
+        arrive = (self.active & ~self.arr_given & (self.d_need > p.approach_min_need) & ~down
+                  & ((s.time_s >= self.t_arrive) | hit_now))
+        self.arr_given |= arrive
+        # Unfiltered with a flag column: no host sync per step; filtered in pop_iteration.
+        self._arrive_log.append(torch.stack((dist, th_rac.abs(), th_lit.abs(), arrive.float()), -1))
         contact = hit_now & self.c_have
         vals["recv_contact"] = w["recv_contact"] * contact.float()
         vals["recv_swing"] = w["recv_swing"] * contact.float() * swing_score(self.c_vc, sp)
@@ -353,7 +415,7 @@ class ReceiveRewardComputer:
     def reset(self, env_ids: torch.Tensor) -> None:
         for t in (self.active, self.c_have, self.hit, self.outcome_pending, self.crossed, self.result_given, self.succeeded,
                   self.miss_given, self.fell, self.tunnel_given, self.tunnel_now, self.prev_face_valid, self.fall_done,
-                  self.counted):
+                  self.counted, self.arr_given):
             t[env_ids] = False
         for t in (self.c_vc, self.c_el, self.c_hd, self.pos_acc, self.d_need, self.t_arrive):
             t[env_ids] = 0.0
@@ -389,12 +451,49 @@ class ReceiveRewardComputer:
         self.iteration.zero_()
         if self._contact_log:
             c = torch.cat(self._contact_log)
-            out.update(hd_abs_med=float(c[:, 0].median()), hd25_share=float((c[:, 0] < self.p.heading_flat_deg).float().mean()),
+            out.update(hd_abs_med=float(c[:, 0].median()), hd25_share=float((c[:, 0] < HD_LOG_DEG).float().mean()),
                        vc_med=float(c[:, 1].median()))
         else:
             out.update(hd_abs_med=float("nan"), hd25_share=float("nan"), vc_med=float("nan"))
         self._contact_log = []
+        nan = float("nan")
+        out.update(st_err_p50=nan, tf_err_p50=nan, tf_lit_p50=nan, arr_n=0.0)
+        if self._arrive_log:
+            a = torch.cat(self._arrive_log)
+            a = a[a[:, 3] > 0]
+            if a.shape[0] > 0:
+                med = a[:, :3].median(dim=0).values.tolist()
+                out.update(st_err_p50=med[0], tf_err_p50=med[1], tf_lit_p50=med[2], arr_n=float(a.shape[0]))
+        self._arrive_log = []
+        out["face_tol"] = float(self.p.heading_flat_deg)
         return out
+
+
+REWARD_GROUPS = ("serve", "recv", "body")
+# V2 2.1: the P3 C serve terms (RewardManager names, prefix serve_); everything that is neither these nor a recv_*
+# term (fall, post_stand, hold_ready, the parent's default costs) and recv_post_stand is G_body.
+SERVE_GROUP_TERMS = tuple(f"serve_{t}" for t in ("legal_contact", "swing_speed", "face_quality", "outcome_pred",
+                                                  "launch_dir", "serve_result", "serve_fault", "no_hit", "tunnel"))
+BODY_RECV_TERMS = ("recv_post_stand",)
+
+
+def reward_group(term_name: str) -> int:
+    """Index in ``REWARD_GROUPS`` of a RewardManager term."""
+    if term_name in SERVE_GROUP_TERMS:
+        return 0
+    if term_name.startswith("recv_") and term_name not in BODY_RECV_TERMS:
+        return 1
+    return 2
+
+
+def group_mask(server: torch.Tensor, natural: torch.Tensor) -> torch.Tensor:
+    """(N, 2, 3) applicability per side: serve = server of a natural rally, recv = receiver (both rally types),
+    body = every learned sample (all but the feeder)."""
+    n = server.shape[0]
+    side = torch.arange(2, device=server.device).expand(n, 2)
+    is_srv = side == server.unsqueeze(1)
+    nat = natural.unsqueeze(1)
+    return torch.stack((is_srv & nat, ~is_srv, ~(is_srv & ~nat)), dim=-1).float()
 
 
 def recv_term(env, term: str, side: int) -> torch.Tensor:

@@ -37,6 +37,20 @@ def cfg_for_side(src: Path, side: int) -> str:
     return text.replace(marker, f"SIDE = {side}\n", 1)
 
 
+def resolve_opponent(opponent: str, play_root: Path, ours: Path, opp_side: int) -> tuple[str | None, str]:
+    """(player cfg text for the opponent's side or None = play's default config stays, model path or "zero")."""
+    if opponent == "zero":
+        return cfg_for_side(ours / "player_cfg.py", opp_side), "zero"
+    if opponent == "model_test":
+        return None, str(play_root / "model_test.pt")
+    if opponent.endswith(".pt"):
+        return None, str(Path(opponent).resolve())  # e.g. the course baseline (120-dim, play's default config)
+    opp = Path(opponent).resolve()
+    if not (opp / "player_cfg.py").exists():
+        return None, str(opp / "policy.pt")  # exported baseline directory without our config
+    return cfg_for_side(opp / "player_cfg.py", opp_side), str(opp / "policy.pt")
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--play_root", type=Path, required=True)
@@ -62,17 +76,9 @@ def main():
     opp_side = 1 - a.side
     try:
         targets[a.side].write_text(cfg_for_side(a.ours / "player_cfg.py", a.side), encoding="utf-8")
-        if a.opponent == "zero":
-            targets[opp_side].write_text(cfg_for_side(a.ours / "player_cfg.py", opp_side), encoding="utf-8")
-            opp_model = "zero"
-        elif a.opponent == "model_test":
-            opp_model = str(a.play_root / "model_test.pt")  # play's own default config stays in place
-        elif a.opponent.endswith(".pt"):
-            opp_model = str(Path(a.opponent).resolve())  # e.g. the course baseline: play's default config stays
-        else:
-            opp = Path(a.opponent).resolve()
-            targets[opp_side].write_text(cfg_for_side(opp / "player_cfg.py", opp_side), encoding="utf-8")
-            opp_model = str(opp / "policy.pt")
+        opp_cfg, opp_model = resolve_opponent(a.opponent, a.play_root, a.ours, opp_side)
+        if opp_cfg is not None:
+            targets[opp_side].write_text(opp_cfg, encoding="utf-8")
         models = {a.side: str(a.ours / "policy.pt"), opp_side: opp_model}
         env = dict(os.environ, PYTHONPATH=str(a.play_root / "source/badmintonlab_game") + os.pathsep + os.environ.get("PYTHONPATH", ""))
         cmd = [

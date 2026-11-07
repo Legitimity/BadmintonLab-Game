@@ -11,7 +11,12 @@ RSL-RL 3.1.2 ``PPO.update`` with four changes, nothing else (no RND, symmetry or
    linearly from ``beta_start`` to ``beta_end`` over ``beta_iters`` updates and then stays at ``beta_end``.
 3. **Noise range.** ``std`` is clamped to ``[std_min, std_max]`` after every optimiser step (and once at start).
 4. **Critic warm-up.** For the first ``critic_only_iters`` updates the actor and the noise get no gradient and
-   the learning rate is not adapted (the actor KL is 0 then; the adaptive rule would only raise it).
+   the learning rate is not adapted (the actor KL is 0 then; the adaptive rule would only raise it). Their
+   gradients are set to ``None``, not to zero: Adam skips parameters without a gradient, while a zero gradient
+   still moves them by the loaded P3 moments (V2 fix).
+
+``value_loss`` is a hook (the multi-critic subclass sums masked per-group losses); ``update`` hands the
+storage's ``masks`` slot of each mini-batch (``None`` here) to ``batch_loss`` as ``group_mask``.
 
 ``updates`` counts the calls of ``update`` and is saved with the checkpoint (``state_dict_extra``).
 """
@@ -43,6 +48,8 @@ class PPOExt(PPO):
         self.aux_group = aux_group
         self.updates = 0
         self.last_stats: dict[str, float] = {}
+        self._batch_stats: dict[str, float] = {}  # per mini-batch, averaged into last_stats by update()
+        self._rollout_stats: dict[str, float] = {}  # per rollout (compute_returns), copied into last_stats
         self.clamp_std()
 
     # ------------------------------------------------------------------ helpers
@@ -107,8 +114,16 @@ class PPOExt(PPO):
             self.updates = int(d.get("updates", 0))
 
     # ------------------------------------------------------------------ losses of one mini-batch
+    def value_loss(self, value_batch, target_values_batch, returns_batch, learn_w, group_mask=None):
+        if self.use_clipped_value_loss:
+            value_clipped = target_values_batch + (value_batch - target_values_batch).clamp(-self.clip_param, self.clip_param)
+            value_losses = (value_batch - returns_batch).pow(2)
+            value_losses_clipped = (value_clipped - returns_batch).pow(2)
+            return self._wmean(torch.max(value_losses, value_losses_clipped).squeeze(-1), learn_w)
+        return self._wmean((returns_batch - value_batch).pow(2).squeeze(-1), learn_w)
+
     def batch_loss(self, obs_batch, actions_batch, target_values_batch, advantages_batch, returns_batch,
-                   old_actions_log_prob_batch, old_mu_batch, old_sigma_batch, adapt_lr: bool):
+                   old_actions_log_prob_batch, old_mu_batch, old_sigma_batch, adapt_lr: bool, group_mask=None):
         n = obs_batch.batch_size[0]
         learn_w, teach_w = self._weights(obs_batch, n)
         if self.normalize_advantage_per_mini_batch:
@@ -144,13 +159,7 @@ class PPOExt(PPO):
         surrogate_clipped = -adv * torch.clamp(ratio, 1.0 - self.clip_param, 1.0 + self.clip_param)
         surrogate_loss = self._wmean(torch.max(surrogate, surrogate_clipped), learn_w)
 
-        if self.use_clipped_value_loss:
-            value_clipped = target_values_batch + (value_batch - target_values_batch).clamp(-self.clip_param, self.clip_param)
-            value_losses = (value_batch - returns_batch).pow(2)
-            value_losses_clipped = (value_clipped - returns_batch).pow(2)
-            value_loss = self._wmean(torch.max(value_losses, value_losses_clipped).squeeze(-1), learn_w)
-        else:
-            value_loss = self._wmean((returns_batch - value_batch).pow(2).squeeze(-1), learn_w)
+        value_loss = self.value_loss(value_batch, target_values_batch, returns_batch, learn_w, group_mask)
         entropy = self._wmean(entropy_batch, learn_w)
         loss = surrogate_loss + self.value_loss_coef * value_loss - self.entropy_coef * entropy
 
@@ -194,22 +203,27 @@ class PPOExt(PPO):
         actor_params = self.actor_parameters() if critic_only else []
         self._renormalize_advantages()
         sums = dict(value_function=0.0, surrogate=0.0, entropy=0.0, teach=0.0)
+        extra: dict[str, float] = {}
+        self._batch_stats = {}
         mse_sum, mse_n, n_upd, n_samples, learn_sum = 0.0, 0.0, 0, 0, 0.0
         generator = self.storage.mini_batch_generator(self.num_mini_batches, self.num_learning_epochs)
         for (obs_batch, actions_batch, target_values_batch, advantages_batch, returns_batch, old_actions_log_prob_batch,
              old_mu_batch, old_sigma_batch, _hid, _masks) in generator:
             loss, parts, teach_mse, n_teach = self.batch_loss(
                 obs_batch, actions_batch, target_values_batch, advantages_batch, returns_batch,
-                old_actions_log_prob_batch, old_mu_batch, old_sigma_batch, adapt_lr=not critic_only)
+                old_actions_log_prob_batch, old_mu_batch, old_sigma_batch, adapt_lr=not critic_only, group_mask=_masks)
             self.optimizer.zero_grad()
             loss.backward()
             for prm in actor_params:
-                prm.grad = None if prm.grad is None else torch.zeros_like(prm.grad)
+                prm.grad = None  # Adam skips it (a zero gradient would still apply the stored moments)
             nn.utils.clip_grad_norm_(self.policy.parameters(), self.max_grad_norm)
             self.optimizer.step()
             self.clamp_std()
             for k, v in parts.items():
                 sums[k] += float(v.detach())
+            for k, v in self._batch_stats.items():
+                extra[k] = extra.get(k, 0.0) + float(v)
+            self._batch_stats = {}
             if n_teach > 0 and not math.isnan(teach_mse):
                 mse_sum += teach_mse * n_teach
                 mse_n += n_teach
@@ -225,5 +239,8 @@ class PPOExt(PPO):
             "Policy/std_mean": self.std_mean(),
             "Policy/critic_only": float(critic_only),
         }
+        self.last_stats.update({k: v / max(n_upd, 1) for k, v in extra.items()})
+        self.last_stats.update(self._rollout_stats)
+        self._rollout_stats = {}
         self.updates += 1
         return {k: v / max(n_upd, 1) for k, v in sums.items()}

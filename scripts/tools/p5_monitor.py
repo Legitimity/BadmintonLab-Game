@@ -1,18 +1,23 @@
-"""P5 monitor (P5_RECEIVE_DESIGN 5.2, 6). Run with env_swanlab's Python (needs tensorboard).
+"""P5 V2 monitor (P5_RECEIVE_DESIGN_V2 3.4, 6.1, 7). Run with env_swanlab's Python (needs tensorboard).
 
-Every ``--poll_s`` seconds:
-  * play evaluation (deterministic, sequential, under ``<play>/.eval.lock``) of every ``model_<k>.pt`` with k a
-    multiple of ``--eval_every`` and of the final checkpoint: serve hold (zero opponent) and receive against
-    ``--recv_opps`` (default P3 final, model_test, local baseline), both sides;
-  * 5.2: serve hold standing-in below the P3 baseline by >= 2 points -> natural share +0.10 (max 0.7), written
-    to ``<run>/p5_control.json`` (the runner reads it every 10 iterations);
-  * 6.2 stops (one-sided, only on getting worse): serve standing-in below baseline by >= 5 points twice in a
-    row; fell_after_hit > 10% in any evaluation; NaN loss; EMA timeout > 2%. There is deliberately no
-    train-vs-play rule (P3: it fired when play was better than the noisy training metric);
-  * 6.3 early finish: all B gates met in two consecutive evaluations;
-  * 7.1 alerts (no action): L0 >= 1000 iterations with f_touch < 0.3, Teach/mse rising, receiver falls > 10%,
-    receive tunnel > 25%, level max reached.
-``--no_stop``: alerts only. ``--eval_export DIR``: one-shot evaluation of an export, then exit.
+Every ``--poll_s`` seconds, on the checkpoints ``model_<k>.pt`` of ``--run_name`` (sequential, play evaluations under
+``<play>/.eval.lock``):
+  * serve hold, every ``--hold_every`` (250): play, zero opponent, deterministic, both sides, ``--hold_rallies``
+    per court (64 courts x 8 -> ~250 serves per side);
+  * full play evaluation, every ``--eval_every`` (500) and the final checkpoint: serve hold (zero, ~500 serves per
+    side), receive against ``p3_final`` and the local baseline (``exports/baseline_14500``), ~500 receive rallies
+    per side each; the serve hold of this evaluation replaces the small one at the same iteration;
+  * training-env deterministic evaluation (``p3_det_eval.py`` on the Receive task), same iterations as the full
+    play evaluation.
+Stops (one-sided, only on getting worse):
+  * serve hold standing-in < ``--hold_min`` (0.80) in two consecutive serve-hold measurements;
+  * play worse than training by >= ``--train_gap`` (10 points): play serve standing-in (zero) against the
+    training ``Serve/in`` (mean of the 50 iterations before the checkpoint). Only this direction;
+  * NaN losses; timeout rate > 2 % (mean of 200 steady iterations); fell after hit > 10 % in a play evaluation;
+  * 7.2 early finish (``--early_finish``): the expected tier met in two consecutive full evaluations.
+Alerts (no action): 6.1 checks at 600 / 1200 / 1800 iterations, stage promotions and ``max_*`` promotions,
+actor-normaliser inputs beyond +-5 (risk 4), Teach/mse rising.
+``--no_stop``: alerts only. ``--eval_export DIR``: one-shot full evaluation of an export, then exit.
 """
 
 import argparse
@@ -31,21 +36,28 @@ ap = argparse.ArgumentParser()
 ap.add_argument("--repo", default="/root/autodl-tmp/BadmintonLab-Game-V3L")
 ap.add_argument("--play", default="/root/autodl-tmp/BadmintonLab-Game-Play")
 ap.add_argument("--isaac_python", default="/root/autodl-tmp/env_isaaclab/bin/python")
-ap.add_argument("--run_name", default="p5_main")
+ap.add_argument("--run_name", default="p5v2_M")
 ap.add_argument("--out", default="/root/autodl-tmp/logs/v3l/p5")
+ap.add_argument("--hold_every", type=int, default=250)
+ap.add_argument("--hold_rallies", type=int, default=8, help="Per court and side, zero opponent (64 courts -> ~250 serves).")
 ap.add_argument("--eval_every", type=int, default=500)
-ap.add_argument("--serve_rallies", type=int, default=32, help="Per court and side (64 courts -> ~1000 serves per side).")
-ap.add_argument("--recv_rallies", type=int, default=32, help="Per court and side; roughly half are receive rallies.")
-ap.add_argument("--baseline_rallies", type=int, default=16)
+ap.add_argument("--serve_rallies", type=int, default=16, help="Per court and side (64 courts -> ~500 serves per side).")
+ap.add_argument("--recv_rallies", type=int, default=16, help="Per court and side; about half are receive rallies.")
+ap.add_argument("--baseline_rallies", type=int, default=24, help="The baseline touches ~50-60 % of its serves.")
 ap.add_argument("--eval_num_envs", type=int, default=64)
+ap.add_argument("--det_num_envs", type=int, default=1024)
+ap.add_argument("--det_iters", type=int, default=10)
 ap.add_argument("--p3_final", default="/root/autodl-tmp/BadmintonLab-Game-V3L/exports/p3_final")
-ap.add_argument("--baseline", default="/root/autodl-tmp/policy.pt")
-ap.add_argument("--recv_opps", default="p3,model_test,baseline")
+ap.add_argument("--baseline", default="/root/autodl-tmp/BadmintonLab-Game-V3L/exports/baseline_14500/policy.pt")
+ap.add_argument("--recv_opps", default="p3,baseline")
 ap.add_argument("--serve_base", type=float, default=0.868, help="P3 final standing-in, zero opponent (REPORT_P3_F2 8).")
+ap.add_argument("--hold_min", type=float, default=0.80)
+ap.add_argument("--train_gap", type=float, default=0.10)
+ap.add_argument("--early_finish", action="store_true")
 ap.add_argument("--done_file", default=None)
 ap.add_argument("--poll_s", type=float, default=120.0)
 ap.add_argument("--no_stop", action="store_true")
-ap.add_argument("--no_share_control", action="store_true", help="Do not write p5_control.json (pilot, feeder only).")
+ap.add_argument("--no_det", action="store_true")
 ap.add_argument("--eval_export", default=None)
 ap.add_argument("--eval_tag", default="oneshot")
 args = ap.parse_args()
@@ -60,7 +72,9 @@ PLAY_CFGS = [
 ]
 LOCK = os.path.join(args.play, ".eval.lock")
 OPP = {"zero": "zero", "p3": args.p3_final, "model_test": "model_test", "baseline": args.baseline}
-GATES = dict(serve_drop=0.02, fault=0.02, touch=0.40, crossed=0.20, fah=0.05)
+# 7.2 tiers: minimum (B, simple receive) and expected.
+TIER = dict(serve_in=0.85, touch=0.30, fah=0.05, fell_before=0.10, baseline_crossed=0.15)
+TAGS = ("Recv/", "P5Curr/", "Teach/", "Policy/", "Serve/", "Loss/", "Critic/", "Norm/", "Reward/")
 
 
 def say(msg):
@@ -73,7 +87,7 @@ def say(msg):
 def load_state():
     if os.path.exists(STATE):
         return json.load(open(STATE))
-    return {"evaluated": [], "alerts": [], "stop": None, "history": {}, "natural_share": None}
+    return {"held": [], "evaluated": [], "alerts": [], "stop": None, "hold": {}, "history": {}, "det": {}}
 
 
 def save_state(st):
@@ -93,7 +107,7 @@ def scalars():
             acc = EventAccumulator(ev, size_guidance={"scalars": 0})
             acc.Reload()
             for tag in acc.Tags()["scalars"]:
-                if tag.startswith(("Recv/", "P5Curr/", "Teach/", "Policy/", "Serve/", "Loss/")):
+                if tag.startswith(TAGS):
                     s = out.setdefault(tag, {})
                     for e in acc.Scalars(tag):
                         s[e.step] = e.value
@@ -103,6 +117,12 @@ def scalars():
 def window_mean(series, end_step, n=50):
     steps = [s for s in sorted(series) if s <= end_step][-n:]
     return sum(series[s] for s in steps) / len(steps) if steps else None
+
+
+def at(series, step):
+    """Value at the last logged step <= ``step``."""
+    steps = [s for s in sorted(series) if s <= step]
+    return series[steps[-1]] if steps else None
 
 
 def checkpoints():
@@ -164,11 +184,9 @@ def play_eval(exp, opp, side, out, rallies, num_envs):
     return code
 
 
-def eval_export(exp, tag):
-    """Serve hold (zero) + receive (``--recv_opps``), both sides. Returns the per-opponent summary."""
+def eval_export(exp, tag, plan):
+    """``plan`` = [(opponent, rallies per court)]; both sides. Returns the per-opponent summary."""
     res = {}
-    plan = [("zero", args.serve_rallies)] + [(o, args.baseline_rallies if o == "baseline" else args.recv_rallies)
-                                             for o in args.recv_opps.split(",") if o]
     for opp, rallies in plan:
         if opp == "baseline" and not os.path.exists(args.baseline):
             say(f"  baseline {args.baseline} missing: skipped")
@@ -184,126 +202,173 @@ def eval_export(exp, tag):
             d = json.load(open(out))
             s, r = d["serve"], d["receive"]
             rec = r.get("recv", {})
+            n_opp = max(rec.get("recv_rallies", 0) or 0, 1)
             rows.append(dict(side=side, serve_n=s["rallies"], serve_in=s["rates"]["served_in_standing"],
                              serve_fault=s["rates"]["height"] + s["rates"]["double"], serve_fah=s["rates"]["fell_after_hit"],
-                             **rec))
+                             recv_fell_before=(r.get("r_fell", 0) - r.get("r_fell_after_hit", 0)) / n_opp,
+                             opp_touch_share=r.get("opp_served", 0) / max(r.get("rallies", 0), 1), **rec))
             say(f"  eval {tag} opp={opp} side={side} serve n={s['rallies']} in_st={rows[-1]['serve_in']:.3f} "
                 f"fault={rows[-1]['serve_fault']:.3f} fah={rows[-1]['serve_fah']:.3f} | recv n={rec.get('recv_rallies')} "
                 f"touch={rec.get('recv_touch', 0):.3f} crossed={rec.get('recv_crossed', 0):.3f} in={rec.get('recv_in', 0):.3f} "
-                f"fell={rec.get('recv_fell', 0):.3f} fah={rec.get('recv_fell_after_hit', 0):.3f} ({time.time() - t0:.0f} s)")
+                f"fell={rec.get('recv_fell', 0):.3f} fah={rec.get('recv_fell_after_hit', 0):.3f} "
+                f"opp_touch={rows[-1]['opp_touch_share']:.3f} ({time.time() - t0:.0f} s)")
         if rows:
             def avg(key, weight):
                 w = [r.get(weight, 0) or 0 for r in rows]
-                return sum(r.get(key, 0) * x for r, x in zip(rows, w)) / max(sum(w), 1)
+                return sum((r.get(key, 0) or 0) * x for r, x in zip(rows, w)) / max(sum(w), 1)
 
             res[opp] = dict(sides=rows, serve_in=avg("serve_in", "serve_n"), serve_fault=avg("serve_fault", "serve_n"),
+                            serve_n=sum(r["serve_n"] for r in rows),
                             serve_fah=max(r["serve_fah"] for r in rows), touch=avg("recv_touch", "recv_rallies"),
                             crossed=avg("recv_crossed", "recv_rallies"), recv_in=avg("recv_in", "recv_rallies"),
-                            recv_fell=avg("recv_fell", "recv_rallies"),
+                            recv_fell=avg("recv_fell", "recv_rallies"), recv_fell_before=avg("recv_fell_before", "recv_rallies"),
                             recv_fah=max(r.get("recv_fell_after_hit", 0) for r in rows),
                             recv_n=sum(r.get("recv_rallies", 0) for r in rows))
     return res
 
 
-def judge(st, k, res):
+def det_eval(ck, k):
+    out = os.path.join(args.out, f"det_{args.run_name}_{k}.json")
+    log = out.replace(".json", ".log")
+    env = dict(os.environ, OMNI_KIT_ACCEPT_EULA="YES",  # the installed badmintonlab_game is another checkout
+               PYTHONPATH=os.path.join(args.repo, "source/badmintonlab_game"))
+    r = subprocess.run([args.isaac_python, "scripts/tools/p3_det_eval.py", "--headless", "--task", "BadmintonLab-Game-Receive",
+                        "--num_envs", str(args.det_num_envs), "--iters", str(args.det_iters), "--modes", "det",
+                        "--checkpoint", ck, "--out", out],
+                       cwd=args.repo, env=env, stdout=open(log, "w"), stderr=subprocess.STDOUT, timeout=3600)
+    if r.returncode != 0 or not os.path.exists(out):
+        say(f"  det eval {k} failed ({r.returncode}), see {log}")
+        return None
+    d = json.load(open(out))["modes"]["det"]
+    rv = d.get("recv", {})
+    say(f"  det it={k}: serve in={d.get('in')} fall={d.get('fall')} | recv n_touch={rv.get('n_touch')} "
+        f"f_touch={rv.get('f_touch')} n_crossed={rv.get('n_crossed')} f_crossed={rv.get('f_crossed')} "
+        f"hd_med={rv.get('hd_abs_med')} vc_med={rv.get('vc_med')} st_err={rv.get('st_err_p50')} tf_err={rv.get('tf_err_p50')}")
+    return d
+
+
+def judge_hold(st, k, z, sc):
+    """Serve hold (``z`` = zero-opponent summary at checkpoint ``k``): two consecutive < hold_min; play vs training."""
+    st["hold"][str(k)] = dict(serve_in=z["serve_in"], serve_n=z["serve_n"])
+    keys = sorted(int(x) for x in st["hold"])
+    prev = st["hold"].get(str(keys[-2])) if len(keys) >= 2 else None
+    say(f"  it={k}: serve hold standing-in {z['serve_in']:.3f} (n={z['serve_n']}, P3 base {args.serve_base:.3f}, "
+        f"min {args.hold_min:.2f})")
+    if z["serve_in"] < args.hold_min and prev is not None and prev["serve_in"] < args.hold_min:
+        request_stop(st, f"3.4: serve hold {z['serve_in']:.3f} / {prev['serve_in']:.3f} < {args.hold_min} twice (it {keys[-2]}, {k})")
+    tr = window_mean(sc.get("Serve/in", {}), k, 50)
+    if tr is not None:
+        gap = tr - z["serve_in"]
+        say(f"  it={k}: training Serve/in {tr:.3f} vs play {z['serve_in']:.3f} (play worse by {gap:+.3f})")
+        if gap >= args.train_gap:
+            request_stop(st, f"3.4: play serve standing-in {z['serve_in']:.3f} below training {tr:.3f} by >= {args.train_gap}")
+
+
+def tier(res):
+    z = res.get("zero")
+    if z is None or "p3" not in res or "baseline" not in res:
+        return None
+    touch = (res["p3"]["touch"] + res["baseline"]["touch"]) / 2
+    fah = max([v["serve_fah"] for v in res.values()] + [v["recv_fah"] for v in res.values() if v.get("recv_n")])
+    before = max(v["recv_fell_before"] for v in res.values() if v.get("recv_n"))
+    low = z["serve_in"] >= TIER["serve_in"] and touch >= TIER["touch"] and fah <= TIER["fah"] and before <= TIER["fell_before"]
+    if not low:
+        return None
+    return "expected" if res["baseline"]["crossed"] >= TIER["baseline_crossed"] else "minimum"
+
+
+def judge_full(st, k, res):
     hist = st["history"]
     hist[str(k)] = res
-    z = res.get("zero")
     keys = sorted(int(x) for x in hist)
     prev = hist.get(str(keys[-2])) if len(keys) >= 2 else None
-    if z is not None:
-        drop = args.serve_base - z["serve_in"]
-        say(f"  it={k}: serve hold standing-in {z['serve_in']:.3f} (P3 base {args.serve_base:.3f}, drop {drop:+.3f})")
-        # 5.2 natural share
-        if drop >= 0.02 and not args.no_share_control:
-            cur = st.get("natural_share")
-            if cur is None:
-                cur = 0.5
-            new = min(cur + 0.10, 0.7)
-            if new > cur:
-                st["natural_share"] = new
-                d = run_dirs()[-1]
-                json.dump({"natural_share": new, "it": k}, open(os.path.join(d, "p5_control.json"), "w"))
-                say(f"  5.2: natural share {cur:.2f} -> {new:.2f} ({d}/p5_control.json)")
-        # 6.2 serve drop twice in a row
-        pz = (prev or {}).get("zero")
-        if drop >= 0.05 and pz is not None and args.serve_base - pz["serve_in"] >= 0.05:
-            request_stop(st, f"6.2: serve standing-in {z['serve_in']:.3f} / {pz['serve_in']:.3f} below base by >= 5 points twice")
-    fah = max([v["serve_fah"] for v in res.values()] + [v["recv_fah"] for v in res.values() if v.get("recv_n")])
-    if fah > 0.10:
-        request_stop(st, f"6.2: fell_after_hit {fah:.3f} > 0.10 at it={k}")
-    # 6.3 early finish
-    ok = gates_ok(res)
-    say(f"  it={k}: B gates {'met' if ok else 'not met'}")
-    if ok and prev is not None and gates_ok(prev):
-        request_stop(st, f"6.3: B gates met in two consecutive evaluations (it {keys[-2]}, {k})")
-
-
-def gates_ok(res):
-    z = res.get("zero")
-    if z is None or "p3" not in res or "model_test" not in res:
-        return False
-    touch = (res["p3"]["touch"] + res["model_test"]["touch"]) / 2
-    crossed = (res["p3"]["crossed"] + res["model_test"]["crossed"]) / 2
-    fah = max([v["serve_fah"] for v in res.values()] + [v["recv_fah"] for v in res.values() if v.get("recv_n")])
-    return (z["serve_in"] >= args.serve_base - GATES["serve_drop"] and z["serve_fault"] <= GATES["fault"]
-            and touch >= GATES["touch"] and crossed >= GATES["crossed"] and fah <= GATES["fah"])
+    vals = [v["serve_fah"] for v in res.values()] + [v["recv_fah"] for v in res.values() if v.get("recv_n")]
+    if vals and max(vals) > 0.10:
+        request_stop(st, f"V1 6.2: fell_after_hit {max(vals):.3f} > 0.10 at it={k}")
+    t = tier(res)
+    say(f"  it={k}: 7.2 tier {t or 'none'}" + "".join(
+        f" | {o}: touch={res[o]['touch']:.3f} crossed={res[o]['crossed']:.3f} fell_before={res[o]['recv_fell_before']:.3f}"
+        for o in ("p3", "baseline") if o in res))
+    if args.early_finish and t == "expected" and prev is not None and tier(prev) == "expected":
+        request_stop(st, f"7.2: expected tier met in two consecutive evaluations (it {keys[-2]}, {k})")
 
 
 def check_training(st, sc):
-    lvl = sc.get("P5Curr/level", {})
-    if not lvl:
+    stage = sc.get("P5Curr/stage", {})
+    if not stage:
         return
-    last = max(lvl)
+    last = max(stage)
     st["last_iter"] = last
-    level = int(round(lvl[last]))
-    iters = int(sc.get("P5Curr/iters_in_level", {}).get(last, 0))
-    ema = lambda k: sc.get(f"P5Curr/ema_{k}", {}).get(last)  # noqa: E731
-    share = sc.get("P5Curr/natural_share", {}).get(last)
-    if share is not None and st.get("natural_share") is None:
-        st["natural_share"] = share
-    for name in ("Loss/value_function", "Loss/surrogate", "Teach/mse"):
+    for name in ("Loss/value_function", "Loss/surrogate"):
         v = sc.get(name, {}).get(last)
-        if v is not None and not math.isfinite(v) and name != "Teach/mse":
+        if v is not None and not math.isfinite(v):
             request_stop(st, f"6.2: {name} is {v} at it={last}")
-    # Timeout: only over a full window of 200 iterations of this run, skipping its first 50 (RSL-RL starts the
-    # episodes at random lengths, so the first iterations of every (resumed) run are mostly time-outs: 1.0, 0.86, ...).
     ts = sc.get("Recv/timeout", {})
     first = min(ts) if ts else 0
     steady = {k: v for k, v in ts.items() if k >= first + 50}
     to = window_mean(steady, last, 200) if len(steady) >= 200 else None
     if to is not None and to > 0.02:
         request_stop(st, f"6.2: timeout rate {to:.3f} > 0.02 (mean of 200 iterations) at it={last}")
-    if level == 0 and iters >= 1000 and (ema("f_touch") or 0) < 0.3:
-        alert(st, "L0_1000", f"7.1: L0 {iters} iterations, EMA f_touch={ema('f_touch')} < 0.3 (check targets / racket_near)")
-    fell = window_mean(sc.get("Recv/f_fell", {}), last, 100)
-    if fell is not None and fell > 0.10 and len(sc.get("Recv/f_fell", {})) >= 300:
-        alert(st, f"fell_{last // 1000}", f"7.1: receiver fall (feeder) {fell:.3f} > 0.10 (doc: approach cap 0.7 m/s)")
-    tun = window_mean(sc.get("Recv/f_tunnel", {}), last, 100)
-    if tun is not None and tun > 0.25 and len(sc.get("Recv/f_tunnel", {})) >= 300:
-        alert(st, f"tunnel_{last // 1000}", f"risk 5: receive tunnel {tun:.3f} > 0.25")
+    steps = sorted(stage)
+    names = ("R0", "R1", "R2")
+    for a, b in zip(steps, steps[1:]):
+        if int(round(stage[b])) != int(round(stage[a])):
+            n_in = at(sc.get("P5Curr/iters_in_stage", {}), a)
+            alert(st, f"stage_{int(round(stage[b]))}", f"curriculum: {names[int(round(stage[b]))]} from iteration {b} "
+                  f"(previous stage ran {n_in:.0f} iterations{', max reached' if n_in and n_in >= 1499 else ''})")
+    ema = lambda k, s=last: at(sc.get(f"P5Curr/ema_{k}", {}), s)  # noqa: E731
+    if last >= 600:
+        s600 = at(stage, 600)
+        e3, e6 = ema("st_err_p50", 300), ema("st_err_p50", 600)
+        t3, t6 = ema("tf_err_p50", 300), ema("tf_err_p50", 600)
+        ok = (s600 or 0) >= 1 or (None not in (e3, e6, t3, t6) and e6 < e3 and t6 < t3)
+        alert(st, "check_600", f"6.1 it 600: stage {names[int(round(s600 or 0))]}, st_err {e3} -> {e6}, tf_err {t3} -> {t6}: "
+              f"{'ok' if ok else 'NOT MET (doc: recv_approach to 3.0)'}")
+    if last >= 1200:
+        nt, ft = ema("n_touch", 1200), ema("f_touch", 1200)
+        ev = window_mean(sc.get("Critic/explained_var_recv", {}), 1200, 50)
+        ok = (nt or 0) >= 0.3 and (ft or 0) >= 0.3
+        alert(st, "check_1200", f"6.1 it 1200: touch natural {nt} feeder {ft}, explained_var_recv {ev}: "
+              f"{'ok' if ok else 'NOT MET'}")
+    for name in ("serve", "recv"):
+        o = window_mean(sc.get(f"Norm/over5_{name}", {}), last, 50)
+        if o is not None and o > 0.01:
+            alert(st, f"norm_{name}_{last // 1000}", f"risk 4: {o:.3%} of the {name} actor inputs beyond +-5 after the frozen normaliser")
     mse = sc.get("Teach/mse", {})
     if len(mse) >= 1000:
         a, b = window_mean(mse, last - 500, 200), window_mean(mse, last, 200)
         if a and b and b > 2.0 * a and b > 0.05:
-            alert(st, f"mse_{last // 1000}", f"7.1: Teach/mse rising {a:.3g} -> {b:.3g} (doc: beta floor 0.1 -> 0.3 if serve drops)")
-    steps = sorted(lvl)
-    for a, b in zip(steps, steps[1:]):
-        if int(round(lvl[b])) != int(round(lvl[a])):
-            alert(st, f"promo_{int(round(lvl[b]))}", f"curriculum: level L{int(round(lvl[b]))} from iteration {b}")
+            alert(st, f"mse_{last // 1000}", f"Teach/mse rising {a:.3g} -> {b:.3g}")
+
+
+def export(k, ck):
+    exp = os.path.join(args.repo, "exports", f"{args.run_name}_{k}")
+    log = os.path.join(args.out, f"export_{args.run_name}_{k}.log")
+    r = subprocess.run([args.isaac_python, "scripts/export_torchscript.py", "--checkpoint", ck, "--out", exp],
+                       cwd=args.repo, stdout=open(log, "w"), stderr=subprocess.STDOUT)
+    if r.returncode != 0:
+        say(f"export {k} failed, see {log}")
+        return None
+    return exp
+
+
+def full_plan():
+    plan = [("zero", args.serve_rallies)]
+    plan += [(o, args.baseline_rallies if o == "baseline" else args.recv_rallies) for o in args.recv_opps.split(",") if o]
+    return plan
 
 
 def main():
     if args.eval_export:
-        res = eval_export(args.eval_export, args.eval_tag)
+        res = eval_export(args.eval_export, args.eval_tag, full_plan())
         json.dump(res, open(os.path.join(args.out, f"eval_{args.eval_tag}_summary.json"), "w"), indent=1)
         print(json.dumps({k: {kk: vv for kk, vv in v.items() if kk != "sides"} for k, v in res.items()}, indent=1))
         return
     if not args.done_file:
         ap.error("--done_file is required")
     st = load_state()
-    say(f"P5 monitor start: run_name={args.run_name}, eval every {args.eval_every}, stop {'off' if args.no_stop else 'on'}, "
-        f"serve base {args.serve_base}, recv opps {args.recv_opps}")
+    say(f"P5 V2 monitor start: run_name={args.run_name}, hold every {args.hold_every} (min {args.hold_min}), full every "
+        f"{args.eval_every}, stop {'off' if args.no_stop else 'on'}, recv opps {args.recv_opps}")
     while True:
         done = os.path.exists(args.done_file)
         todo = []
@@ -311,22 +376,29 @@ def main():
             sc = scalars()
             ck = checkpoints()
             check_training(st, sc)
-            todo = sorted(k for k in ck if k > 0 and k % args.eval_every == 0 and k not in st["evaluated"])
-            if done and ck and max(ck) not in st["evaluated"] and max(ck) not in todo:
-                todo.append(max(ck))
+            final = max(ck) if (done and ck) else None
+            todo = sorted(k for k in ck if k > 0 and k not in st["held"] and
+                          (k % args.hold_every == 0 or k % args.eval_every == 0 or k == final))
             for k in todo:
-                if not done and st.get("stop") and k != max(ck):
-                    continue
-                exp = os.path.join(args.repo, "exports", f"{args.run_name}_{k}")
-                log = os.path.join(args.out, f"export_{args.run_name}_{k}.log")
-                r = subprocess.run([args.isaac_python, "scripts/export_torchscript.py", "--checkpoint", ck[k], "--out", exp],
-                                   cwd=args.repo, stdout=open(log, "w"), stderr=subprocess.STDOUT)
-                if r.returncode != 0:
-                    say(f"export {k} failed, see {log}")
-                else:
-                    say(f"evaluate checkpoint {k}: {ck[k]}")
-                    judge(st, k, eval_export(exp, f"{args.run_name}_{k}"))
-                st["evaluated"].append(k)
+                if st.get("stop") and not done:
+                    break
+                full = k % args.eval_every == 0 or k == final
+                exp = export(k, ck[k])
+                if exp is not None:
+                    tag = f"{args.run_name}_{k}"
+                    say(f"evaluate checkpoint {k} ({'full' if full else 'serve hold'}): {ck[k]}")
+                    plan = full_plan() if full else [("zero", args.hold_rallies)]
+                    res = eval_export(exp, tag, plan)
+                    if "zero" in res:
+                        judge_hold(st, k, res["zero"], sc)
+                    if full:
+                        judge_full(st, k, res)
+                        if not args.no_det:
+                            d = det_eval(ck[k], k)
+                            if d is not None:
+                                st["det"][str(k)] = d
+                        st["evaluated"].append(k)
+                st["held"].append(k)
                 save_state(st)
             save_state(st)
         except Exception as e:  # noqa: BLE001

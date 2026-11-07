@@ -7,6 +7,11 @@ actor mean (``act_inference``, what play runs) and with the sampled training act
 Each mode resets the env, discards ``--warmup`` iterations (all courts start their first rally together),
 then pools ``--iters`` iterations of 24 control steps. Rates come from the reward computer's statistics,
 the same as ``Serve/*`` in training. Stage C weights, default reward parameters (v_close_max 8.0).
+
+P5 V2 (``--task BadmintonLab-Game-Receive``, P5_RECEIVE_DESIGN_V2 3.4): a P5 checkpoint (one or three value
+heads, detected from the checkpoint) in the receive environment with ``--natural_share`` and feeder levels
+``0..--level`` (uniform); the result adds the receive rates (``Recv/*`` of training: ``n_*`` natural, ``f_*``
+feeder; ``hd_abs_med`` = median |face heading| at the receiver's contacts, ``st_err_p50`` / ``tf_err_p50``).
 """
 
 import argparse
@@ -25,6 +30,8 @@ parser.add_argument("--num_envs", type=int, default=2048)
 parser.add_argument("--iters", type=int, default=20)
 parser.add_argument("--warmup", type=int, default=2)
 parser.add_argument("--modes", default="det,stoch")
+parser.add_argument("--natural_share", type=float, default=0.5, help="Receive task only.")
+parser.add_argument("--level", type=int, default=3, help="Receive task only: feeder levels 0..level, uniform.")
 parser.add_argument("--out", required=True)
 cli_args.add_rsl_rl_args(parser)
 AppLauncher.add_app_launcher_args(parser)
@@ -40,11 +47,30 @@ from rsl_rl.runners import OnPolicyRunner  # noqa: E402
 
 import badmintonlab_game.tasks  # noqa: E402,F401
 from badmintonlab_game.tasks.manager_based.badmintonlab_game.serve.serve_reward import STAGE_WEIGHTS  # noqa: E402
-from badmintonlab_game.tasks.manager_based.badmintonlab_game.serve.wrapper import ServePolicyVecEnvWrapper  # noqa: E402
+from badmintonlab_game.tasks.manager_based.badmintonlab_game.serve.wrapper import (  # noqa: E402
+    ReceivePolicyVecEnvWrapper,
+    ServePolicyVecEnvWrapper,
+)
 from common import load_weights, prepare_agent_cfg  # noqa: E402
 
 KEYS = ("legal", "crossed", "in", "fault", "no_hit", "tunnel", "net", "out", "fall", "fall_after_hit", "timeout",
         "vc_mean", "el_mean", "launch_el_mean", "outcome_mean", "rallies")
+RECV_KEYS = ("rallies", "touch", "crossed", "in", "fell", "miss", "tunnel", "timeout", "f_rallies", "f_touch", "f_crossed",
+             "f_in", "f_fell", "n_rallies", "n_touch", "n_crossed", "n_in", "n_fell", "hd_abs_med", "hd25_share", "vc_med",
+             "st_err_p50", "tf_err_p50", "tf_lit_p50", "arr_n")
+
+
+def _p5_runner(env, agent_cfg, checkpoint):
+    from badmintonlab_game.tasks.manager_based.badmintonlab_game.serve.p5_runner import P5Runner
+
+    ck = torch.load(checkpoint, map_location="cpu", weights_only=False)
+    sd = ck["model_state_dict"]
+    last = max(int(k.split(".")[1]) for k in sd if k.startswith("critic.") and k.split(".")[1].isdigit())
+    heads = sd[f"critic.{last}.weight"].shape[0]
+    runner = P5Runner(env, agent_cfg.to_dict(), log_dir=None, device=agent_cfg.device,
+                      group_mode="multi" if heads > 1 else "single")
+    runner.alg.policy.load_state_dict(sd)
+    return runner, heads
 
 
 @hydra_task_config(args_cli.task, "rsl_rl_cfg_entry_point")
@@ -53,32 +79,54 @@ def main(env_cfg, agent_cfg):
     env_cfg.scene.num_envs = args_cli.num_envs
     env_cfg.seed = agent_cfg.seed
     env_cfg.serve_reward.initial_stage = "C"
-    env = ServePolicyVecEnvWrapper(gym.make(args_cli.task, cfg=env_cfg), clip_actions=agent_cfg.clip_actions)
+    p5 = hasattr(env_cfg, "p5")
+    if p5:
+        env_cfg.p5.natural_share = args_cli.natural_share
+        env_cfg.p5.level = args_cli.level
+        env_cfg.p5.level_mode = "uniform"
+        env = ReceivePolicyVecEnvWrapper(gym.make(args_cli.task, cfg=env_cfg), clip_actions=agent_cfg.clip_actions)
+    else:
+        env = ServePolicyVecEnvWrapper(gym.make(args_cli.task, cfg=env_cfg), clip_actions=agent_cfg.clip_actions)
     try:
-        runner = OnPolicyRunner(env, agent_cfg.to_dict(), log_dir=None, device=agent_cfg.device)
-        load_weights(runner, args_cli.checkpoint)
+        heads = 1
+        if p5:
+            runner, heads = _p5_runner(env, agent_cfg, args_cli.checkpoint)
+        else:
+            runner = OnPolicyRunner(env, agent_cfg.to_dict(), log_dir=None, device=agent_cfg.device)
+            load_weights(runner, args_cli.checkpoint)
         policy = runner.alg.policy
         policy.eval()
         computer = env.unwrapped.serve_reward
         computer.set_weights(STAGE_WEIGHTS["C"])
+        recv = getattr(env.unwrapped, "recv_reward", None) if p5 else None
+        if p5:
+            env.unwrapped.set_level(args_cli.level)
+            env.unwrapped.set_natural_share(args_cli.natural_share)
         std = getattr(policy, "std", None)
         std = torch.exp(policy.log_std) if std is None and hasattr(policy, "log_std") else std
         noise = None if std is None else float(std.detach().mean())
         result = dict(checkpoint=args_cli.checkpoint, courts=env.court_count, iters=args_cli.iters,
                       warmup=args_cli.warmup, steps_per_iter=agent_cfg.num_steps_per_env, mean_noise_std=noise,
-                      v_close_max=computer.p.v_close_max, modes={})
+                      v_close_max=computer.p.v_close_max, modes={}, value_heads=heads,
+                      natural_share=args_cli.natural_share if p5 else None, level=args_cli.level if p5 else None)
         for mode in args_cli.modes.split(","):
             obs, _ = env.reset()
             for it in range(args_cli.warmup + args_cli.iters):
                 if it == args_cli.warmup:
                     computer.pop_iteration()
+                    if recv is not None:
+                        recv.pop_iteration()
                 with torch.no_grad():
                     for _ in range(agent_cfg.num_steps_per_env):
                         actions = policy.act_inference(obs) if mode == "det" else policy.act(obs)
                         obs, _, _, _ = env.step(actions)
-            # Pooled over the measured iterations: the counters accumulate until popped.
+            # Pooled over the measured iterations: the counters accumulate until popped (receive contact and
+            # arrival logs too).
             rates = computer.pop_iteration()
             r = {k: round(float(rates[k]), 4) for k in KEYS if k in rates}
+            if recv is not None:
+                rr = recv.pop_iteration()
+                r["recv"] = {k: round(float(rr[k]), 4) for k in RECV_KEYS if k in rr}
             result["modes"][mode] = r
             print(f"[DET_EVAL] {mode}: " + " ".join(f"{k}={v}" for k, v in r.items()), flush=True)
         os.makedirs(os.path.dirname(os.path.abspath(args_cli.out)), exist_ok=True)

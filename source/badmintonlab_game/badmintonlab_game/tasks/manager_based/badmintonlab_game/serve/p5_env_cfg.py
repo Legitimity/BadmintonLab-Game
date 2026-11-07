@@ -69,7 +69,8 @@ class ReceiveParamsCfg(ReceiveParams):
 @configclass
 class P5Cfg:
     natural_share: float = 0.5  # initial; the runner sets it from the curriculum
-    level: int = 0  # initial feeder level; the runner sets it from the curriculum
+    level: int = 2  # initial feeder level; the runner sets it from the curriculum (V2: 2 in R0/R1, 3 in R2)
+    level_mode: str = "uniform"  # V2: level drawn uniformly in 0..level per rally; "band": V1 (70% own band)
     feeder_x: float = 5.8  # feeder root, |x| in its own half (canonical x = -feeder_x)
     feeder_y: float = 1.9  # random sign
     teach_after_hit: float = 0.3  # s of teacher samples after the server's first hit

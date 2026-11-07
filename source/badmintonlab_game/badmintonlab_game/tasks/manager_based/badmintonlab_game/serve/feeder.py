@@ -33,6 +33,11 @@ REACH = 0.85  # doc 1.1: horizontal sweet-spot reach from the root (not used for
 RACKET_HOME = (2.49, 0.01)
 RACKET_REACH = 0.3
 ROOT_FROM_RACKET = (RECV_HOME[0] - RACKET_HOME[0], RECV_HOME[1] - RACKET_HOME[1])
+RECV_YAW = math.pi - 0.043  # receiver's ready yaw, feeder frame (player_cfg.READY_ROOT yaw -0.043, mirrored)
+# Bearing of the resting sweet spot seen from the root, in the body frame (0 = straight ahead, + = left):
+# about -36.5 deg, the racket is ahead and to the right. V2 recv_torso_face subtracts it (see receive.py).
+RACKET_BEARING = math.remainder(math.atan2(RACKET_HOME[1] - RECV_HOME[1], RACKET_HOME[0] - RECV_HOME[0]) - RECV_YAW,
+                                2.0 * math.pi)
 LAUNCH_X = -2.55  # x of the drop point (mirrored per side by reset_shuttle_drop_state)
 DROP_Z = 2.2
 
