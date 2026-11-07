@@ -7,7 +7,8 @@ Every ``--poll_s`` seconds:
   * automatic stop (SIGTERM to the trainer: it saves ``latest.pt`` and ``model_<it>.pt`` after the current
     iteration; ``STOP_REQUESTED`` tells the queue not to restart):
       - plan 5: stage B >= 1500 iterations with EMA in < 0.40
-      - plan 5: train ``Serve/in`` vs play standing-in (zero opponent) differ by > 10 points
+      - plan 5 (one-sided since P3 F2): play standing-in (zero opponent) below train ``Serve/in`` by > 10 points
+        (play better than training, as with action noise in P3, never stops a run)
       - plan 5: train fall < 0.10 while play fell_after_hit > 0.30
       - early stop: M1 met in play (both sides, both opponents; thresholds --m1_*)
       - early stop: 1000 iterations after stage C passed
@@ -263,8 +264,10 @@ def evaluate(st, k, ckpt, sc):
     ev_in = sum(r[3].get("served_in_standing", r[3]["served_in"]) for r in zero) / len(zero) if zero else None
     ev_fah = max(r[3]["fell_after_hit"] for r in rows)
     say(f"  it={k}: train(in={train_in}, fall={train_fall}) vs play(zero opp) standing-in={ev_in}, max fell_after_hit={ev_fah:.3f}")
-    if train_in is not None and ev_in is not None and abs(train_in - ev_in) > 0.10:
-        request_stop(st, f"plan 5: it={k} train in {train_in:.3f} vs play standing-in {ev_in:.3f} differ by > 10 points")
+    if train_in is not None and ev_in is not None and train_in - ev_in > 0.10:
+        request_stop(st, f"plan 5: it={k} play standing-in {ev_in:.3f} below train in {train_in:.3f} by > 10 points")
+    elif train_in is not None and ev_in is not None and ev_in - train_in > 0.10:
+        alert(st, f"playbetter_{k}", f"it={k}: play standing-in {ev_in:.3f} above train in {train_in:.3f} by > 10 points (no stop)")
     if train_fall is not None and train_fall < 0.10 and ev_fah > 0.30:
         request_stop(st, f"plan 5: it={k} train fall {train_fall:.3f} < 0.10 but play fell_after_hit {ev_fah:.3f} > 0.30")
     if train_fall is not None and train_fall < 0.01 and ev_fah > 0.05:

@@ -7,7 +7,8 @@ Every ``--poll_s`` seconds:
   * 5.2: serve hold standing-in below the P3 baseline by >= 2 points -> natural share +0.10 (max 0.7), written
     to ``<run>/p5_control.json`` (the runner reads it every 10 iterations);
   * 6.2 stops (one-sided, only on getting worse): serve standing-in below baseline by >= 5 points twice in a
-    row; fell_after_hit > 10% in any evaluation; NaN loss; EMA timeout > 2%;
+    row; fell_after_hit > 10% in any evaluation; NaN loss; EMA timeout > 2%. There is deliberately no
+    train-vs-play rule (P3: it fired when play was better than the noisy training metric);
   * 6.3 early finish: all B gates met in two consecutive evaluations;
   * 7.1 alerts (no action): L0 >= 1000 iterations with f_touch < 0.3, Teach/mse rising, receiver falls > 10%,
     receive tunnel > 25%, level max reached.
@@ -44,6 +45,7 @@ ap.add_argument("--serve_base", type=float, default=0.868, help="P3 final standi
 ap.add_argument("--done_file", default=None)
 ap.add_argument("--poll_s", type=float, default=120.0)
 ap.add_argument("--no_stop", action="store_true")
+ap.add_argument("--no_share_control", action="store_true", help="Do not write p5_control.json (pilot, feeder only).")
 ap.add_argument("--eval_export", default=None)
 ap.add_argument("--eval_tag", default="oneshot")
 args = ap.parse_args()
@@ -213,7 +215,7 @@ def judge(st, k, res):
         drop = args.serve_base - z["serve_in"]
         say(f"  it={k}: serve hold standing-in {z['serve_in']:.3f} (P3 base {args.serve_base:.3f}, drop {drop:+.3f})")
         # 5.2 natural share
-        if drop >= 0.02:
+        if drop >= 0.02 and not args.no_share_control:
             cur = st.get("natural_share")
             if cur is None:
                 cur = 0.5
