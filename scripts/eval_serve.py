@@ -63,6 +63,7 @@ def main():
     ap.add_argument("--watchdog_s", type=float, default=60.0)
     ap.add_argument("--out", type=Path, default=None)
     ap.add_argument("--python", default=sys.executable)
+    ap.add_argument("--probe_out", type=Path, default=None, help="Fall traces of our receiver (P5 V2 3.1).")
     a = ap.parse_args()
     a.ours = a.ours.resolve()  # the inner process runs with cwd = play root
     if a.out is not None:
@@ -94,6 +95,8 @@ def main():
             "--watchdog_s", str(a.watchdog_s),
             "--headless",
         ]
+        if a.probe_out is not None:
+            cmd += ["--probe_out", str(a.probe_out.resolve())]
         out = subprocess.run(cmd, env=env, cwd=a.play_root, capture_output=True, text=True)
         sys.stderr.write(out.stderr[-4000:])
         line = [ln for ln in out.stdout.splitlines() if ln.startswith("[SERVE_EVAL]")]
