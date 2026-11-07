@@ -191,13 +191,13 @@ class ReceiveCurriculum:
     level_ema: int = 100
     level_min: int = 100
     level_station: float = 0.4
-    level_fall: float = 0.05
+    level_fall: float = 0.02  # 11-08: per ball (was 0.05 per 6-ball episode)
     gate_ema: int = 200
     gate_min: int = 300
     gate_max: int = 4000  # 11-08: raised from 2000 (L1 alone took ~800 iters)
     gate_station: float = 0.5
     gate_face: float = 0.5
-    gate_fall: float = 0.03
+    gate_fall: float = 0.015  # 11-08: per ball
     iters_in_level: int = 0
     iters_in_stage: int = 0
     ema: dict = field(default_factory=dict)
@@ -224,7 +224,7 @@ class ReceiveCurriculum:
             self._ema(self.gate_ema_vals, rates, self.gate_ema)
         if self.level < 3 and self.iters_in_level >= self.level_min:
             e = self.ema
-            if e.get("station_ok", 0.0) >= self.level_station and e.get("fall", 1.0) <= self.level_fall:
+            if e.get("station_ok", 0.0) >= self.level_station and e.get("fall_ball", 1.0) <= self.level_fall:
                 self.history.append(dict(event=f"level_{self.level + 1}", iteration=iteration, ema=dict(e)))
                 self.level += 1
                 self.iters_in_level = 0
@@ -235,7 +235,7 @@ class ReceiveCurriculum:
             if (
                 g.get("station_ok", 0.0) >= self.gate_station
                 and g.get("face_ok", 0.0) >= self.gate_face
-                and g.get("fall", 1.0) <= self.gate_fall
+                and g.get("fall_ball", 1.0) <= self.gate_fall
             ):
                 self.passed = True
                 self.history.append(dict(event="passed_S1", iteration=iteration, ema=dict(g)))

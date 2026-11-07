@@ -304,6 +304,7 @@ class ReceiveBadmintonEnv(ServeBadmintonEnv):
             head_deg=math.degrees(c["head_sum"] / b),
             touch=c["touch"] / b,
             fall=c["falls"] / max(c["episodes"], 1.0),
+            fall_ball=c["falls"] / b,  # 11-08: per fed ball (play has one ball per rally)
             episodes=c["episodes"],
             v_to_station=c["vel_sum"] / max(c["vel_n"], 1.0),
             fall_low=c["fall_low"],

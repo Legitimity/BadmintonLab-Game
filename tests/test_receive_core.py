@@ -106,8 +106,8 @@ def test_feeder_table_is_filtered_and_sorted(core):
 
 def test_curriculum_levels_and_gate(core):
     c = core.ReceiveCurriculum(level_min=10, level_ema=5, gate_min=20, gate_ema=5, gate_max=200)
-    good = dict(station_ok=0.9, face_ok=0.9, fall=0.0)
-    bad = dict(station_ok=0.1, face_ok=0.9, fall=0.0)
+    good = dict(station_ok=0.9, face_ok=0.9, fall=0.0, fall_ball=0.0)
+    bad = dict(station_ok=0.1, face_ok=0.9, fall=0.0, fall_ball=0.0)
     for it in range(30):
         c.update(it, bad)
     assert c.level == 0 and not c.passed
