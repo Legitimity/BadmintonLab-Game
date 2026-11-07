@@ -194,7 +194,7 @@ class ReceiveCurriculum:
     level_fall: float = 0.05
     gate_ema: int = 200
     gate_min: int = 300
-    gate_max: int = 2000
+    gate_max: int = 4000  # 11-08: raised from 2000 (L1 alone took ~800 iters)
     gate_station: float = 0.5
     gate_face: float = 0.5
     gate_fall: float = 0.03
