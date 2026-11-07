@@ -211,6 +211,7 @@ def main(env_cfg, agent_cfg):
             if args_cli.resume_path and os.path.abspath(args_cli.resume_path) == resume_path:
                 curriculum.natural_min, curriculum.natural_max = args_cli.natural_min, args_cli.natural_max
                 curriculum.max_level = args_cli.max_level
+                curriculum.r1_iters = args_cli.r1_iters
                 curriculum.level = min(curriculum.level, curriculum.max_level)
                 curriculum.natural_share = curriculum.clamp_share(args_cli.natural_share)
                 runner.apply_p5()

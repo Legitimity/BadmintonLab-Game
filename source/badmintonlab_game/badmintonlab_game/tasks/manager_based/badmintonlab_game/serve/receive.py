@@ -4,7 +4,8 @@ Only the **receiver** (``1 - server``) is scored, around its first legal hit. Th
 serve: contact features captured at the physics step (``capture_contact``), pass-through detection
 (``capture_tunnel``), one ``end_step`` per control step that fills ``values`` (already weighted; events
 scaled by ``1/step_dt`` like the serve terms). Scoring functions are the serve ones
-(``swing_score``, ``face_quality``, ``outcome_pred_score``, ``launch_score``) with the receive targets.
+(``swing_score``, the elevation part of ``face_quality``, ``outcome_pred_score``, ``launch_score``) with the
+receive targets; the face heading and the launch heading use wider receive-only factors (pilot A).
 
 The incoming ball is announced by the environment with ``set_incoming``: the feeder launch, or the step
 after a natural serve. Targets are in the server's (feeder's) canonical frame (``feeder.RECV_HOME``).
@@ -23,9 +24,9 @@ import torch
 from .feeder import RECV_HOME, ROOT_FROM_RACKET
 from .rules import predict_flight
 from .serve_reward import (
+    face_elevation_quality,
     ServeRewardParams,
     contact_features,
-    face_quality,
     launch_score,
     outcome_pred_score,
     quat_rotate_x_axis,
@@ -82,12 +83,22 @@ class ReceiveParams:
     near_time: float = 0.4  # racket_near once the ball is less than this from the target
     elevation_target_deg: float = 52.0
     x_target: float = 2.0
-    v_close_target: float = 6.5  # swing_score of the return (the serve of P3 final runs with v_close_max 7.0)
-    v_close_max: float = 8.0
+    # A' (pilot A + drag model): from the measured contact point ~2.6 m behind the net a return needs >= 8 m/s
+    # launch speed to clear the net and land in; doc 1.2's "slow swing (6.5 / 8.0) suffices" assumed 1.5 m.
+    v_close_target: float = 7.5  # swing_score of the return only (the serve keeps its own values)
+    v_close_max: float = 9.0
+    # Horizontal heading of the striking face for recv_face (receiver frame, 0 = towards the net): full score
+    # within heading_flat_deg, Gaussian of width heading_sigma_deg outside. Replaces face_quality's 15 deg heading
+    # Gaussian, which scored ~0 at the pilot's 50-75 deg and gave no gradient.
+    heading_flat_deg: float = 25.0
+    heading_sigma_deg: float = 25.0
     positive_cap: float = 8.0
     terminate_on_fall: bool = True
     flight_dt: float = 0.02
     initial_stage: str = "R1"
+    # Pilot A: launch_score ignores the heading and P3's swing sends the return sideways (vy ~ +3, vx ~ 1 m/s,
+    # never over the net) at near-full launch_dir. For the return it is scaled by cos(heading)^power.
+    launch_heading_power: float = 2.0
 
 
 @dataclass
@@ -150,12 +161,18 @@ class ReceiveRewardComputer:
         self.counted = z(n, dt=torch.bool)
         self.natural = torch.ones(n, dtype=torch.bool, device=device)
         self.iteration = torch.zeros(len(RECV_STAT_KEYS), device=device)
+        self._contact_log: list[torch.Tensor] = []  # (k, 2): |heading|, v_close of receiver contacts
 
     def set_weights(self, weights: dict) -> None:
         unknown = set(weights) - set(RECV_TERMS)
         if unknown:
             raise KeyError(f"Unknown receive reward terms: {sorted(unknown)}")
         self.weights.update({k: float(v) for k, v in weights.items()})
+
+    def face_score(self, elevation, heading):
+        """Elevation part of ``face_quality`` (core + tail) times the wide heading factor."""
+        off = torch.clamp(heading.abs() - self.p.heading_flat_deg, min=0.0) / self.p.heading_sigma_deg
+        return face_elevation_quality(elevation, self.sp) * torch.exp(-off * off)
 
     # ------------------------------------------------------------------ incoming ball
     def set_incoming(self, mask: torch.Tensor, tgt: torch.Tensor, t_arrive: torch.Tensor, d_need: torch.Tensor,
@@ -240,7 +257,7 @@ class ReceiveRewardComputer:
         contact = hit_now & self.c_have
         vals["recv_contact"] = w["recv_contact"] * contact.float()
         vals["recv_swing"] = w["recv_swing"] * contact.float() * swing_score(self.c_vc, sp)
-        vals["recv_face"] = w["recv_face"] * contact.float() * face_quality(self.c_el, self.c_hd, sp)
+        vals["recv_face"] = w["recv_face"] * contact.float() * self.face_score(self.c_el, self.c_hd)
         tunnel = self.tunnel_now & ~self.tunnel_given
         self.tunnel_given |= tunnel
         vals["recv_tunnel"] = w["recv_tunnel"] * tunnel.float()
@@ -257,7 +274,9 @@ class ReceiveRewardComputer:
             net_z, land = predict_flight(pos_c, v_c, sp.drag_over_mass, sp.gravity, dt=sp.flight_dt,
                                          max_steps=int(4.0 / sp.flight_dt))
             score[ids] = outcome_pred_score(net_z, land, sp)
-            launch[ids], launch_el[ids] = launch_score(v_c, sp)
+            ls, launch_el[ids] = launch_score(v_c, sp)
+            cos_h = (v_c[:, 0] / torch.linalg.norm(v_c[:, :2], dim=-1).clamp(min=1e-6)).clamp(min=0.0)
+            launch[ids] = ls * cos_h ** p.launch_heading_power
         vals["recv_outcome_pred"] = w["recv_outcome_pred"] * score
         vals["recv_launch_dir"] = w["recv_launch_dir"] * launch
         self.outcome_pending = hit_now.clone()
@@ -301,6 +320,8 @@ class ReceiveRewardComputer:
 
     # ------------------------------------------------------------------ statistics
     def _step_stats(self, contact, score, due, launch_el, approach, do_approach) -> None:
+        if bool(contact.any()):
+            self._contact_log.append(torch.stack((self.c_hd[contact].abs(), self.c_vc[contact]), -1))
         add = {
             "contacts": contact.float().sum(),
             "vc_sum": (self.c_vc * contact.float()).sum(),
@@ -366,6 +387,13 @@ class ReceiveRewardComputer:
     def pop_iteration(self) -> dict:
         out = self.rates(self.iteration)
         self.iteration.zero_()
+        if self._contact_log:
+            c = torch.cat(self._contact_log)
+            out.update(hd_abs_med=float(c[:, 0].median()), hd25_share=float((c[:, 0] < self.p.heading_flat_deg).float().mean()),
+                       vc_med=float(c[:, 1].median()))
+        else:
+            out.update(hd_abs_med=float("nan"), hd25_share=float("nan"), vc_med=float("nan"))
+        self._contact_log = []
         return out
 
 

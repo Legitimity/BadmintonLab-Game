@@ -184,6 +184,13 @@ def swing_score(v_close: torch.Tensor, p) -> torch.Tensor:
     return rise - over
 
 
+def face_elevation_quality(elevation, p: ServeRewardParams) -> torch.Tensor:
+    """Elevation factor of ``face_quality`` without the heading: ``max(core, tail)`` in elevation."""
+    d = elevation - p.elevation_target_deg
+    de = d / p.face_sigma_deg
+    return torch.maximum(torch.exp(-de * de), p.face_tail_weight * torch.exp(-d.abs() / p.face_tail_scale_deg))
+
+
 def face_quality(elevation, heading, p: ServeRewardParams) -> torch.Tensor:
     """Gaussian core (V3) with an exponential tail in elevation (V2.1): ``max(core, tail)``."""
     d = elevation - p.elevation_target_deg

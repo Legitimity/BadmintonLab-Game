@@ -163,7 +163,7 @@ class P5Runner(ServeRunner):
             for key, value in values.items():
                 self.writer.add_scalar(key, value, it)
         keys = ("f_rallies", "f_touch", "f_crossed", "f_in", "f_fell", "f_tunnel", "f_need_mean", "n_rallies", "n_touch",
-                "n_crossed", "n_in", "vc_mean", "approach_mean", "timeout")
+                "n_crossed", "n_in", "vc_mean", "vc_med", "hd_abs_med", "hd25_share", "approach_mean", "timeout")
         teach = self.alg.last_stats if hasattr(self.alg, "last_stats") else {}
         print("[Recv] " + " ".join(f"{k}={rates[k]:.3f}" for k in keys if k in rates)
               + f" | L={u.feeder_level} nat={u.natural_share:.2f}"

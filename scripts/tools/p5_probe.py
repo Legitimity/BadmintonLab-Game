@@ -32,6 +32,7 @@ from isaaclab_tasks.utils.hydra import hydra_task_config  # noqa: E402
 
 import badmintonlab_game.tasks  # noqa: E402,F401
 from badmintonlab_game.tasks.manager_based.badmintonlab_game.serve.serve_reward import to_canonical  # noqa: E402
+from badmintonlab_game.tasks.manager_based.badmintonlab_game.serve.rules import predict_flight  # noqa: E402
 
 
 @hydra_task_config("BadmintonLab-Game-Receive", "rsl_rl_cfg_entry_point")
@@ -54,6 +55,7 @@ def main(env_cfg, agent_cfg):
     rk_at = torch.zeros(n, 3, device=dev)
     sh_at = torch.zeros(n, 3, device=dev)
     rallies = []
+    returns = []
     for t in range(args.steps):
         # Closest racket-ball distance of the receiver during the incoming flight (server frame).
         srv = u.initial_hitter
@@ -84,6 +86,22 @@ def main(env_cfg, agent_cfg):
                 act = torch.cat((pol(obs["player_0"]), pol(obs["player_1"])), -1)
             pre_nat = u.natural.clone()
             obs, _, term, trunc, info = env.step(act)
+        # Returns: the step after the receiver's first hit (outcome_pending set this step), receiver frame.
+        pend = u.recv_reward.outcome_pending & ~pre_nat
+        if bool(pend.any()):
+            ids = pend.nonzero().flatten()
+            rcv = 1 - u.initial_hitter[ids]
+            pc = to_canonical(u._shuttle.data.root_pos_w[ids] - u.scene.env_origins[ids], rcv)
+            vc = to_canonical(u._shuttle.data.root_lin_vel_w[ids], rcv)
+            sp = u.serve_reward.p
+            nz, land = predict_flight(pc, vc, sp.drag_over_mass, sp.gravity, dt=0.01, max_steps=400)
+            for j in range(ids.numel()):
+                v = vc[j]
+                el = float(torch.rad2deg(torch.atan2(v[2], torch.linalg.norm(v[:2]))))
+                returns.append(dict(pos=[round(x, 2) for x in pc[j].tolist()], vel=[round(x, 2) for x in v.tolist()],
+                                    speed=round(float(v.norm()), 2), el=round(el, 1), net_z=round(float(nz[j]), 2),
+                                    land=[round(x, 2) for x in land[j].tolist()], face=round(float(u.recv_reward.c_el[ids[j]]), 1), hd=round(float(u.recv_reward.c_hd[ids[j]]), 1),
+                                    vc=round(float(u.recv_reward.c_vc[ids[j]]), 2)))
         done_all = (term | trunc) & active_snapshot & ~pre_nat
         for i in done_all.nonzero().flatten().tolist():
             rallies.append(dict(dmin=round(float(dmin[i]), 3), need=round(float(need_snapshot[i]), 3),
@@ -114,6 +132,16 @@ def main(env_cfg, agent_cfg):
               f"hit {sum(r['hit'] for r in rallies) / len(ds):.3f}", flush=True)
         for r in rallies[:12]:
             print("[PROBE_RALLY]" + json.dumps(r), flush=True)
+    if returns:
+        import statistics as stt
+        med = lambda k: stt.median(r[k] for r in returns)  # noqa: E731
+        fwd = sum(r["vel"][0] > 0 for r in returns) / len(returns)
+        over = sum(r["net_z"] > 1.55 for r in returns) / len(returns)
+        print(f"[PROBE_RET] n={len(returns)} speed p50 {med('speed'):.2f} el p50 {med('el'):.1f} face p50 {med('face'):.1f} "
+              f"vc p50 {med('vc'):.2f} |hd| p50 {stt.median(abs(r['hd']) for r in returns):.1f} |hd|<25 {sum(abs(r['hd']) < 25 for r in returns) / len(returns):.3f} vx>0 (towards net) {fwd:.3f} pred net_z>1.55 {over:.3f} net_z p50 {med('net_z'):.2f} "
+              f"pos z p50 {stt.median(r['pos'][2] for r in returns):.2f} pos x p50 {stt.median(r['pos'][0] for r in returns):.2f}", flush=True)
+        for r in returns[:15]:
+            print("[PROBE_RET1]" + json.dumps(r), flush=True)
     ver = u.pop_verify()
     print("[PROBE_VERIFY]" + json.dumps(ver), flush=True)
     print("[PROBE_RECV]" + json.dumps(u.recv_reward.pop_iteration()), flush=True)
