@@ -81,6 +81,19 @@ parser.add_argument(
     default=None,
     help="PPO mini-batches per epoch. Default 16 (2048 courts). At 8192 courts use 64 to keep the mini-batch size.",
 )
+parser.add_argument(
+    "--physics_dt",
+    type=float,
+    default=0.001,
+    choices=(0.001, 0.002, 0.005),
+    help="Physics step (play a5e0780: 0.001). decimation = 0.02 / dt; actuator delays stay 10-40 ms.",
+)
+parser.add_argument("--entropy_coef", type=float, default=None, help="Override algorithm.entropy_coef.")
+parser.add_argument(
+    "--std_range",
+    default=None,
+    help="Clamp the action noise std into 'lo,hi' after loading and after every update, e.g. '0.15,0.35'.",
+)
 cli_args.add_rsl_rl_args(parser)
 AppLauncher.add_app_launcher_args(parser)
 args_cli, hydra_args = parser.parse_known_args()
@@ -96,6 +109,7 @@ from isaaclab_tasks.utils import get_checkpoint_path  # noqa: E402
 from isaaclab_tasks.utils.hydra import hydra_task_config  # noqa: E402
 
 import badmintonlab_game.tasks  # noqa: E402,F401
+from badmintonlab_game.tasks.manager_based.badmintonlab_game.dual_agent_env_cfg import set_physics_dt  # noqa: E402
 from badmintonlab_game.tasks.manager_based.badmintonlab_game.serve import player_cfg  # noqa: E402
 from badmintonlab_game.tasks.manager_based.badmintonlab_game.serve.curriculum import (  # noqa: E402
     ServeCurriculum,
@@ -246,6 +260,14 @@ def main(env_cfg, agent_cfg):
         env_cfg.sim.device = args_cli.device
         agent_cfg.device = args_cli.device
     env_cfg.seed = agent_cfg.seed
+    set_physics_dt(env_cfg, args_cli.physics_dt)
+    if args_cli.entropy_coef is not None:
+        agent_cfg.algorithm.entropy_coef = args_cli.entropy_coef
+    if args_cli.save_interval_override is not None:
+        agent_cfg.save_interval = args_cli.save_interval_override
+    std_range = None
+    if args_cli.std_range:
+        std_range = tuple(float(v) for v in args_cli.std_range.split(","))
     env_cfg.serve_reward.initial_stage = args_cli.stage
     if args_cli.stage_weights:
         # Before the env is built: the reward computer and the curriculum both read STAGE_WEIGHTS.
@@ -291,6 +313,10 @@ def main(env_cfg, agent_cfg):
             stage_gates=args_cli.stage_gates,
             stage_param=args_cli.stage_param,
             stop_after_stage=args_cli.stop_after_stage,
+            physics_dt=env_cfg.sim.dt,
+            decimation=env_cfg.decimation,
+            entropy_coef=agent_cfg.algorithm.entropy_coef,
+            std_range=std_range,
             serve_reward={k: v for k, v in vars(env_cfg.serve_reward).items() if isinstance(v, (int, float, str, bool))},
             num_mini_batches=agent_cfg.algorithm.num_mini_batches,
             samples_per_iteration=2 * env_cfg.scene.num_envs * agent_cfg.num_steps_per_env,
@@ -342,11 +368,13 @@ def main(env_cfg, agent_cfg):
             time_budget_hours=args_cli.time_budget_hours,
             curriculum=curriculum,
             stop_after_stage=args_cli.stop_after_stage,
+            std_range=std_range,
         )
         runner.install_signal_handlers()
         if resume_path:
             print(f"[INFO] Resuming from: {resume_path}")
             runner.load(resume_path)
+            runner.clamp_std()
         elif not args_cli.no_pose_init:
             init_actor_output(runner.alg.policy, _ready_action(env))
         dump_yaml(os.path.join(log_dir, "params", "env.yaml"), env_cfg)

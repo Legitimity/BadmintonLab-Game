@@ -26,6 +26,7 @@ parser.add_argument("--iters", type=int, default=20)
 parser.add_argument("--warmup", type=int, default=2)
 parser.add_argument("--modes", default="det,stoch")
 parser.add_argument("--out", required=True)
+parser.add_argument("--physics_dt", type=float, default=0.001, choices=(0.001, 0.002, 0.005))
 cli_args.add_rsl_rl_args(parser)
 AppLauncher.add_app_launcher_args(parser)
 args_cli, hydra_args = parser.parse_known_args()
@@ -39,12 +40,14 @@ from isaaclab_tasks.utils.hydra import hydra_task_config  # noqa: E402
 from rsl_rl.runners import OnPolicyRunner  # noqa: E402
 
 import badmintonlab_game.tasks  # noqa: E402,F401
+from badmintonlab_game.tasks.manager_based.badmintonlab_game.dual_agent_env_cfg import set_physics_dt  # noqa: E402
 from badmintonlab_game.tasks.manager_based.badmintonlab_game.serve.serve_reward import STAGE_WEIGHTS  # noqa: E402
 from badmintonlab_game.tasks.manager_based.badmintonlab_game.serve.wrapper import ServePolicyVecEnvWrapper  # noqa: E402
 from common import load_weights, prepare_agent_cfg  # noqa: E402
 
 KEYS = ("legal", "crossed", "in", "fault", "no_hit", "tunnel", "net", "out", "fall", "fall_after_hit", "timeout",
-        "vc_mean", "el_mean", "launch_el_mean", "outcome_mean", "rallies")
+        "vc_mean", "el_mean", "launch_el_mean", "outcome_mean", "rallies", "launch_v_mean", "pred_in", "land_x_mean",
+        "land_ay_mean", "tof_mean")
 
 
 @hydra_task_config(args_cli.task, "rsl_rl_cfg_entry_point")
@@ -53,6 +56,7 @@ def main(env_cfg, agent_cfg):
     env_cfg.scene.num_envs = args_cli.num_envs
     env_cfg.seed = agent_cfg.seed
     env_cfg.serve_reward.initial_stage = "C"
+    set_physics_dt(env_cfg, args_cli.physics_dt)
     env = ServePolicyVecEnvWrapper(gym.make(args_cli.task, cfg=env_cfg), clip_actions=agent_cfg.clip_actions)
     try:
         runner = OnPolicyRunner(env, agent_cfg.to_dict(), log_dir=None, device=agent_cfg.device)
@@ -66,7 +70,8 @@ def main(env_cfg, agent_cfg):
         noise = None if std is None else float(std.detach().mean())
         result = dict(checkpoint=args_cli.checkpoint, courts=env.court_count, iters=args_cli.iters,
                       warmup=args_cli.warmup, steps_per_iter=agent_cfg.num_steps_per_env, mean_noise_std=noise,
-                      v_close_max=computer.p.v_close_max, modes={})
+                      v_close_max=computer.p.v_close_max, physics_dt=env_cfg.sim.dt, decimation=env_cfg.decimation,
+                      modes={})
         for mode in args_cli.modes.split(","):
             obs, _ = env.reset()
             for it in range(args_cli.warmup + args_cli.iters):

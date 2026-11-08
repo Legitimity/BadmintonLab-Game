@@ -91,6 +91,74 @@ def main():
         return original_reset(env_ids)
 
     u._reset_idx = reset_with_snapshot
+
+    # Serve quality (P3_FINETUNE_DT1MS 4.4), read at physics rate by wrapping play's per-substep hooks
+    # (bookkeeping only). Per rally: first hit of ours (closing speed along the face normal against the shuttle
+    # velocity of the previous substep, exit speed and elevation right after the contact substep, receiver's
+    # racket position), and the landing (time and point) of the shuttle.
+    robots = [u.scene["robot_0"], u.scene["robot_1"]]
+    rk = [int(r.find_bodies("racket_link")[0][0]) for r in robots]
+    sweet = torch.tensor([0.0, 0.0, 0.52], device=device)
+    origin_y = u.scene.env_origins[:, 1]
+    phys = {"t": 0.0}
+    last_svel = torch.zeros(n, 3, device=device)
+    q_have = torch.zeros(n, dtype=torch.bool, device=device)
+    q_vc = torch.zeros(n, device=device)
+    q_exit_v = torch.zeros(n, device=device)
+    q_exit_el = torch.zeros(n, device=device)
+    q_hit_t = torch.zeros(n, device=device)
+    q_recv_xy = torch.zeros(n, 2, device=device)
+    q_land = torch.zeros(n, dtype=torch.bool, device=device)
+    q_land_t = torch.zeros(n, device=device)
+    q_land_xy = torch.zeros(n, 2, device=device)
+
+    def _quat_apply(q, v):
+        w, xyz = q[..., :1], q[..., 1:]
+        t = 2.0 * torch.cross(xyz, v, dim=-1)
+        return v + w * t + torch.cross(xyz, t, dim=-1)
+
+    def _canon_xy(pos):
+        return torch.stack((sign_me * (pos[:, 0] - origin_x), sign_me * (pos[:, 1] - origin_y)), dim=-1)
+
+    original_hits = u._update_hits
+    original_result = u._update_rally_result
+
+    def hits_with_quality():
+        before = u.just_hit[:, me].clone()
+        original_hits()
+        phys["t"] += float(u.physics_dt)
+        new = u.just_hit[:, me] & ~before & ~q_have
+        if bool(new.any()):
+            r = robots[me]
+            quat = r.data.body_quat_w[:, rk[me]]
+            off = _quat_apply(quat, sweet.expand(n, 3))
+            v_sweet = r.data.body_lin_vel_w[:, rk[me]] + torch.cross(r.data.body_ang_vel_w[:, rk[me]], off, dim=-1)
+            normal = _quat_apply(quat, torch.tensor([1.0, 0.0, 0.0], device=device).expand(n, 3))
+            vc = ((v_sweet - last_svel) * normal).sum(-1).abs()
+            sv = shuttle.data.root_lin_vel_w
+            speed = sv.norm(dim=-1)
+            el = torch.rad2deg(torch.asin((sv[:, 2] / speed.clamp_min(1e-6)).clamp(-1.0, 1.0)))
+            o = robots[other]
+            o_pos = o.data.body_pos_w[:, rk[other]] + _quat_apply(o.data.body_quat_w[:, rk[other]], sweet.expand(n, 3))
+            q_vc[new], q_exit_v[new], q_exit_el[new] = vc[new], speed[new], el[new]
+            q_hit_t[new] = phys["t"]
+            q_recv_xy[new] = _canon_xy(o_pos)[new]
+            q_have[new] = True
+        last_svel.copy_(shuttle.data.root_lin_vel_w)
+
+    def result_with_landing():
+        before = u.rally_resolved.clone()
+        original_result()
+        newly = u.rally_resolved & ~before & q_have & ~q_land
+        if bool(newly.any()):
+            q_land_t[newly] = phys["t"]
+            q_land_xy[newly] = _canon_xy(shuttle.data.root_pos_w)[newly]
+            q_land[newly] = True
+
+    u._update_hits = hits_with_quality
+    u._update_rally_result = result_with_landing
+    quality = {k: [] for k in ("land_x", "land_ay", "land_y", "tof", "v_close", "exit_v", "exit_el", "d_recv_racket",
+                               "recv_racket_x", "recv_racket_y")}
     fall_t = torch.full((n,), -1.0, device=device)
     hit_t = torch.full((n,), -1.0, device=device)
     timing = {"serve": {"len": [], "hit": [], "fall": [], "fall_after_hit": []}, "receive": {"len": [], "hit": [], "fall": [], "fall_after_hit": []}}
@@ -156,6 +224,21 @@ def main():
                 s["return_in"] += int(bool(crossed[i]) and (won or bool(opp_after[i])))
                 s["return_in_standing"] += int(bool(crossed[i]) and (won or bool(opp_after[i])) and not bool(fell[i]))
                 s["opp_hit_after"] += int(bool(opp_after[i]))
+                if role == "serve" and won and bool(ours_hit[i]) and not bool(fell[i]) and bool(q_have[i]):
+                    # Serve quality of the in serves (zero or passive opponents: the landing ends the rally).
+                    quality["v_close"].append(float(q_vc[i]))
+                    quality["exit_v"].append(float(q_exit_v[i]))
+                    quality["exit_el"].append(float(q_exit_el[i]))
+                    if bool(q_land[i]) and not bool(opp_after[i]):
+                        lx, ly = float(q_land_xy[i, 0]), float(q_land_xy[i, 1])
+                        quality["land_x"].append(lx)
+                        quality["land_y"].append(ly)
+                        quality["land_ay"].append(abs(ly))
+                        quality["tof"].append(float(q_land_t[i] - q_hit_t[i]))
+                        rx, ry = float(q_recv_xy[i, 0]), float(q_recv_xy[i, 1])
+                        quality["recv_racket_x"].append(rx)
+                        quality["recv_racket_y"].append(ry)
+                        quality["d_recv_racket"].append(((lx - rx) ** 2 + (ly - ry) ** 2) ** 0.5)
                 if role == "receive" and bool(opp_first[i]):
                     # Receive metrics of 6.1, per legal opponent serve (the opponent touched the shuttle first).
                     s["opp_served"] += 1
@@ -186,6 +269,8 @@ def main():
             fell[done] = False
             fall_t[done] = -1.0
             hit_t[done] = -1.0
+            q_have[done] = False
+            q_land[done] = False
             started[done] = sim_t
     def summary(xs):
         if not xs:
@@ -199,11 +284,13 @@ def main():
         s["rates"] = {k: s[k] / r for k in keys if k != "rallies"}
         # Seconds from the rally start (hit, fall, rally length) and from our hit to the fall.
         s["timing_s"] = {k: summary(v) for k, v in timing[role].items()}
+    stats["serve"]["quality"] = {k: summary(v) for k, v in quality.items()}
     rv = stats["receive"]
     m = max(rv["opp_served"], 1)
     rv["recv"] = {"recv_rallies": rv["opp_served"], "recv_touch": rv["r_touch"] / m, "recv_crossed": rv["r_crossed"] / m,
                   "recv_in": rv["r_in"] / m, "recv_fell": rv["r_fell"] / m, "recv_fell_after_hit": rv["r_fell_after_hit"] / m}
-    out = dict(obs_dims=dims, num_envs=n, seed=args.seed, wall_s=time.time() - wall, **stats)
+    out = dict(obs_dims=dims, num_envs=n, seed=args.seed, wall_s=time.time() - wall, physics_dt=float(u.physics_dt),
+               decimation=int(u.cfg.decimation), sim_s=sim_t, **stats)
     print("[SERVE_EVAL]" + json.dumps(out), flush=True)
     env.close()
 

@@ -166,9 +166,11 @@ class MatchRules:
 FLIGHT_CHUNK = 10  # integration steps per fused call; one host sync per chunk
 
 
-def _flight_steps(p, v, active, net_z, g, drag_over_mass: float, dt: float, net_x: float, floor: float, n: int):
-    """``n`` midpoint steps. Pure tensor code, so torch.compile fuses it into a few kernels."""
+def _flight_steps(p, v, active, net_z, t, g, drag_over_mass: float, dt: float, net_x: float, floor: float, n: int):
+    """``n`` midpoint steps. Pure tensor code, so torch.compile fuses it into a few kernels. ``t``: flight time
+    of each row so far (counts the steps while the row is airborne)."""
     for _ in range(n):
+        t = t + dt * active.to(t.dtype)
         # Midpoint rule: at dt=0.01 this stays within ~1 cm of a fine integration.
         speed = torch.linalg.norm(v, dim=-1, keepdim=True)
         vm = v + 0.5 * dt * (g - drag_over_mass * speed * v)
@@ -182,7 +184,7 @@ def _flight_steps(p, v, active, net_z, g, drag_over_mass: float, dt: float, net_
         net_z = torch.where(crossing, p[:, 2] + a * (pn[:, 2] - p[:, 2]), net_z)
         p = pn
         active = active & (p[:, 2] > floor)
-    return p, v, active, net_z
+    return p, v, active, net_z, t
 
 
 _COMPILED = {"fn": None, "failed": False}
@@ -209,11 +211,13 @@ def predict_flight(
     net_x: float = 0.0,
     floor: float = 0.03,
     check_every: int = FLIGHT_CHUNK,
-) -> tuple[torch.Tensor, torch.Tensor]:
+    return_time: bool = False,
+):
     """Vectorised flight prediction in the canonical frame (the striker is at x<0).
 
     Returns ``(net_z, landing_xy)``. ``net_z`` is ``-inf`` if the shuttle never crosses
-    the net plane going forward. Same drag law as ``_apply_shuttle_forces``.
+    the net plane going forward. Same drag law as ``_apply_shuttle_forces``. With ``return_time`` also the
+    flight time to the landing (to ``max_steps * dt`` for a row still airborne), resolution ``dt``.
 
     Steps after every row has landed are no-ops, so checking for that only every ``check_every``
     steps gives the same result as checking at every step, with one host sync per chunk.
@@ -227,9 +231,10 @@ def predict_flight(
     active = torch.ones(p.shape[0], dtype=torch.bool, device=p.device)
     if rows == 1:
         active[1] = False
+    t = torch.zeros(p.shape[0], device=p.device, dtype=p.dtype)
     g = torch.tensor((0.0, 0.0, -gravity), device=p.device, dtype=p.dtype)
     if rows == 0:
-        return net_z, p[:, :2]
+        return (net_z, p[:, :2], t) if return_time else (net_z, p[:, :2])
     chunk = _chunk_fn(p.device) if check_every == FLIGHT_CHUNK else _flight_steps
     done = 0
     while done < max_steps:
@@ -238,13 +243,15 @@ def predict_flight(
         n = min(check_every, max_steps - done)
         fn = chunk if n == FLIGHT_CHUNK else _flight_steps
         try:
-            p, v, active, net_z = fn(p, v, active, net_z, g, float(drag_over_mass), float(dt), float(net_x), float(floor), n)
+            p, v, active, net_z, t = fn(p, v, active, net_z, t, g, float(drag_over_mass), float(dt), float(net_x), float(floor), n)
         except Exception as exc:  # compile problems must not stop training
             if fn is _flight_steps:
                 raise
             print(f"[predict_flight] torch.compile failed ({exc!r}); using eager", flush=True)
             _COMPILED["failed"] = True
             chunk = _flight_steps
-            p, v, active, net_z = _flight_steps(p, v, active, net_z, g, float(drag_over_mass), float(dt), float(net_x), float(floor), n)
+            p, v, active, net_z, t = _flight_steps(p, v, active, net_z, t, g, float(drag_over_mass), float(dt), float(net_x), float(floor), n)
         done += n
+    if return_time:
+        return net_z[:rows], p[:rows, :2], t[:rows]
     return net_z[:rows], p[:rows, :2]

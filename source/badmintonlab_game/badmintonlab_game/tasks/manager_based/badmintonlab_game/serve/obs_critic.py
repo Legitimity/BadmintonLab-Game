@@ -26,10 +26,11 @@ def rally_phase(env, side: int) -> torch.Tensor:
 
 
 def actuator_delay(env, asset_cfg: SceneEntityCfg) -> torch.Tensor:
-    """Per-episode delay of the arm and waist groups, in physics steps. Hidden from the actor."""
+    """Per-episode delay of the arm and waist groups, in units of 5 ms (the P3 physics step, so the critic input
+    keeps its range at any physics_dt: 2-8). Hidden from the actor."""
     robot: Articulation = env.scene[asset_cfg.name]
     lags = [robot.actuators[name].positions_delay_buffer.time_lags.float() for name in ("arms", "waist")]
-    return torch.stack(lags, dim=-1)
+    return torch.stack(lags, dim=-1) * (float(env.physics_dt) / 0.005)
 
 
 def racket_vel_b(env, asset_cfg: SceneEntityCfg) -> torch.Tensor:

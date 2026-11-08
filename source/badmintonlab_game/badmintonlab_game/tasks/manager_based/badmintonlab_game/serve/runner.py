@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import math
 import os
 import random
 import signal
@@ -32,8 +33,9 @@ class ServeRunner(OnPolicyRunner):
     FINITE_CHECK_INTERVAL = 50
 
     def __init__(self, env, train_cfg, log_dir=None, device="cpu", time_budget_hours=None, curriculum=None,
-                 stop_after_stage=None):
+                 stop_after_stage=None, std_range=None):
         super().__init__(env, train_cfg, log_dir=log_dir, device=device)
+        self.std_range = std_range
         self.time_budget_s = None if time_budget_hours is None else time_budget_hours * 3600.0
         self.curriculum = curriculum
         self.stop_after_stage = stop_after_stage
@@ -91,10 +93,24 @@ class ServeRunner(OnPolicyRunner):
         if self.writer is not None:
             for key, value in values.items():
                 self.writer.add_scalar(key, value, it)
-        shown = {k: rates[k] for k in ("legal", "crossed", "in", "fault", "no_hit", "tunnel", "fall", "fall_after_hit", "vc_mean", "el_mean", "launch_el_mean")}
+        shown = {k: rates[k] for k in ("legal", "crossed", "in", "fault", "no_hit", "tunnel", "fall", "fall_after_hit", "vc_mean", "el_mean", "launch_el_mean", "launch_v_mean", "pred_in", "land_x_mean", "land_ay_mean", "tof_mean") if k in rates}
         print("[Serve] " + " ".join(f"{k}={v:.3f}" for k, v in {**shown, **params}.items()), flush=True)
 
+    def clamp_std(self) -> None:
+        """Keeps the action noise std in ``std_range`` (scalar or log parameterisation)."""
+        if self.std_range is None:
+            return
+        lo, hi = self.std_range
+        policy = self.alg.policy
+        with torch.no_grad():
+            if getattr(policy, "std", None) is not None and isinstance(policy.std, torch.nn.Parameter):
+                policy.std.clamp_(lo, hi)
+            elif getattr(policy, "log_std", None) is not None:
+                policy.log_std.clamp_(math.log(lo), math.log(hi))
+
     def log(self, locs, *args, **kwargs):
+        # Called after the update of this iteration and before the next rollout.
+        self.clamp_std()
         super().log(locs, *args, **kwargs)
         it = locs["it"]
         self._serve_metrics(it)

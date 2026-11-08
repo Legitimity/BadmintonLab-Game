@@ -119,6 +119,21 @@ BOOSTER_T1_CFG = ArticulationCfg(
     },
 )
 
+ACTUATOR_DELAY_S = (0.010, 0.040)  # min / max actuator delay in seconds (play: 2/8 steps at 5 ms, 10/40 at 1 ms)
+
+
+def actuator_delay_steps(physics_dt: float) -> tuple[int, int]:
+    """Delay bounds in physics steps for a physics step of ``physics_dt`` seconds (always 10-40 ms)."""
+    return round(ACTUATOR_DELAY_S[0] / physics_dt), round(ACTUATOR_DELAY_S[1] / physics_dt)
+
+
+def set_actuator_delays(robot_cfg: ArticulationCfg, physics_dt: float) -> None:
+    """Rewrites every actuator's ``min_delay`` / ``max_delay`` for ``physics_dt``."""
+    lo, hi = actuator_delay_steps(physics_dt)
+    for name, act in list(robot_cfg.actuators.items()):
+        robot_cfg.actuators[name] = act.replace(min_delay=lo, max_delay=hi)
+
+
 T1_ACTION_SCALE = {}
 for a in BOOSTER_T1_CFG.actuators.values():
     e = a.effort_limit_sim

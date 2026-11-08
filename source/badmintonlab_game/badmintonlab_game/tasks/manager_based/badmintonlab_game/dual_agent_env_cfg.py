@@ -9,7 +9,7 @@ from isaaclab.managers import SceneEntityCfg
 from isaaclab.managers import TerminationTermCfg as DoneTerm
 from isaaclab.utils import configclass
 
-from badmintonlab_game.assets.robots.booster import T1_ACTION_SCALE
+from badmintonlab_game.assets.robots.booster import T1_ACTION_SCALE, set_actuator_delays
 
 from . import mdp
 from .badminton_scene_cfg import (
@@ -17,6 +17,29 @@ from .badminton_scene_cfg import (
     _ROBOT_RESET_Y_RANGE,
     DualAgentSceneCfg,
 )
+
+CONTROL_DT = 0.02  # policy step, 50 Hz, for every physics step
+PHYSICS_DTS = (0.001, 0.002, 0.005)
+
+
+def set_physics_dt(cfg, physics_dt: float) -> None:
+    """Physics step of ``cfg`` (play ``a5e0780``: 1 ms, decimation 20, actuator delays 10/40 steps).
+
+    Keeps the 50 Hz control step; the actuator delays stay 10-40 ms; the racket contact history covers one
+    control step (``DualAgentBadmintonEnv`` checks history_length == decimation).
+    """
+    decimation = round(CONTROL_DT / physics_dt)
+    if abs(decimation * physics_dt - CONTROL_DT) > 1e-9:
+        raise ValueError(f"physics_dt {physics_dt} does not divide the control step {CONTROL_DT}")
+    cfg.sim.dt = physics_dt
+    cfg.decimation = decimation
+    cfg.sim.render_interval = decimation
+    for name in ("robot_0", "robot_1"):
+        set_actuator_delays(getattr(cfg.scene, name), physics_dt)
+    for name in ("racket_contact_0", "racket_contact_1"):
+        sensor = getattr(cfg.scene, name, None)
+        if sensor is not None:
+            sensor.history_length = decimation
 
 
 @configclass
