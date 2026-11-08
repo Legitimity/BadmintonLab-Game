@@ -90,6 +90,8 @@ parser.add_argument(
 )
 parser.add_argument("--entropy_coef", type=float, default=None, help="Override algorithm.entropy_coef.")
 parser.add_argument("--save_interval_override", type=int, default=None, help="Checkpoint every N iterations.")
+parser.add_argument("--style", default=None, help="Serve style preset (serve/styles.py), applied before hydra overrides "
+                    "of env.serve_reward and before --stage_weights.")
 parser.add_argument(
     "--std_range",
     default=None,
@@ -112,6 +114,7 @@ from isaaclab_tasks.utils.hydra import hydra_task_config  # noqa: E402
 import badmintonlab_game.tasks  # noqa: E402,F401
 from badmintonlab_game.tasks.manager_based.badmintonlab_game.dual_agent_env_cfg import set_physics_dt  # noqa: E402
 from badmintonlab_game.tasks.manager_based.badmintonlab_game.serve import player_cfg  # noqa: E402
+from badmintonlab_game.tasks.manager_based.badmintonlab_game.serve.styles import style_config  # noqa: E402
 from badmintonlab_game.tasks.manager_based.badmintonlab_game.serve.curriculum import (  # noqa: E402
     ServeCurriculum,
     apply_stage_gates,
@@ -270,6 +273,20 @@ def main(env_cfg, agent_cfg):
     if args_cli.std_range:
         std_range = tuple(float(v) for v in args_cli.std_range.split(","))
     env_cfg.serve_reward.initial_stage = args_cli.stage
+    style = None
+    if args_cli.style:
+        # Hydra overrides were applied to env_cfg already: a style value only replaces a field still at its default.
+        sp, sw = style_config(args_cli.style)
+        defaults = type(env_cfg.serve_reward)()
+        for k, v in sp.items():
+            if not hasattr(env_cfg.serve_reward, k):
+                raise KeyError(f"--style {args_cli.style}: unknown reward parameter {k!r}")
+            if getattr(env_cfg.serve_reward, k) == getattr(defaults, k):
+                setattr(env_cfg.serve_reward, k, v)
+        for stage in STAGE_WEIGHTS:
+            STAGE_WEIGHTS[stage].update(sw)
+        style = dict(name=args_cli.style, params=sp, weights=sw)
+        print(f"[INFO] serve style {args_cli.style}: params {sp}, weights {sw}")
     if args_cli.stage_weights:
         # Before the env is built: the reward computer and the curriculum both read STAGE_WEIGHTS.
         for item in args_cli.stage_weights.split(","):
@@ -318,6 +335,8 @@ def main(env_cfg, agent_cfg):
             decimation=env_cfg.decimation,
             entropy_coef=agent_cfg.algorithm.entropy_coef,
             std_range=std_range,
+            style=style,
+            stage_weights_effective={k: dict(v) for k, v in STAGE_WEIGHTS.items()},
             serve_reward={k: v for k, v in vars(env_cfg.serve_reward).items() if isinstance(v, (int, float, str, bool))},
             num_mini_batches=agent_cfg.algorithm.num_mini_batches,
             samples_per_iteration=2 * env_cfg.scene.num_envs * agent_cfg.num_steps_per_env,

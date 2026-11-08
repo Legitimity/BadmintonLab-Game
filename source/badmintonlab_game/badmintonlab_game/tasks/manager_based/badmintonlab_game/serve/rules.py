@@ -166,9 +166,10 @@ class MatchRules:
 FLIGHT_CHUNK = 10  # integration steps per fused call; one host sync per chunk
 
 
-def _flight_steps(p, v, active, net_z, t, g, drag_over_mass: float, dt: float, net_x: float, floor: float, n: int):
+def _flight_steps(p, v, active, net_z, t, zmax, g, drag_over_mass: float, dt: float, net_x: float, floor: float,
+                  n: int):
     """``n`` midpoint steps. Pure tensor code, so torch.compile fuses it into a few kernels. ``t``: flight time
-    of each row so far (counts the steps while the row is airborne)."""
+    of each row so far (counts the steps while the row is airborne); ``zmax``: apex height so far."""
     for _ in range(n):
         t = t + dt * active.to(t.dtype)
         # Midpoint rule: at dt=0.01 this stays within ~1 cm of a fine integration.
@@ -183,8 +184,9 @@ def _flight_steps(p, v, active, net_z, t, g, drag_over_mass: float, dt: float, n
         a = (net_x - p[:, 0]) / torch.where(crossing, dx, torch.ones_like(dx))
         net_z = torch.where(crossing, p[:, 2] + a * (pn[:, 2] - p[:, 2]), net_z)
         p = pn
+        zmax = torch.where(active, torch.maximum(zmax, p[:, 2]), zmax)
         active = active & (p[:, 2] > floor)
-    return p, v, active, net_z, t
+    return p, v, active, net_z, t, zmax
 
 
 _COMPILED = {"fn": None, "failed": False}
@@ -212,12 +214,14 @@ def predict_flight(
     floor: float = 0.03,
     check_every: int = FLIGHT_CHUNK,
     return_time: bool = False,
+    return_apex: bool = False,
 ):
     """Vectorised flight prediction in the canonical frame (the striker is at x<0).
 
     Returns ``(net_z, landing_xy)``. ``net_z`` is ``-inf`` if the shuttle never crosses
     the net plane going forward. Same drag law as ``_apply_shuttle_forces``. With ``return_time`` also the
-    flight time to the landing (to ``max_steps * dt`` for a row still airborne), resolution ``dt``.
+    flight time to the landing (to ``max_steps * dt`` for a row still airborne), resolution ``dt``. With
+    ``return_apex`` (implies the time) also the apex height (at least the start height).
 
     Steps after every row has landed are no-ops, so checking for that only every ``check_every``
     steps gives the same result as checking at every step, with one host sync per chunk.
@@ -232,8 +236,11 @@ def predict_flight(
     if rows == 1:
         active[1] = False
     t = torch.zeros(p.shape[0], device=p.device, dtype=p.dtype)
+    zmax = p[:, 2].clone()
     g = torch.tensor((0.0, 0.0, -gravity), device=p.device, dtype=p.dtype)
     if rows == 0:
+        if return_apex:
+            return net_z, p[:, :2], t, zmax
         return (net_z, p[:, :2], t) if return_time else (net_z, p[:, :2])
     chunk = _chunk_fn(p.device) if check_every == FLIGHT_CHUNK else _flight_steps
     done = 0
@@ -243,15 +250,19 @@ def predict_flight(
         n = min(check_every, max_steps - done)
         fn = chunk if n == FLIGHT_CHUNK else _flight_steps
         try:
-            p, v, active, net_z, t = fn(p, v, active, net_z, t, g, float(drag_over_mass), float(dt), float(net_x), float(floor), n)
+            p, v, active, net_z, t, zmax = fn(p, v, active, net_z, t, zmax, g, float(drag_over_mass), float(dt),
+                                              float(net_x), float(floor), n)
         except Exception as exc:  # compile problems must not stop training
             if fn is _flight_steps:
                 raise
             print(f"[predict_flight] torch.compile failed ({exc!r}); using eager", flush=True)
             _COMPILED["failed"] = True
             chunk = _flight_steps
-            p, v, active, net_z, t = _flight_steps(p, v, active, net_z, t, g, float(drag_over_mass), float(dt), float(net_x), float(floor), n)
+            p, v, active, net_z, t, zmax = _flight_steps(p, v, active, net_z, t, zmax, g, float(drag_over_mass),
+                                                         float(dt), float(net_x), float(floor), n)
         done += n
+    if return_apex:
+        return net_z[:rows], p[:rows, :2], t[:rows], zmax[:rows]
     if return_time:
         return net_z[:rows], p[:rows, :2], t[:rows]
     return net_z[:rows], p[:rows, :2]

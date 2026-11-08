@@ -40,8 +40,12 @@ TERMS = (
     "tunnel",
     "launch_dir",
     "flight_time",
+    "land_target",
+    "net_clear",
+    "apex",
 )
-POSITIVE_TERMS = ("legal_contact", "swing_speed", "face_quality", "outcome_pred", "launch_dir", "flight_time")
+POSITIVE_TERMS = ("legal_contact", "swing_speed", "face_quality", "outcome_pred", "launch_dir", "flight_time",
+                  "land_target", "net_clear", "apex")
 DENSE_TERMS = ("hold_ready", "post_stand")  # per second; everything else is a one-step event
 EVENT_TERMS = tuple(t for t in TERMS if t not in DENSE_TERMS)
 STAT_KEYS = (
@@ -73,6 +77,11 @@ STAT_KEYS = (
     "land_x_sum",
     "land_ay_sum",
     "tof_sum",
+    # Serve styles: signed landing y, net clearance and apex of the predicted-in serves; land_target score.
+    "land_y_sum",
+    "clear_sum",
+    "apex_sum",
+    "land_score_sum",
 )
 
 
@@ -115,6 +124,22 @@ class ServeRewardParams:
     # predicted landing, only for a serve predicted in.
     flight_time_ref: float = 1.6
     flight_time_scale: float = 0.6
+    # Serve styles (P3_SERVE_STYLES 3). outcome_land_mix: share of the x-landing factor in outcome_score (0.5 = V3;
+    # 0 keeps only the net margin and the out guards).
+    outcome_land_mix: float = 0.5
+    # land_target: 0.5 exp(-(d/land_sigma)^2) + 0.5 exp(-d/land_tail), d = distance to (land_x_t, land_y_t) in the
+    # canonical frame (signed y; land_abs_y compares |y|), times the out guards.
+    land_x_t: float = 1.6
+    land_y_t: float = 0.0
+    land_abs_y: bool = False
+    land_sigma: float = 0.6
+    land_tail: float = 2.0
+    # net_clear: exp(-((clearance - net_clear_t) / net_clear_sigma)^2), clearance over net_height; 0 below the net.
+    net_clear_t: float = 0.15
+    net_clear_sigma: float = 0.25
+    # apex: sign * (apex - start height) / apex_scale clamped to [0, 1]; sign +1 rewards a high arc, -1 a flat one.
+    apex_sign: float = 1.0
+    apex_scale: float = 2.0
     net_height: float = 1.55  # conservative: the edge height
     net_margin: float = 0.20
     net_scale: float = 0.5
@@ -154,14 +179,14 @@ class ServeRewardParams:
 STAGE_WEIGHTS = {
     "A": dict(hold_ready=-0.5, legal_contact=2.0, swing_speed=0.5, face_quality=0.5, outcome_pred=2.0,
               serve_fault=-5.0, no_hit=-3.0, fall=-10.0, serve_result=10.0, post_stand=1.0, tunnel=-1.0,
-              launch_dir=1.0, flight_time=0.0),
+              launch_dir=1.0, flight_time=0.0, land_target=0.0, net_clear=0.0, apex=0.0),
     "B": dict(hold_ready=-0.2, legal_contact=1.0, swing_speed=1.5, face_quality=1.0, outcome_pred=4.0,
               serve_fault=-5.0, no_hit=-3.0, fall=-10.0, serve_result=10.0, post_stand=1.0, tunnel=-2.0,
-              launch_dir=2.0, flight_time=0.0),
+              launch_dir=2.0, flight_time=0.0, land_target=0.0, net_clear=0.0, apex=0.0),
     # flight_time: 0 in P3; P3_FINETUNE_DT1MS F2 sets C.flight_time=1.0 with --stage_weights.
     "C": dict(hold_ready=-0.1, legal_contact=0.5, swing_speed=1.0, face_quality=0.5, outcome_pred=4.0,
               serve_fault=-5.0, no_hit=-3.0, fall=-10.0, serve_result=10.0, post_stand=0.5, tunnel=-2.0,
-              launch_dir=1.0, flight_time=0.0),
+              launch_dir=1.0, flight_time=0.0, land_target=0.0, net_clear=0.0, apex=0.0),
 }
 
 
@@ -232,7 +257,8 @@ def outcome_score(net_z, landing_xy, p: ServeRewardParams) -> torch.Tensor:
     s1 = torch.exp(-torch.clamp(p.net_margin - clearance, min=0.0) / p.net_scale)
     s1 = torch.where(torch.isfinite(net_z), s1, torch.zeros_like(s1))
     s3 = landing_score(landing_xy, p)
-    return s1 * (0.5 + 0.5 * s3) * outcome_guard(landing_xy, p)
+    mix = p.outcome_land_mix
+    return s1 * ((1.0 - mix) + mix * s3) * outcome_guard(landing_xy, p)
 
 
 def landing_score(landing_xy, p: ServeRewardParams) -> torch.Tensor:
@@ -249,6 +275,31 @@ def predicted_in(net_z, landing_xy, p: ServeRewardParams, court_half_length: flo
     x, y = landing_xy[..., 0], landing_xy[..., 1]
     over = torch.isfinite(net_z) & (net_z > p.net_height)
     return over & (x > 0.0) & (x < court_half_length) & (y.abs() < court_half_width)
+
+
+def land_target_score(landing_xy, p: ServeRewardParams, net_z: torch.Tensor | None = None) -> torch.Tensor:
+    """``land_target`` in [0, 1]: Gaussian core plus a Laplace tail (gradient at any distance), out guards applied.
+
+    With ``net_z`` the score is 0 unless the shuttle clears the net edge (a net ball near a short target pays nothing).
+    """
+    y = landing_xy[..., 1].abs() if p.land_abs_y else landing_xy[..., 1]
+    d = torch.sqrt((landing_xy[..., 0] - p.land_x_t) ** 2 + (y - p.land_y_t) ** 2)
+    core = torch.exp(-((d / p.land_sigma) ** 2))
+    tail = torch.exp(-d / p.land_tail)
+    s = (0.5 * core + 0.5 * tail) * outcome_guard(landing_xy, p)
+    if net_z is not None:
+        s = torch.where(torch.isfinite(net_z) & (net_z > p.net_height), s, torch.zeros_like(s))
+    return s
+
+
+def net_clear_score(net_z, p: ServeRewardParams) -> torch.Tensor:
+    c = net_z - p.net_height
+    s = torch.exp(-(((c - p.net_clear_t) / p.net_clear_sigma) ** 2))
+    return torch.where(torch.isfinite(net_z) & (c > 0.0), s, torch.zeros_like(s))
+
+
+def apex_score(apex, z0, p: ServeRewardParams) -> torch.Tensor:
+    return torch.clamp(p.apex_sign * (apex - z0) / p.apex_scale, 0.0, 1.0)
 
 
 def flight_time_score(tof, p: ServeRewardParams) -> torch.Tensor:
@@ -463,12 +514,17 @@ class ServeRewardComputer:
         land_xy = torch.zeros(n, 2, device=self.device)
         tof = torch.zeros(n, device=self.device)
         tof_r = torch.zeros(n, device=self.device)
+        land_r = torch.zeros(n, device=self.device)
+        clear_r = torch.zeros(n, device=self.device)
+        apex_r = torch.zeros(n, device=self.device)
+        clear = torch.zeros(n, device=self.device)
+        apex_h = torch.zeros(n, device=self.device)
         if bool(due.any()):
             ids = due.nonzero(as_tuple=False).squeeze(-1)
             pos_c = to_canonical(s.shuttle_pos[ids], server[ids])
             vel_c = to_canonical(s.shuttle_vel[ids], server[ids])
-            net_z, land, t_rest = predict_flight(pos_c, vel_c, p.drag_over_mass, p.gravity, dt=p.flight_dt,
-                                                 max_steps=int(4.0 / p.flight_dt), return_time=True)
+            net_z, land, t_rest, zmax = predict_flight(pos_c, vel_c, p.drag_over_mass, p.gravity, dt=p.flight_dt,
+                                                       max_steps=int(4.0 / p.flight_dt), return_apex=True)
             score[ids] = outcome_pred_score(net_z, land, p)
             launch[ids], launch_el[ids] = launch_score(vel_c, p)
             launch_v[ids] = vel_c.norm(dim=-1)
@@ -476,9 +532,17 @@ class ServeRewardComputer:
             ok = predicted_in(net_z, land, p)
             p_in[ids], land_xy[ids], tof[ids] = ok, land, t_hit
             tof_r[ids] = flight_time_score(t_hit, p) * ok.float()
+            land_r[ids] = land_target_score(land, p, net_z)
+            clear_r[ids] = net_clear_score(net_z, p)
+            apex_r[ids] = apex_score(zmax, pos_c[:, 2], p) * ok.float()
+            clear[ids] = torch.where(torch.isfinite(net_z), net_z - p.net_height, torch.zeros_like(net_z))
+            apex_h[ids] = zmax
         role_vals["outcome_pred"][:, 0] = w["outcome_pred"] * score
         role_vals["launch_dir"][:, 0] = w["launch_dir"] * launch
         role_vals["flight_time"][:, 0] = w["flight_time"] * tof_r
+        role_vals["land_target"][:, 0] = w["land_target"] * land_r
+        role_vals["net_clear"][:, 0] = w["net_clear"] * clear_r
+        role_vals["apex"][:, 0] = w["apex"] * apex_r
         self.outcome_pending = server_hit_now.clone()
 
         # Positive cap per rally, applied to the weighted positive terms together.
@@ -545,7 +609,7 @@ class ServeRewardComputer:
 
         self.done_now = s.just_resolved | return_now | self.fall_done
         self._stats(s, contact, score, due, success, return_now, tunnel, server_down, launch_el,
-                    (launch_v, p_in, land_xy, tof))
+                    (launch_v, p_in, land_xy, tof, clear, apex_h, land_r))
         self.tunnel_now.zero_()
 
     # ------------------------------------------------------------------ bookkeeping
@@ -592,8 +656,12 @@ class ServeRewardComputer:
             "launch_n": f(due),
         }
         if flight is not None:
-            launch_v, p_in, land_xy, tof = flight
+            launch_v, p_in, land_xy, tof = flight[:4]
             p_in = p_in & due
+            if len(flight) > 4:
+                clear, apex_h, land_r = flight[4:]
+                add.update(land_y_sum=(land_xy[:, 1] * p_in.float()).sum(), clear_sum=(clear * p_in.float()).sum(),
+                           apex_sum=(apex_h * p_in.float()).sum(), land_score_sum=(land_r * due.float()).sum())
             add.update(launch_v_sum=(launch_v * due.float()).sum(), pred_in_n=f(p_in),
                        land_x_sum=(land_xy[:, 0] * p_in.float()).sum(),
                        land_ay_sum=(land_xy[:, 1].abs() * p_in.float()).sum(), tof_sum=(tof * p_in.float()).sum())
@@ -625,7 +693,8 @@ class ServeRewardComputer:
         r = max(c["rallies"], 1.0)
         k = max(c["contacts"], 1.0)
         means = ("vn_sum", "el_sum", "hd_abs_sum", "outcome_sum", "vc_sum", "launch_el_sum", "launch_n",
-                 "launch_v_sum", "pred_in_n", "land_x_sum", "land_ay_sum", "tof_sum")
+                 "launch_v_sum", "pred_in_n", "land_x_sum", "land_ay_sum", "tof_sum", "land_y_sum", "clear_sum",
+                 "apex_sum", "land_score_sum")
         out = {key: c[key] / r for key in STAT_KEYS if key not in ("rallies", "contacts", *means)}
         out["fault"] = out["height"] + out["double"]
         out["tunnel"] = out.pop("tunnel_n")
@@ -636,7 +705,11 @@ class ServeRewardComputer:
                    land_x_mean=c.get("land_x_sum", 0.0) / max(c.get("pred_in_n", 0.0), 1.0),
                    land_ay_mean=c.get("land_ay_sum", 0.0) / max(c.get("pred_in_n", 0.0), 1.0),
                    tof_mean=c.get("tof_sum", 0.0) / max(c.get("pred_in_n", 0.0), 1.0),
-                   pred_in=c.get("pred_in_n", 0.0) / max(c.get("launch_n", 0.0), 1.0))
+                   pred_in=c.get("pred_in_n", 0.0) / max(c.get("launch_n", 0.0), 1.0),
+                   land_y_mean=c.get("land_y_sum", 0.0) / max(c.get("pred_in_n", 0.0), 1.0),
+                   clear_mean=c.get("clear_sum", 0.0) / max(c.get("pred_in_n", 0.0), 1.0),
+                   apex_mean=c.get("apex_sum", 0.0) / max(c.get("pred_in_n", 0.0), 1.0),
+                   land_score_mean=c.get("land_score_sum", 0.0) / max(c.get("launch_n", 0.0), 1.0))
         return out
 
     def pop_iteration(self) -> dict:

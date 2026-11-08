@@ -40,7 +40,23 @@ ap.add_argument("--rallies", type=int, default=2,
 ap.add_argument("--done_file", required=True)
 ap.add_argument("--poll_s", type=float, default=60.0)
 ap.add_argument("--no_stop", action="store_true")
+ap.add_argument("--stop_drop", type=float, default=0.04, help="f2: degraded when in < ref - stop_drop twice in a row.")
+ap.add_argument("--style", default=None,
+                help="P3_SERVE_STYLES: select by the style (flight_time > 0: shortest median flight time; otherwise the "
+                     "median landing closest to (land_x_t, land_y_t)) instead of the receiver-racket distance.")
 args = ap.parse_args()
+
+
+def load_style(name):
+    import importlib.util
+    path = os.path.join(args.repo, "source/badmintonlab_game/badmintonlab_game/tasks/manager_based/badmintonlab_game/serve/styles.py")
+    spec = importlib.util.spec_from_file_location("_styles", path)
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    return mod.style_config(name)
+
+
+STYLE = load_style(args.style) if args.style else None
 
 os.makedirs(args.out, exist_ok=True)
 STATE = os.path.join(args.out, "state.json")
@@ -126,13 +142,33 @@ def evaluate(it, ckpt):
                **{k: round(v, 4) for k, v in pooled.items()})
     # Medians of the in serves, averaged over the two sides (each side's p50 weighted by its count).
     qual = {}
-    for k in ("land_x", "land_ay", "tof", "v_close", "exit_v", "exit_el", "d_recv_racket"):
+    for k in ("land_x", "land_ay", "land_y", "tof", "v_close", "exit_v", "exit_el", "d_recv_racket"):
         parts = [((s.get("quality") or {}).get(k) or {}) for s in sides]
         parts = [p for p in parts if p.get("n")]
         if parts:
             qual[k] = round(sum(p["p50"] * p["n"] for p in parts) / sum(p["n"] for p in parts), 3)
     res["q50"] = qual
+    if STYLE is not None and "land_x" in qual and "land_y" in qual:
+        sp = STYLE[0]
+        res["d_target"] = round(((qual["land_x"] - sp["land_x_t"]) ** 2 + (qual["land_y"] - sp["land_y_t"]) ** 2) ** 0.5, 3)
     return res
+
+
+def style_select(cand):
+    """(chosen eval, metric name, value): flight-time styles minimise tof (within 0.05 s: the higher in), landing
+    styles minimise d_target (within 0.2 m: the higher in)."""
+    if STYLE[1].get("flight_time", 0.0) > 0.0:
+        cand = [e for e in cand if "tof" in e.get("q50", {})]
+        key, tol, get = "tof", 0.05, (lambda e: e["q50"]["tof"])
+    else:
+        cand = [e for e in cand if "d_target" in e]
+        key, tol, get = "d_target", 0.2, (lambda e: e["d_target"])
+    if not cand:
+        return None, key, None
+    vmin = min(get(e) for e in cand)
+    near = [e for e in cand if get(e) <= vmin + tol]
+    c = max(near, key=lambda e: (e["served_in_standing"], -get(e)))
+    return c, key, get(c)
 
 
 def valid(e):
@@ -169,8 +205,9 @@ def check_rules(st):
         if ins[best_at] >= args.base + 0.03 and len(ins) - 1 - best_at >= 2:
             request_stop(st, f"f1_converged: best {ins[best_at]:.3f} at {evals[best_at]['it']}, two evals without a new best")
     if args.mode == "f2" and args.ref is not None:
-        if len(ins) >= 2 and ins[-1] < args.ref - 0.04 and ins[-2] < args.ref - 0.04:
-            request_stop(st, f"f2_degraded: {ins[-2]:.3f}, {ins[-1]:.3f} < ref {args.ref:.3f} - 0.04")
+        lim = args.ref - args.stop_drop
+        if len(ins) >= 2 and ins[-1] < lim and ins[-2] < lim:
+            request_stop(st, f"f2_degraded: {ins[-2]:.3f}, {ins[-1]:.3f} < ref {args.ref:.3f} - {args.stop_drop}")
 
 
 def main():
@@ -193,7 +230,8 @@ def main():
                     st["evals"][str(it)] = res
                     say(f"eval {it}: in {res['served_in_standing']:.3f} (sides {res['side_in']}) fault {res['fault']:.3f} "
                         f"no_hit {res['no_hit']:.3f} net {res['net']:.3f} out {res['out']:.3f} "
-                        f"fell_after_hit {res['fell_after_hit']:.3f} n {res['rallies']} q50 {res['q50']} ({res['wall_s']} s)")
+                        f"fell_after_hit {res['fell_after_hit']:.3f} n {res['rallies']} q50 {res['q50']} "
+                        f"d_target {res.get('d_target')} ({res['wall_s']} s)")
                 ok = [e for e in st["evals"].values() if not e.get("failed") and valid(e)]
                 if ok:
                     b = max(ok, key=lambda e: e["served_in_standing"])
@@ -201,7 +239,14 @@ def main():
                     # Section 4.5 (revised): in >= select_floor, then the largest landing-to-racket distance
                     # (within 0.2 m: the higher in).
                     floor = args.select_floor
-                    cand = [e for e in ok if e["served_in_standing"] >= floor and "d_recv_racket" in e.get("q50", {})]
+                    if STYLE is not None:
+                        c, key, val = style_select([e for e in ok if e["served_in_standing"] >= floor])
+                        if c is not None:
+                            st["select"] = {"it": c["it"], "in": c["served_in_standing"], key: val, "ckpt": c["ckpt"],
+                                            "export": c["export"]}
+                        cand = []
+                    else:
+                        cand = [e for e in ok if e["served_in_standing"] >= floor and "d_recv_racket" in e.get("q50", {})]
                     if cand:
                         dmax = max(e["q50"]["d_recv_racket"] for e in cand)
                         near = [e for e in cand if e["q50"]["d_recv_racket"] >= dmax - 0.2]

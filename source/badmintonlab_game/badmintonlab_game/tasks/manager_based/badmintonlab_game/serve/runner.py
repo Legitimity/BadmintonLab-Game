@@ -93,7 +93,8 @@ class ServeRunner(OnPolicyRunner):
         if self.writer is not None:
             for key, value in values.items():
                 self.writer.add_scalar(key, value, it)
-        shown = {k: rates[k] for k in ("legal", "crossed", "in", "fault", "no_hit", "tunnel", "fall", "fall_after_hit", "vc_mean", "el_mean", "launch_el_mean", "launch_v_mean", "pred_in", "land_x_mean", "land_ay_mean", "tof_mean") if k in rates}
+        shown = {k: rates[k] for k in ("legal", "crossed", "in", "fault", "no_hit", "tunnel", "fall", "fall_after_hit", "vc_mean", "el_mean", "launch_el_mean", "launch_v_mean", "pred_in", "land_x_mean", "land_ay_mean", "tof_mean", "land_y_mean",
+                                        "clear_mean", "apex_mean", "land_score_mean") if k in rates}
         print("[Serve] " + " ".join(f"{k}={v:.3f}" for k, v in {**shown, **params}.items()), flush=True)
 
     def clamp_std(self) -> None:
