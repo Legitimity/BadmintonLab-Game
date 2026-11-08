@@ -47,6 +47,7 @@ parser.add_argument("--init_from", default=None, help="S2: checkpoint of the pas
 parser.add_argument("--dt_ms", type=int, default=1, help="physics step in ms (1 = play a5e0780)")
 parser.add_argument("--s2_anneal", type=int, default=1000, help="earliest S2 gate iteration")
 parser.add_argument("--s2_tau", type=float, default=220.0, help="sigma annealing time constant")
+parser.add_argument("--no_stop_on_pass", action="store_true", help="keep training after the stage gate passes")
 parser.add_argument("--s2_other_std", type=float, default=0.3, help="S2 start: raise non-leg std to at least this.")
 cli_args.add_rsl_rl_args(parser)
 AppLauncher.add_app_launcher_args(parser)
@@ -138,6 +139,7 @@ def main(env_cfg, agent_cfg):
         runner = ReceiveRunner(wrapped, agent_cfg.to_dict(), log_dir=log_dir, device=agent_cfg.device,
                                time_budget_hours=args_cli.time_budget_hours, curriculum=cur, leg_mask=leg_mask,
                                critic_warmup=0 if resume_path else args_cli.critic_warmup)  # fmt: skip
+        runner.stop_on_pass = not args_cli.no_stop_on_pass
         runner.install_signal_handlers()
         if resume_path:
             print(f"[INFO] Resuming from {resume_path}")

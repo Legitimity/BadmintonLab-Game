@@ -159,7 +159,7 @@ class ReceiveRunner(ServeRunner):
             flush=True,
         )
         super().log(locs, *args, **kwargs)
-        if cur is not None and cur.passed:
+        if cur is not None and cur.passed and getattr(self, "stop_on_pass", True):
             self.stop_reason = f"passed_{getattr(cur, 'stage', 'S1')}"
             raise StopTraining
         if cur is not None and cur.stop_reason:
