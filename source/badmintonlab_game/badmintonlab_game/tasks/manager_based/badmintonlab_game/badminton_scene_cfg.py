@@ -28,7 +28,7 @@ def _racket_sensor(side: int, *, ground: bool = False) -> ContactSensorCfg:
     target = "/World/ground/terrain/GroundPlane/CollisionPlane" if ground else "{ENV_REGEX_NS}/Shuttle"
     return ContactSensorCfg(
         prim_path=f"{{ENV_REGEX_NS}}/Robot{side}/racket_link",
-        history_length=4,
+        history_length=20,  # = decimation (1 ms physics)
         track_air_time=False,
         force_threshold=1.0,
         filter_prim_paths_expr=[target],

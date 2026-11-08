@@ -324,9 +324,9 @@ class DualAgentBadmintonEnvCfg(ManagerBasedRLEnvCfg):
     process_reward_cap: int = 4
 
     def __post_init__(self):
-        self.decimation = 4
+        self.decimation = 20  # play a5e0780: 1 ms physics, 50 Hz control
         self.episode_length_s = 10.0
-        self.sim.dt = 0.005
+        self.sim.dt = 0.001
         self.sim.render_interval = self.decimation
         self.viewer.origin_type = "world"
         self.viewer.eye = (7.0, -9.0, 5.0)

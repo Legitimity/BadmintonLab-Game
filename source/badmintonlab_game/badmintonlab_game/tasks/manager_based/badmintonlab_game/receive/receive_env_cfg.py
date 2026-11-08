@@ -99,6 +99,7 @@ class ReceiveEnvCfg(ServeEnvCfg):
     ball_timeout_s: float = 2.5
     z_ready: float = 0.68
     fall_height: float = 0.45
+    swing_v_cap: float = 8.0  # S2 r_v input cap, m/s (V3.1 had 3.5 as a 5 ms tunnelling guard)
 
     def __post_init__(self):
         super().__post_init__()

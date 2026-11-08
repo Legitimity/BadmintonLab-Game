@@ -100,6 +100,8 @@ class ReceiveRunner(ServeRunner):
         self._actor_snapshot = None
 
     def snapshot_actor(self) -> None:
+        """Critic-only warm-up for ``critic_warmup`` iterations counted from now (also after loading S1)."""
+        self._warmup_from = int(self.current_learning_iteration)
         pol = self.alg.policy
         self._actor_snapshot = (
             {k: v.detach().clone() for k, v in pol.actor.state_dict().items()},
@@ -115,7 +117,7 @@ class ReceiveRunner(ServeRunner):
     def log(self, locs, *args, **kwargs):
         it = locs["it"]
         pol = self.alg.policy
-        if self._actor_snapshot is not None and self.critic_warmup > 0 and it < self.critic_warmup:
+        if self._actor_snapshot is not None and self.critic_warmup > 0 and it < getattr(self, "_warmup_from", 0) + self.critic_warmup:
             self._restore_actor()  # critic-only warm-up: the actor (and its noise) stay at p3_final
         else:
             core.clamp_log_std(pol.log_std.data, self.leg_mask)
@@ -126,6 +128,7 @@ class ReceiveRunner(ServeRunner):
             cur.update(it, rates)
             if cur.level != unwrapped.level:
                 unwrapped.set_level(cur.level)
+            self.apply_recv_params()
             for event in cur.events:
                 print(f"[Curriculum] {event} at iteration {it}", flush=True)
                 if self.log_dir is not None:
@@ -141,6 +144,14 @@ class ReceiveRunner(ServeRunner):
                 if isinstance(v, float) and math.isnan(v):
                     continue
                 self.writer.add_scalar(k, v, it)
+        if getattr(cur, "stage", "S1") == "S2":
+            p = cur.params()
+            print(
+                f"[S2] it={cur.iters_in_stage} sp={p['sigma_p']:.3f} sr={p['sigma_r']:.2f} "
+                + " ".join(f"{k}={rates[k]:.3f}" for k in ("hit", "ret_in", "ret_net", "ret_out", "epos_p50", "eori_deg", "vn_mean", "swing_mean"))
+                + " | " + " ".join(f"L{i}={rates[f'L{i}_hit']:.2f}" for i in range(4)),
+                flush=True,
+            )
         print(
             "[Recv] lvl={} ".format(unwrapped.level)
             + " ".join(f"{k}={rates[k]:.3f}" for k in ("station_ok", "face_ok", "d_mean", "d_p50", "head_deg", "v_to_station", "fall", "touch"))
@@ -149,11 +160,21 @@ class ReceiveRunner(ServeRunner):
         )
         super().log(locs, *args, **kwargs)
         if cur is not None and cur.passed:
-            self.stop_reason = "passed_S1"
+            self.stop_reason = f"passed_{getattr(cur, 'stage', 'S1')}"
             raise StopTraining
         if cur is not None and cur.stop_reason:
             self.stop_reason = cur.stop_reason
             raise StopTraining
+
+    def apply_recv_params(self) -> None:
+        """S2: push the blended weights and annealed tolerances into the env (S1 uses the env defaults)."""
+        cur = self.recv_curriculum
+        if cur is None or getattr(cur, "stage", "S1") != "S2":
+            return
+        p = cur.params()
+        u = self.env.unwrapped
+        u.set_stage("S2")
+        u.set_stage_params(p["weights"], p["sigma_p"], p["sigma_r"])
 
     def _infos(self) -> dict:
         out = super()._infos()
@@ -162,7 +183,15 @@ class ReceiveRunner(ServeRunner):
 
     def load(self, path, load_optimizer=True, map_location=None):
         infos = super().load(path, load_optimizer=load_optimizer, map_location=map_location)
-        if infos and infos.get("recv_curriculum") and self.recv_curriculum is not None:
-            self.recv_curriculum.load_state_dict(infos["recv_curriculum"])
-            self.env.unwrapped.set_level(self.recv_curriculum.level)
+        cur = self.recv_curriculum
+        state = (infos or {}).get("recv_curriculum")
+        if state and cur is not None:
+            # Starting S2 from an S1 checkpoint: keep the fresh S2 curriculum (and its uniform feeds).
+            if state.get("stage", "S1") == getattr(cur, "stage", "S1"):
+                cur.load_state_dict(state)
+            else:
+                print(f"[INFO] checkpoint curriculum stage {state.get('stage', 'S1')} != {cur.stage}: starting {cur.stage} fresh", flush=True)
+        if cur is not None:
+            self.env.unwrapped.set_level(cur.level)
+            self.apply_recv_params()
         return infos

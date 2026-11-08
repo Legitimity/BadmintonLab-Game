@@ -105,6 +105,57 @@ def r_track(d: torch.Tensor) -> torch.Tensor:
     return torch.exp(-4.0 * (d - 0.3).clamp(min=0.0))
 
 
+# ------------------------------------------------------------------ S2 (paper eq. (2), (3))
+def target_normal(elev_deg: float = 50.0, device="cpu") -> torch.Tensor:
+    """n* for side 0: facing the net (+x), tilted up by ``elev_deg``."""
+    e = math.radians(elev_deg)
+    return torch.tensor((math.cos(e), 0.0, math.sin(e)), device=device)
+
+
+def quat_axes_xy(q: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+    """Body x and y axes in the world frame; quaternions (w, x, y, z)."""
+    w, x, y, z = q.unbind(-1)
+    ax = torch.stack((1 - 2 * (y * y + z * z), 2 * (x * y + w * z), 2 * (x * z - w * y)), dim=-1)
+    ay = torch.stack((2 * (x * y - w * z), 1 - 2 * (x * x + z * z), 2 * (y * z + w * x)), dim=-1)
+    return ax, ay
+
+
+def face_error(normal: torch.Tensor, n_star: torch.Tensor) -> torch.Tensor:
+    """Angle (rad) between the racket plate normal and n*. The plate has two faces, so |cos| is used."""
+    c = (normal * n_star).sum(-1).abs().clamp(max=1.0)
+    return torch.acos(c)
+
+
+def r_swing(e_pos: torch.Tensor, e_ori: torch.Tensor, v_n: torch.Tensor, sigma_p: float, sigma_r: float,
+            sigma_v: float = 3.0, v_cap: float = 8.0, w_v: float = 0.3) -> torch.Tensor:
+    """Paper eq. (2): exp(-|e_pos|^2/sp) exp(-e_ori/sr) + 0.3 (1 - exp(-max(0, v.n*)/sv)).
+
+    ``e_pos``: (N,) distance sweet spot - hitting target, m. ``v_n``: sweet-spot speed along n*.
+    ``v_cap`` (11-08, 1 ms physics): the old 3.5 m/s cap was a tunnelling guard (closing speed >6.4 m/s
+    passed through the plate at 5 ms); at 1 ms that limit is gone, so the cap only bounds outliers.
+    """
+    pose = torch.exp(-(e_pos**2) / sigma_p) * torch.exp(-e_ori / sigma_r)
+    v = v_n.clamp(min=0.0, max=v_cap)
+    return pose + w_v * (1.0 - torch.exp(-v / sigma_v))
+
+
+def r_racket_style(axis_y: torch.Tensor) -> torch.Tensor:
+    """Paper eq. (3): (y_ee . y_world)^2, y_ee = plate short edge (URDF box 0.01 x 0.14 x 0.2: y)."""
+    return axis_y[..., 1] ** 2
+
+
+def anneal(it: int, start: float, end: float, n: int) -> float:
+    """Linear from ``start`` (it = 0) to ``end`` (it >= n)."""
+    a = min(max(it / max(n, 1), 0.0), 1.0)
+    return start + a * (end - start)
+
+
+def blend_weights(a: dict, b: dict, alpha: float) -> dict:
+    alpha = min(max(alpha, 0.0), 1.0)
+    keys = set(a) | set(b)
+    return {k: (1 - alpha) * a.get(k, 0.0) + alpha * b.get(k, 0.0) for k in keys}
+
+
 @dataclass
 class FeederTable:
     launch_pos: torch.Tensor
@@ -154,10 +205,22 @@ def build_feeder_table(
 
 
 LEVEL_EDGES = (0.4, 0.8, 1.4, float("inf"))
+LEVEL_ALL = 4  # uniform over the whole filtered table (the paper samples the filtered set uniformly)
+
+
+def ball_level(d_need: torch.Tensor) -> torch.Tensor:
+    """Distance band 0-3 of each feed (L0 <0.4, L1 <0.8, L2 <1.4, L3 >=1.4 m)."""
+    edges = torch.tensor(LEVEL_EDGES[:-1], device=d_need.device, dtype=d_need.dtype)
+    return torch.bucketize(d_need, edges, right=True)
 
 
 def level_bounds(table: FeederTable, level: int) -> tuple[int, int]:
-    """(lo, hi): rows [lo, hi) have this level's d_need band; rows [0, lo) are the easier levels."""
+    """(lo, hi): rows [lo, hi) have this level's d_need band; rows [0, lo) are the easier levels.
+
+    Note: at L3 80% of the feeds are >= 1.4 m away (the S1 gate was judged on that mix, not on the
+    natural distribution). ``LEVEL_ALL`` returns (0, len): uniform over the table."""
+    if level == LEVEL_ALL:
+        return 0, len(table)
     d = table.d_need
     lo = 0 if level == 0 else int(torch.searchsorted(d, torch.tensor([LEVEL_EDGES[level - 1]], device=d.device)).item())
     edge = LEVEL_EDGES[level]
@@ -254,6 +317,83 @@ class ReceiveCurriculum:
         return {k: getattr(self, k) for k in keys}
 
     def load_state_dict(self, state: dict) -> None:
+        for k, v in state.items():
+            setattr(self, k, v)
+
+
+@dataclass
+class S2Curriculum:
+    """Stage S2, precision-guided swing (paper IV-A stage 2; P5 V3.1 5.2, 11-08 revision).
+
+    - reward weights blend S1 -> S2 over ``blend_iters``;
+    - sigma_p 2.0 -> 0.1, sigma_r 8.0 -> 1.0 linearly over ``anneal_iters`` (paper: "progressively tighten");
+    - feeds uniform over the filtered table (``LEVEL_ALL``; the paper samples targets uniformly, no distance
+      curriculum);
+    - gate (EMA): hit rate >= ``gate_hit``, hit-instant sweet-spot error p50 < ``gate_epos``, falls per ball
+      < ``gate_fall``; only after the annealing has finished (judged at the final tolerances).
+    """
+
+    s1_weights: dict = field(default_factory=dict)
+    s2_weights: dict = field(default_factory=dict)
+    stage: str = "S2"
+    level: int = LEVEL_ALL
+    blend_iters: int = 300
+    anneal_iters: int = 2000
+    sigma_p: tuple = (2.0, 0.1)
+    sigma_r: tuple = (8.0, 1.0)
+    gate_ema: int = 200
+    gate_min: int = 500
+    gate_max: int = 4000
+    gate_hit: float = 0.4
+    gate_epos: float = 0.15
+    gate_fall: float = 0.03
+    iters_in_stage: int = 0
+    ema: dict = field(default_factory=dict)
+    passed: bool = False
+    stop_reason: str | None = None
+    history: list = field(default_factory=list)
+    events: list = field(default_factory=list)
+
+    def params(self) -> dict:
+        it = self.iters_in_stage
+        return dict(
+            weights=blend_weights(self.s1_weights, self.s2_weights, it / max(self.blend_iters, 1)),
+            sigma_p=anneal(it, *self.sigma_p, self.anneal_iters),
+            sigma_r=anneal(it, *self.sigma_r, self.anneal_iters),
+        )
+
+    def update(self, iteration: int, rates: dict) -> None:
+        self.events = []
+        self.iters_in_stage += 1
+        ReceiveCurriculum._ema(self.ema, rates, self.gate_ema)
+        e = self.ema
+        ready = self.iters_in_stage >= max(self.gate_min, self.anneal_iters)
+        if ready and not self.passed and (
+            e.get("hit", 0.0) >= self.gate_hit and e.get("epos_p50", 1.0) < self.gate_epos and e.get("fall_ball", 1.0) <= self.gate_fall
+        ):
+            self.passed = True
+            self.history.append(dict(event="passed_S2", iteration=iteration, ema=dict(e)))
+            self.events.append("passed_S2")
+        for m in (500, 1000, 1500, 2000, 3000):
+            if self.iters_in_stage == m:
+                self.events.append(f"s2_{m}")  # periodic checkpoints for play evaluation
+        if not self.passed and self.iters_in_stage >= self.gate_max:
+            self.stop_reason = "S2_max_iters"
+
+    def log_values(self) -> dict:
+        p = self.params()
+        out = {"Curriculum/passed": float(self.passed), "Curriculum/sigma_p": p["sigma_p"], "Curriculum/sigma_r": p["sigma_r"],
+               "Curriculum/blend": min(self.iters_in_stage / max(self.blend_iters, 1), 1.0)}  # fmt: skip
+        out.update({f"Curriculum/ema_{k}": v for k, v in self.ema.items() if not k.startswith("L")})
+        return out
+
+    def state_dict(self) -> dict:
+        keys = ("stage", "level", "iters_in_stage", "ema", "passed", "history")
+        return {k: getattr(self, k) for k in keys}
+
+    def load_state_dict(self, state: dict) -> None:
+        if state.get("stage") != "S2":
+            raise ValueError(f"not an S2 curriculum state: {state.get('stage')}")
         for k, v in state.items():
             setattr(self, k, v)
 

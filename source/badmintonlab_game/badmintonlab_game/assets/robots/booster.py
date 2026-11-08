@@ -48,8 +48,8 @@ BOOSTER_T1_CFG = ArticulationCfg(
     soft_joint_pos_limit_factor=0.9,
     actuators={
         "arms": BoosterDelayedPDActuatorCfg(
-            max_delay=8,
-            min_delay=2,
+            max_delay=40,
+            min_delay=10,
             joint_names_expr=[
                 ".*_Shoulder_Pitch",
                 ".*_Shoulder_Roll",
@@ -59,14 +59,14 @@ BOOSTER_T1_CFG = ArticulationCfg(
             booster_joint_cfgs=actuator.BoosterJointE4310(natural_freq=4.0, damping_ratio=1.5),
         ),
         "waist": BoosterDelayedPDActuatorCfg(
-            max_delay=8,
-            min_delay=2,
+            max_delay=40,
+            min_delay=10,
             joint_names_expr=["Waist"],
             booster_joint_cfgs=actuator.BoosterJointE6408(natural_freq=4.0, damping_ratio=1.5),
         ),
         "legs": BoosterDelayedPDActuatorCfg(
-            max_delay=8,
-            min_delay=2,
+            max_delay=40,
+            min_delay=10,
             joint_names_expr=[
                 ".*_Hip_Pitch",
                 ".*_Hip_Roll",
@@ -81,8 +81,8 @@ BOOSTER_T1_CFG = ArticulationCfg(
             },
         ),
         "feet": BoosterDelayedPDActuatorCfg(
-            max_delay=8,
-            min_delay=2,
+            max_delay=40,
+            min_delay=10,
             joint_names_expr=[
                 ".*_Ankle_Pitch",
                 ".*_Ankle_Roll",
@@ -111,8 +111,8 @@ BOOSTER_T1_CFG = ArticulationCfg(
             },
         ),
         "head": BoosterDelayedPDActuatorCfg(
-            max_delay=8,
-            min_delay=2,
+            max_delay=40,
+            min_delay=10,
             joint_names_expr=[".*Head.*"],
             booster_joint_cfgs=actuator.BoosterJointDM4310(natural_freq=4.0, damping_ratio=1.5),
         ),

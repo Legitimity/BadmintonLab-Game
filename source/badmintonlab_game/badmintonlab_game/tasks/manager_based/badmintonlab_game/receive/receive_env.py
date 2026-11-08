@@ -30,15 +30,25 @@ UPPER_JOINTS = (
     "Right_Elbow_Yaw",
 )
 DENSE = ("track", "face_front", "base_height", "base_orientation", "feet_air_time", "step_height", "foot_posture",
-         "no_double_flight", "feet_slide", "acc_reg", "hold_ready", "approach")  # fmt: skip
-EVENTS = ("touchdown_speed", "gait_symmetry", "fall")
+         "no_double_flight", "feet_slide", "acc_reg", "hold_ready", "approach",
+         "racket_style", "torque", "energy")  # fmt: skip
+EVENTS = ("touchdown_speed", "gait_symmetry", "fall", "swing", "contact")
 TERMS = DENSE + EVENTS
 S1_WEIGHTS = dict(
     track=4.0, approach=2.0, face_front=0.5, base_height=-10.0, base_orientation=-2.0, feet_air_time=1.0, step_height=0.5,
     foot_posture=-0.5, no_double_flight=-1.0, feet_slide=-0.1, acc_reg=-2.5e-7, hold_ready=0.3,
     touchdown_speed=-0.5, gait_symmetry=-0.2, fall=-10.0,
 )  # fmt: skip
-STAT_KEYS = ("balls", "station_ok", "face_ok", "d_sum", "head_sum", "touch", "episodes", "falls", "vel_sum", "vel_n", "fall_low", "fall_tilt", "fall_step_sum", "timeouts")
+# S2 (P5 V3.1 5.2, paper IV-A stage 2): lower the regional tracking, add the hit-instant reward (20, six per
+# episode), the racket style term (0.2), a contact bonus, torque / energy costs. 11-08 choices: track 4 -> 1
+# (S1 raised it 2 -> 4; same 1/4 ratio as the spec's 2 -> 0.5), approach 2 -> 1.
+S2_WEIGHTS = dict(
+    S1_WEIGHTS, track=1.0, approach=1.0, swing=20.0, contact=2.0, racket_style=0.2, torque=-2.0e-5, energy=-2.0e-4,
+)  # fmt: skip
+SWING_UPPER = ("Waist", "Right_Shoulder_Pitch", "Right_Shoulder_Roll", "Right_Elbow_Pitch", "Right_Elbow_Yaw")
+STAT_KEYS = ("balls", "station_ok", "face_ok", "d_sum", "head_sum", "touch", "episodes", "falls", "vel_sum", "vel_n", "fall_low", "fall_tilt", "fall_step_sum", "timeouts",
+             "ended", "hit", "ret_in", "ret_net", "ret_out", "epos_sum", "eori_sum", "vn_sum", "swing_sum")  # fmt: skip
+N_LVL = 4
 
 
 def _wrap(a: torch.Tensor) -> torch.Tensor:
@@ -52,7 +62,7 @@ class ReceiveBadmintonEnv(ServeBadmintonEnv):
         self.table = core.build_feeder_table(cfg.feeder_rows, seed=cfg.feeder_seed, device=dev)
         self.level = 0
         self._bounds = core.level_bounds(self.table, self.level)
-        self.weights = dict(S1_WEIGHTS)
+        self.weights = {k: float(S1_WEIGHTS.get(k, 0.0)) for k in TERMS}
         self.balls_per_episode = int(cfg.balls_per_episode)
         self.gap_steps = int(round(cfg.ball_gap_s / self.step_dt))
         self.ball_timeout_steps = int(round(cfg.ball_timeout_s / self.step_dt))
@@ -70,6 +80,18 @@ class ReceiveBadmintonEnv(ServeBadmintonEnv):
         self.values = {k: z(n) for k in TERMS}
         self.stats = z(len(STAT_KEYS))
         self.arrival_d = []  # per-iteration list of tensors, popped by the runner
+        self.arrival_epos = []
+        self.ball_lvl = z(n, dtype=torch.long)
+        self.lvl_stats = z(N_LVL, 5)  # arrivals, station_ok, d_sum, ended, hit
+        self.sigma_p, self.sigma_r, self.sigma_v = 2.0, 8.0, 3.0
+        self.n_star = core.target_normal(50.0, device=dev)
+        self.v_cap = float(cfg.swing_v_cap)
+        self._hit_now = z(n, dtype=torch.bool)
+        self._e_pos = z(n)
+        self._e_ori = z(n)
+        self._v_n = z(n)
+        self._axis_y = z(n, 3)
+        self._arrive = z(n, dtype=torch.bool)
         robot = self._robots[0]
         self._foot_ids = robot.find_bodies(["left_foot_link", "right_foot_link"], preserve_order=True)[0]
         self._feet = self.scene.sensors["feet_contact_0"]
@@ -79,6 +101,9 @@ class ReceiveBadmintonEnv(ServeBadmintonEnv):
         q_ready[ids] = torch.tensor(list(recv_player_cfg.READY_JOINTS.values()), device=dev)
         self.q_ready = q_ready
         self._upper_ids = robot.find_joints(list(UPPER_JOINTS), preserve_order=True)[0]
+        self._upper_s1 = self._upper_ids
+        self._upper_s2 = robot.find_joints([j for j in UPPER_JOINTS if j not in SWING_UPPER], preserve_order=True)[0]
+        self.stage = "S1"
         self.ready_yaw = float(recv_player_cfg.READY_ROOT["yaw"])
         self.z_ready = float(cfg.z_ready)
         self._hold_action_1 = None  # set by the wrapper
@@ -90,6 +115,18 @@ class ReceiveBadmintonEnv(ServeBadmintonEnv):
     def set_level(self, level: int) -> None:
         self.level = int(level)
         self._bounds = core.level_bounds(self.table, self.level)
+
+    def set_stage(self, stage: str) -> None:
+        """S2: hold_ready only on the non-swing upper joints (left arm, head), so the right arm and waist can swing."""
+        self.stage = stage
+        self._upper_ids = self._upper_s2 if stage == "S2" else self._upper_s1
+
+    def set_stage_params(self, weights: dict, sigma_p: float, sigma_r: float) -> None:
+        unknown = set(weights) - set(TERMS)
+        if unknown:
+            raise KeyError(sorted(unknown))
+        self.weights = {k: float(weights.get(k, 0.0)) for k in TERMS}
+        self.sigma_p, self.sigma_r = float(sigma_p), float(sigma_r)
 
     # ------------------------------------------------------------------ feeding
     def _inject(self, ids: torch.Tensor) -> None:
@@ -113,6 +150,7 @@ class ReceiveBadmintonEnv(ServeBadmintonEnv):
         self.station[ids] = t.station[rows]
         self.int_pos[ids] = t.int_pos[rows]
         self.t_arr[ids] = t.t_arr[rows]
+        self.ball_lvl[ids] = core.ball_level(t.d_need[rows])
         self.arr_step[ids] = torch.round(t.t_arr[rows] / self.step_dt).long().clamp(min=1)
         self.ball_active[ids] = True
         self.ball_steps[ids] = 0
@@ -125,6 +163,7 @@ class ReceiveBadmintonEnv(ServeBadmintonEnv):
     def step(self, action: torch.Tensor):
         self.action_manager.process_action(action.to(self.device))
         self.rules.begin_control_step()
+        self._hit_now.zero_()
         self.recorder_manager.record_pre_step()
         rendering = self.sim.has_gui() or self.sim.has_rtx_sensors()
         for _ in range(self.cfg.decimation):
@@ -186,6 +225,7 @@ class ReceiveBadmintonEnv(ServeBadmintonEnv):
         )
         self.rules.update_hits(contacts, local_z)
         self.ball_touched |= self.rules.just_hit[:, 0]
+        self._hit_now |= self.rules.just_hit[:, 0]
         self._prev_phys_shuttle.copy_(pos_w)
         self.rules.update_rally_result(pos_w, self.scene.env_origins)
 
@@ -216,7 +256,38 @@ class ReceiveBadmintonEnv(ServeBadmintonEnv):
         self.arrival_d.append(torch.where(arrive, d, torch.full_like(d, -1.0)))
         if len(self.arrival_d) > 64:
             self.arrival_d = self.arrival_d[-64:]
+        # Hit-instant quantities at t* (the control step the shuttle reaches the generated target).
+        sids = self._sweet_spot_ids
+        quat = torch.stack([r.data.body_link_quat_w[:, i] for r, i in zip(self._robots, sids)], dim=1)
+        q = quat[:, 0]
+        ss = robot.data.body_link_pos_w[:, sids[0]] - self.scene.env_origins
+        vss = self._racket_link_lin_vel_w(quat)[:, 0]
+        ax, ay = core.quat_axes_xy(q)
+        self._e_pos = torch.linalg.norm(ss - self.int_pos, dim=-1)
+        self._e_ori = core.face_error(ax, self.n_star)
+        self._v_n = (vss * self.n_star).sum(-1)
+        self._axis_y = ay
+        self._arrive = arrive
+        s[STAT_KEYS.index("epos_sum")] += (a * self._e_pos).sum()
+        s[STAT_KEYS.index("eori_sum")] += (a * self._e_ori).sum()
+        s[STAT_KEYS.index("vn_sum")] += (a * self._v_n).sum()
+        self.arrival_epos.append(torch.where(arrive, self._e_pos, torch.full_like(d, -1.0)))
+        if len(self.arrival_epos) > 64:
+            self.arrival_epos = self.arrival_epos[-64:]
+        lv = self.ball_lvl
+        ls = self.lvl_stats
+        ls[:, 0].index_add_(0, lv, a)
+        ls[:, 1].index_add_(0, lv, a * (d < 0.35).float())
+        ls[:, 2].index_add_(0, lv, a * d)
         ended = act & (self.rally_resolved | (self.ball_steps >= self.ball_timeout_steps))
+        hit = self.ball_touched & ended
+        s[STAT_KEYS.index("ended")] += ended.float().sum()
+        s[STAT_KEYS.index("hit")] += hit.float().sum()
+        s[STAT_KEYS.index("ret_in")] += (hit & self.rally_resolved & (self.rally_winner == 0)).float().sum()
+        s[STAT_KEYS.index("ret_net")] += (hit & self.rules.step_net_fault).float().sum()
+        s[STAT_KEYS.index("ret_out")] += (hit & self.rules.step_out_fault).float().sum()
+        ls[:, 3].index_add_(0, lv, ended.float())
+        ls[:, 4].index_add_(0, lv, hit.float())
         self.ball_active &= ~ended
         self.balls_done += ended.long()
         self.gap_left = torch.where(ended, torch.full_like(self.gap_left, self.gap_steps), self.gap_left)
@@ -268,6 +339,16 @@ class ReceiveBadmintonEnv(ServeBadmintonEnv):
         v["acc_reg"] = w["acc_reg"] * (robot.data.joint_acc**2).sum(-1)
         err = robot.data.joint_pos[:, self._upper_ids] - self.q_ready[self._upper_ids]
         v["hold_ready"] = w["hold_ready"] * torch.exp(-(err**2).mean(-1) / 0.1)
+        # S2 terms (weights 0 in S1).
+        arr = self._arrive.float()
+        sw = core.r_swing(self._e_pos, self._e_ori, self._v_n, self.sigma_p, self.sigma_r, self.sigma_v, self.v_cap)
+        v["swing"] = w["swing"] * sw * arr / dt
+        self.stats[STAT_KEYS.index("swing_sum")] += (sw * arr).sum()
+        v["racket_style"] = w["racket_style"] * core.r_racket_style(self._axis_y) * active
+        v["contact"] = w["contact"] * self._hit_now.float() / dt
+        tau = robot.data.applied_torque
+        v["torque"] = w["torque"] * (tau**2).sum(-1)
+        v["energy"] = w["energy"] * (tau * robot.data.joint_vel).abs().sum(-1)
         first = self._feet.compute_first_contact(dt)[:, self._feet_sensor_ids]
         v["touchdown_speed"] = w["touchdown_speed"] * ((foot_vel[..., 2] ** 2) * first.float()).sum(-1) / dt
         last_air = feet.last_air_time[:, self._feet_sensor_ids]
@@ -294,7 +375,13 @@ class ReceiveBadmintonEnv(ServeBadmintonEnv):
         ds = torch.cat(self.arrival_d) if self.arrival_d else torch.zeros(0, device=self.device)
         self.arrival_d = []
         ds = ds[ds >= 0]
+        ep = torch.cat(self.arrival_epos) if self.arrival_epos else torch.zeros(0, device=self.device)
+        self.arrival_epos = []
+        ep = ep[ep >= 0]
+        lvl = self.lvl_stats.tolist()
+        self.lvl_stats.zero_()
         b = max(c["balls"], 1.0)
+        en = max(c["ended"], 1.0)
         out = dict(
             balls=c["balls"],
             station_ok=c["station_ok"] / b,
@@ -311,7 +398,22 @@ class ReceiveBadmintonEnv(ServeBadmintonEnv):
             fall_tilt=c["fall_tilt"],
             fall_t=c["fall_step_sum"] * self.step_dt / max(c["falls"], 1.0),
             timeouts=c["timeouts"],
+            hit=c["hit"] / en,
+            ret_in=c["ret_in"] / en,
+            ret_net=c["ret_net"] / en,
+            ret_out=c["ret_out"] / en,
+            epos_mean=c["epos_sum"] / b,
+            epos_p50=float(ep.median()) if ep.numel() else float("nan"),
+            eori_deg=math.degrees(c["eori_sum"] / b),
+            vn_mean=c["vn_sum"] / b,
+            swing_mean=c["swing_sum"] / b,
         )
+        nan = float("nan")
+        for i, (na, ok, dsum, ne, h) in enumerate(lvl):
+            out[f"L{i}_n"] = na
+            out[f"L{i}_station_ok"] = ok / na if na else nan
+            out[f"L{i}_d_mean"] = dsum / na if na else nan
+            out[f"L{i}_hit"] = h / ne if ne else nan
         return out
 
 

@@ -1,9 +1,14 @@
-"""Train the receive expert, stage S1 footwork (P5 V3.1). Local runs (RTX 5070 8 GB).
+"""Train the receive expert (P5 V3.1): stage S1 footwork, stage S2 precision swing. Local runs (RTX 5070 8 GB).
 
 Example::
 
     python scripts/rsl_rl/train_receive.py --headless --num_envs 2048 --run_name recv_s1 \
         --p3_policy D:/rl-badminton-dev/p3_sync_v4/p3_final/policy.pt --time_budget_hours 8 --auto_resume
+
+    python scripts/rsl_rl/train_receive.py --headless --num_envs 2048 --run_name recv_s2 --stage S2 \
+        --init_from D:/.../model_passed_S1_2514.pt --dt_ms 1 --time_budget_hours 8 --auto_resume
+
+``--dt_ms`` keeps the 20 ms control step and the 10-40 ms actuator delay (physics.apply_physics); 1 = play.
 
 Smoke: ``--num_envs 64 --max_iterations 2``.
 """
@@ -37,6 +42,11 @@ parser.add_argument("--leg_std", type=float, default=0.5)
 parser.add_argument("--other_std", type=float, default=0.3)
 parser.add_argument("--no_curriculum", action="store_true")
 parser.add_argument("--level", type=int, default=0, help="Start feeder level (fixed if --no_curriculum).")
+parser.add_argument("--stage", default="S1", choices=("S1", "S2"))
+parser.add_argument("--init_from", default=None, help="S2: checkpoint of the passed S1 (weights, optimizer, lr).")
+parser.add_argument("--dt_ms", type=int, default=1, help="physics step in ms (1 = play a5e0780)")
+parser.add_argument("--s2_anneal", type=int, default=2000)
+parser.add_argument("--s2_other_std", type=float, default=0.3, help="S2 start: raise non-leg std to at least this.")
 cli_args.add_rsl_rl_args(parser)
 AppLauncher.add_app_launcher_args(parser)
 args_cli, hydra_args = parser.parse_known_args()
@@ -52,6 +62,8 @@ from isaaclab_tasks.utils.hydra import hydra_task_config  # noqa: E402
 import badmintonlab_game.tasks  # noqa: E402,F401
 from badmintonlab_game.tasks.manager_based.badmintonlab_game import receive as _receive  # noqa: E402,F401
 from badmintonlab_game.tasks.manager_based.badmintonlab_game.receive import core  # noqa: E402
+from badmintonlab_game.tasks.manager_based.badmintonlab_game.receive.receive_env import S1_WEIGHTS, S2_WEIGHTS  # noqa: E402
+from badmintonlab_game.tasks.manager_based.badmintonlab_game.physics import apply_physics  # noqa: E402
 from badmintonlab_game.tasks.manager_based.badmintonlab_game.receive.agents import (  # noqa: E402
     EXTRA_MEAN,
     EXTRA_STD,
@@ -96,6 +108,7 @@ def main(env_cfg, agent_cfg):
     if args_cli.device is not None:
         env_cfg.sim.device = args_cli.device
         agent_cfg.device = args_cli.device
+    apply_physics(env_cfg, args_cli.dt_ms)
 
     log_root = os.path.abspath(os.path.join("logs", "rsl_rl", agent_cfg.experiment_name))
     resume_path = find_latest(log_root, agent_cfg.run_name) if (args_cli.auto_resume and agent_cfg.run_name) else None
@@ -103,7 +116,8 @@ def main(env_cfg, agent_cfg):
     log_dir = os.path.join(log_root, run_name)
     env_cfg.log_dir = log_dir
     meta = write_run_meta(log_dir, REPO, dict(num_envs=env_cfg.scene.num_envs, resume=resume_path, p3=args_cli.p3_policy,
-                                              mini_batches=agent_cfg.algorithm.num_mini_batches, leg_std=args_cli.leg_std))  # fmt: skip
+                                              mini_batches=agent_cfg.algorithm.num_mini_batches, leg_std=args_cli.leg_std,
+                                              stage=args_cli.stage, init_from=args_cli.init_from, dt_ms=args_cli.dt_ms))  # fmt: skip
 
     env = gym.make(args_cli.task, cfg=env_cfg)
     try:
@@ -113,8 +127,13 @@ def main(env_cfg, agent_cfg):
         names = term._joint_names
         leg_mask = torch.tensor([any(k in n for k in LEG) for n in names])
         print(f"[INFO] {wrapped.num_envs} learners; {int(leg_mask.sum())} leg joints; feeder rows {len(unwrapped.table)}; log {log_dir}")
-        cur = None if args_cli.no_curriculum else core.ReceiveCurriculum(level=args_cli.level)
-        unwrapped.set_level(args_cli.level)
+        print(f"[INFO] stage {args_cli.stage}; physics dt {unwrapped.physics_dt} s, decimation {env_cfg.decimation}", flush=True)
+        if args_cli.stage == "S2":
+            cur = core.S2Curriculum(s1_weights=dict(S1_WEIGHTS), s2_weights=dict(S2_WEIGHTS), anneal_iters=args_cli.s2_anneal)
+            unwrapped.set_level(cur.level)
+        else:
+            cur = None if args_cli.no_curriculum else core.ReceiveCurriculum(level=args_cli.level)
+            unwrapped.set_level(args_cli.level)
         runner = ReceiveRunner(wrapped, agent_cfg.to_dict(), log_dir=log_dir, device=agent_cfg.device,
                                time_budget_hours=args_cli.time_budget_hours, curriculum=cur, leg_mask=leg_mask,
                                critic_warmup=0 if resume_path else args_cli.critic_warmup)  # fmt: skip
@@ -122,6 +141,20 @@ def main(env_cfg, agent_cfg):
         if resume_path:
             print(f"[INFO] Resuming from {resume_path}")
             runner.load(resume_path)
+        elif args_cli.stage == "S2":
+            if not args_cli.init_from:
+                raise SystemExit("--stage S2 needs --init_from <S1 checkpoint>")
+            # Weights, optimizer state and learning rate continue from S1 (spec 2.1: never a fresh Adam).
+            runner.load(args_cli.init_from)
+            ls = runner.alg.policy.log_std.data
+            lm = leg_mask.to(ls.device)
+            import math as _m
+
+            floor = torch.full_like(ls, _m.log(args_cli.s2_other_std))
+            ls.copy_(torch.where(~lm, torch.maximum(ls, floor), ls))
+            runner.snapshot_actor()  # critic-only warm-up: the critic has never seen the swing reward
+            print(f"[INFO] S2 from {args_cli.init_from}; std leg {ls[lm].exp().mean():.3f} other {ls[~lm].exp().mean():.3f}; "
+                  f"critic-only for {args_cli.critic_warmup} iterations", flush=True)  # fmt: skip
         else:
             ts = core.load_p3_torchscript(args_cli.p3_policy)
             core.warm_start_actor(runner.alg.policy, ts, EXTRA_MEAN, EXTRA_STD)
