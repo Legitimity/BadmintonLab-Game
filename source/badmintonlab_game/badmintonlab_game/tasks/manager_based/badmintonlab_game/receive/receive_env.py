@@ -40,10 +40,10 @@ S1_WEIGHTS = dict(
     touchdown_speed=-0.5, gait_symmetry=-0.2, fall=-10.0,
 )  # fmt: skip
 # S2 (P5 V3.1 5.2, paper IV-A stage 2): lower the regional tracking, add the hit-instant reward (20, six per
-# episode), the racket style term (0.2), a contact bonus, torque / energy costs. 11-08 choices: track 4 -> 1
-# (S1 raised it 2 -> 4; same 1/4 ratio as the spec's 2 -> 0.5), approach 2 -> 1.
+# episode), the racket style term (0.2), a contact bonus, torque / energy costs. 11-08 choices: approach 2 -> 1;
+# track 4 -> 2 (V3.3: with 1.0 the probe's station rate fell 0.73 -> 0.46 and far-ball hits 0.16 -> 0.05).
 S2_WEIGHTS = dict(
-    S1_WEIGHTS, track=1.0, approach=1.0, swing=20.0, contact=2.0, racket_style=0.2, torque=-2.0e-5, energy=-2.0e-4,
+    S1_WEIGHTS, track=2.0, approach=1.0, swing=20.0, contact=2.0, racket_style=0.2, torque=-2.0e-5, energy=-2.0e-4,
 )  # fmt: skip
 SWING_UPPER = ("Waist", "Right_Shoulder_Pitch", "Right_Shoulder_Roll", "Right_Elbow_Pitch", "Right_Elbow_Yaw")
 STAT_KEYS = ("balls", "station_ok", "face_ok", "d_sum", "head_sum", "touch", "episodes", "falls", "vel_sum", "vel_n", "fall_low", "fall_tilt", "fall_step_sum", "timeouts",

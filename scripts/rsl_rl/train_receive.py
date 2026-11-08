@@ -45,7 +45,8 @@ parser.add_argument("--level", type=int, default=0, help="Start feeder level (fi
 parser.add_argument("--stage", default="S1", choices=("S1", "S2"))
 parser.add_argument("--init_from", default=None, help="S2: checkpoint of the passed S1 (weights, optimizer, lr).")
 parser.add_argument("--dt_ms", type=int, default=1, help="physics step in ms (1 = play a5e0780)")
-parser.add_argument("--s2_anneal", type=int, default=2000)
+parser.add_argument("--s2_anneal", type=int, default=1000, help="earliest S2 gate iteration")
+parser.add_argument("--s2_tau", type=float, default=220.0, help="sigma annealing time constant")
 parser.add_argument("--s2_other_std", type=float, default=0.3, help="S2 start: raise non-leg std to at least this.")
 cli_args.add_rsl_rl_args(parser)
 AppLauncher.add_app_launcher_args(parser)
@@ -129,7 +130,7 @@ def main(env_cfg, agent_cfg):
         print(f"[INFO] {wrapped.num_envs} learners; {int(leg_mask.sum())} leg joints; feeder rows {len(unwrapped.table)}; log {log_dir}")
         print(f"[INFO] stage {args_cli.stage}; physics dt {unwrapped.physics_dt} s, decimation {env_cfg.decimation}", flush=True)
         if args_cli.stage == "S2":
-            cur = core.S2Curriculum(s1_weights=dict(S1_WEIGHTS), s2_weights=dict(S2_WEIGHTS), anneal_iters=args_cli.s2_anneal)
+            cur = core.S2Curriculum(s1_weights=dict(S1_WEIGHTS), s2_weights=dict(S2_WEIGHTS), anneal_iters=args_cli.s2_anneal, anneal_tau=args_cli.s2_tau)
             unwrapped.set_level(cur.level)
         else:
             cur = None if args_cli.no_curriculum else core.ReceiveCurriculum(level=args_cli.level)

@@ -34,24 +34,30 @@ def physics():
 
 def test_r_swing_ends(core):
     z = torch.zeros(1)
-    # Perfect pose, no speed: 1.
-    assert torch.allclose(core.r_swing(z, z, z, 2.0, 8.0), torch.ones(1))
-    # Speed term: 0.3 (1 - exp(-v/3)).
+    k = 0.3 * (1 - math.exp(-1.0))  # speed share at v = sigma_v = 3
     v = torch.tensor([3.0])
-    assert torch.allclose(core.r_swing(z, z, v, 0.1, 1.0), torch.tensor([1.0 + 0.3 * (1 - math.exp(-1.0))]))
-    # Negative normal speed gives nothing; the cap bounds outliers.
+    assert torch.allclose(core.r_swing(z, z, z, 2.0, 8.0), torch.ones(1))
+    far = torch.tensor([2.0])
+    # Paper form (additive): speed pays even far from the target.
+    assert torch.allclose(core.r_swing(z, z, v, 0.1, 1.0, gated=False), torch.tensor([1.0 + k]))
+    assert float(core.r_swing(far, z, v, 0.1, 1.0, gated=False)) == pytest.approx(k, abs=1e-6)
+    # V3.3 gated form: no speed reward far from the target.
+    assert torch.allclose(core.r_swing(z, z, v, 0.1, 1.0), torch.tensor([1.0 + k]))
+    assert float(core.r_swing(far, z, v, 0.1, 1.0)) == pytest.approx(0.0, abs=1e-6)
     assert torch.allclose(core.r_swing(z, z, -v, 0.1, 1.0), torch.ones(1))
     big = core.r_swing(z, z, torch.tensor([50.0]), 0.1, 1.0, v_cap=8.0)
     assert torch.allclose(big, torch.tensor([1.0 + 0.3 * (1 - math.exp(-8.0 / 3.0))]))
-    # Annealing: 0.3 m error is tolerated at the start, not at the end.
     e = torch.tensor([0.3])
-    start = core.r_swing(e, z, z, 2.0, 8.0)
-    end = core.r_swing(e, z, z, 0.1, 1.0)
-    assert torch.allclose(start, torch.tensor([math.exp(-0.09 / 2.0)]))
-    assert torch.allclose(end, torch.tensor([math.exp(-0.09 / 0.1)]))
-    # Orientation: 0.5 rad.
+    assert torch.allclose(core.r_swing(e, z, z, 2.0, 8.0), torch.tensor([math.exp(-0.09 / 2.0)]))
+    assert torch.allclose(core.r_swing(e, z, z, 0.1, 1.0), torch.tensor([math.exp(-0.09 / 0.1)]))
     o = torch.tensor([0.5])
     assert torch.allclose(core.r_swing(z, o, z, 2.0, 1.0), torch.tensor([math.exp(-0.5)]))
+
+
+def test_anneal_exp(core):
+    assert core.anneal_exp(0, 2.0, 0.1, 220.0) == pytest.approx(2.0)
+    assert core.anneal_exp(500, 2.0, 0.1, 220.0) == pytest.approx(0.296, abs=2e-3)
+    assert core.anneal_exp(10_000, 2.0, 0.1, 220.0) == pytest.approx(0.1, abs=1e-6)
 
 
 def test_face_error_two_faces(core):
@@ -81,20 +87,21 @@ def test_ball_level_and_uniform(core):
 
 def test_s2_curriculum_blend_anneal_gate(core):
     s1 = dict(track=4.0, swing=0.0)
-    s2 = dict(track=1.0, swing=20.0)
-    cur = core.S2Curriculum(s1_weights=s1, s2_weights=s2, blend_iters=100, anneal_iters=200, gate_min=50, gate_ema=1)
+    s2 = dict(track=2.0, swing=20.0)
+    cur = core.S2Curriculum(s1_weights=s1, s2_weights=s2, blend_iters=100, anneal_iters=200, anneal_tau=50.0,
+                            gate_min=50, gate_ema=1)  # fmt: skip
     p = cur.params()
     assert p["weights"]["track"] == 4.0 and p["weights"]["swing"] == 0.0 and p["sigma_p"] == 2.0 and p["sigma_r"] == 8.0
     good = dict(hit=0.6, epos_p50=0.1, fall_ball=0.01)
     for it in range(100):
         cur.update(it, good)
     p = cur.params()
-    assert p["weights"]["track"] == pytest.approx(1.0) and p["weights"]["swing"] == pytest.approx(20.0)
-    assert p["sigma_p"] == pytest.approx(2.0 + 0.5 * (0.1 - 2.0))
-    assert not cur.passed  # not before the annealing has finished
+    assert p["weights"]["track"] == pytest.approx(2.0) and p["weights"]["swing"] == pytest.approx(20.0)
+    assert p["sigma_p"] == pytest.approx(0.1 + 1.9 * math.exp(-2.0))
+    assert not cur.passed
     for it in range(100, 200):
         cur.update(it, good)
-    assert cur.passed and cur.params()["sigma_p"] == pytest.approx(0.1) and cur.params()["sigma_r"] == pytest.approx(1.0)
+    assert cur.passed and cur.params()["sigma_p"] == pytest.approx(0.1 + 1.9 * math.exp(-4.0))
     st = cur.state_dict()
     cur2 = core.S2Curriculum(s1_weights=s1, s2_weights=s2)
     cur2.load_state_dict(st)

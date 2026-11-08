@@ -127,16 +127,20 @@ def face_error(normal: torch.Tensor, n_star: torch.Tensor) -> torch.Tensor:
 
 
 def r_swing(e_pos: torch.Tensor, e_ori: torch.Tensor, v_n: torch.Tensor, sigma_p: float, sigma_r: float,
-            sigma_v: float = 3.0, v_cap: float = 8.0, w_v: float = 0.3) -> torch.Tensor:
+            sigma_v: float = 3.0, v_cap: float = 8.0, w_v: float = 0.3, gated: bool = True) -> torch.Tensor:
     """Paper eq. (2): exp(-|e_pos|^2/sp) exp(-e_ori/sr) + 0.3 (1 - exp(-max(0, v.n*)/sv)).
 
     ``e_pos``: (N,) distance sweet spot - hitting target, m. ``v_n``: sweet-spot speed along n*.
     ``v_cap`` (11-08, 1 ms physics): the old 3.5 m/s cap was a tunnelling guard (closing speed >6.4 m/s
     passed through the plate at 5 ms); at 1 ms that limit is gone, so the cap only bounds outliers.
+    ``gated`` (11-08 V3.3, our adaptation): the speed term is multiplied by the pose term, so a fast swing
+    only pays where the racket meets the target. The additive paper form was exploited in the S2 probe
+    (normal racket speed 0.4 -> 6.2 m/s in 270 iterations with the sweet-spot error flat at ~0.36 m).
     """
     pose = torch.exp(-(e_pos**2) / sigma_p) * torch.exp(-e_ori / sigma_r)
     v = v_n.clamp(min=0.0, max=v_cap)
-    return pose + w_v * (1.0 - torch.exp(-v / sigma_v))
+    speed = w_v * (1.0 - torch.exp(-v / sigma_v))
+    return pose * (1.0 + speed) if gated else pose + speed
 
 
 def r_racket_style(axis_y: torch.Tensor) -> torch.Tensor:
@@ -148,6 +152,11 @@ def anneal(it: int, start: float, end: float, n: int) -> float:
     """Linear from ``start`` (it = 0) to ``end`` (it >= n)."""
     a = min(max(it / max(n, 1), 0.0), 1.0)
     return start + a * (end - start)
+
+
+def anneal_exp(it: int, start: float, end: float, tau: float) -> float:
+    """end + (start - end) exp(-it / tau): fast first, then slow (V3.3; sigma_p 2.0 -> 0.3 at ~420 iters)."""
+    return end + (start - end) * math.exp(-max(it, 0) / max(tau, 1e-6))
 
 
 def blend_weights(a: dict, b: dict, alpha: float) -> dict:
@@ -326,7 +335,10 @@ class S2Curriculum:
     """Stage S2, precision-guided swing (paper IV-A stage 2; P5 V3.1 5.2, 11-08 revision).
 
     - reward weights blend S1 -> S2 over ``blend_iters``;
-    - sigma_p 2.0 -> 0.1, sigma_r 8.0 -> 1.0 linearly over ``anneal_iters`` (paper: "progressively tighten");
+    - sigma_p 2.0 -> 0.1, sigma_r 8.0 -> 1.0 (paper: "progressively tighten"); V3.3: exponential with time
+      constant ``anneal_tau`` (220: sigma_p 0.30 / sigma_r 1.7 at 500 iters, 0.12 / 1.1 at 1000). The linear
+      2000-iteration schedule of the probe left sigma_p ~1.7 at 300 iters (no position gradient);
+      ``anneal_iters`` is now only the earliest iteration at which the gate is judged;
     - feeds uniform over the filtered table (``LEVEL_ALL``; the paper samples targets uniformly, no distance
       curriculum);
     - gate (EMA): hit rate >= ``gate_hit``, hit-instant sweet-spot error p50 < ``gate_epos``, falls per ball
@@ -338,7 +350,8 @@ class S2Curriculum:
     stage: str = "S2"
     level: int = LEVEL_ALL
     blend_iters: int = 300
-    anneal_iters: int = 2000
+    anneal_iters: int = 1000
+    anneal_tau: float = 220.0
     sigma_p: tuple = (2.0, 0.1)
     sigma_r: tuple = (8.0, 1.0)
     gate_ema: int = 200
@@ -358,8 +371,8 @@ class S2Curriculum:
         it = self.iters_in_stage
         return dict(
             weights=blend_weights(self.s1_weights, self.s2_weights, it / max(self.blend_iters, 1)),
-            sigma_p=anneal(it, *self.sigma_p, self.anneal_iters),
-            sigma_r=anneal(it, *self.sigma_r, self.anneal_iters),
+            sigma_p=anneal_exp(it, *self.sigma_p, self.anneal_tau),
+            sigma_r=anneal_exp(it, *self.sigma_r, self.anneal_tau),
         )
 
     def update(self, iteration: int, rates: dict) -> None:
