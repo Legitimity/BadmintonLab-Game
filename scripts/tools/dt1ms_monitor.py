@@ -32,6 +32,8 @@ ap.add_argument("--start_iter", type=int, required=True)
 ap.add_argument("--eval_every", type=int, default=250)
 ap.add_argument("--base", type=float, default=None, help="f1: E0 play in of p3_final.")
 ap.add_argument("--ref", type=float, default=None, help="f2: play in of p3_dt_best.")
+ap.add_argument("--select_floor", type=float, default=0.97,
+                help="Section 4.5 (revised): play standing in >= this to be selectable (was max(0.85, ref - 0.02)).")
 ap.add_argument("--num_envs", type=int, default=256)
 ap.add_argument("--rallies", type=int, default=2,
                 help="Per court, serve and receive rallies together: 256 x 2 = 512 per side, ~256 of them serves.")
@@ -196,9 +198,9 @@ def main():
                 if ok:
                     b = max(ok, key=lambda e: e["served_in_standing"])
                     st["best"] = {"it": b["it"], "in": b["served_in_standing"], "ckpt": b["ckpt"], "export": b["export"]}
-                    # Section 4.5: in >= max(0.85, ref - 0.02), then the largest landing-to-racket distance
+                    # Section 4.5 (revised): in >= select_floor, then the largest landing-to-racket distance
                     # (within 0.2 m: the higher in).
-                    floor = max(0.85, (args.ref if args.ref is not None else 0.0) - 0.02)
+                    floor = args.select_floor
                     cand = [e for e in ok if e["served_in_standing"] >= floor and "d_recv_racket" in e.get("q50", {})]
                     if cand:
                         dmax = max(e["q50"]["d_recv_racket"] for e in cand)

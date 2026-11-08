@@ -89,6 +89,7 @@ parser.add_argument(
     help="Physics step (play a5e0780: 0.001). decimation = 0.02 / dt; actuator delays stay 10-40 ms.",
 )
 parser.add_argument("--entropy_coef", type=float, default=None, help="Override algorithm.entropy_coef.")
+parser.add_argument("--save_interval_override", type=int, default=None, help="Checkpoint every N iterations.")
 parser.add_argument(
     "--std_range",
     default=None,
