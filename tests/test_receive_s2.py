@@ -150,3 +150,18 @@ def test_defaults_match_play():
     if play.exists():
         ps = play.read_text(encoding="utf-8")
         assert ps.count("min_delay=10") == 5 and ps.count("max_delay=40") == 5
+
+
+def test_table_from_serves_keeps_hard_balls(core):
+    """Real serves are not filtered by time or reachability (only by having an intercept in the band)."""
+    # p3_final-like serve (receiver frame): 8.5 m/s, 43 deg from x=2.35, z=0.78; and a ball that never descends in band.
+    e = math.radians(43.0)
+    pos = torch.tensor([[2.35, 0.0, 0.78], [2.35, 0.0, 0.78]])
+    vel = torch.tensor([[-8.5 * math.cos(e), 0.0, 8.5 * math.sin(e)], [-30.0, 0.0, 1.0]])
+    t, info = core.table_from_serves(pos, vel)
+    assert info["n_in"] == 2 and info["n_kept"] == 1 and len(t) == 1
+    assert t.d_need[0] > 0.9  # far more than the synthetic filter allows at this arrival time
+    syn_ok = t.d_need[0] <= 0.9 * (t.t_arr[0] - 0.2) + 0.3
+    assert not bool(syn_ok)
+    both = core.concat_tables([t, t])
+    assert len(both) == 2

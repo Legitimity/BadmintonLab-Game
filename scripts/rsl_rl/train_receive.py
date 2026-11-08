@@ -48,6 +48,12 @@ parser.add_argument("--dt_ms", type=int, default=1, help="physics step in ms (1 
 parser.add_argument("--s2_anneal", type=int, default=1000, help="earliest S2 gate iteration")
 parser.add_argument("--s2_tau", type=float, default=220.0, help="sigma annealing time constant")
 parser.add_argument("--no_stop_on_pass", action="store_true", help="keep training after the stage gate passes")
+# 11-08 V3.4: real serves + footwork. The fall weight is NOT raised by default (a larger fall penalty
+# pushes the policy towards not moving, the opposite of what V3.4 needs).
+parser.add_argument("--real_serves", nargs="*", default=[], help="serve files from record_serves.py")
+parser.add_argument("--real_frac", type=float, default=0.0, help="fraction of balls from the real serves")
+parser.add_argument("--w", nargs="*", default=[], help="S2 weight overrides, e.g. track=3 approach=2")
+parser.add_argument("--approach_cap", type=float, default=0.8, help="approach reward speed cap, m/s")
 parser.add_argument("--s2_other_std", type=float, default=0.3, help="S2 start: raise non-leg std to at least this.")
 cli_args.add_rsl_rl_args(parser)
 AppLauncher.add_app_launcher_args(parser)
@@ -119,7 +125,9 @@ def main(env_cfg, agent_cfg):
     env_cfg.log_dir = log_dir
     meta = write_run_meta(log_dir, REPO, dict(num_envs=env_cfg.scene.num_envs, resume=resume_path, p3=args_cli.p3_policy,
                                               mini_batches=agent_cfg.algorithm.num_mini_batches, leg_std=args_cli.leg_std,
-                                              stage=args_cli.stage, init_from=args_cli.init_from, dt_ms=args_cli.dt_ms))  # fmt: skip
+                                              stage=args_cli.stage, init_from=args_cli.init_from, dt_ms=args_cli.dt_ms,
+                                              real_serves=args_cli.real_serves, real_frac=args_cli.real_frac, w=args_cli.w,
+                                              approach_cap=args_cli.approach_cap))  # fmt: skip
 
     env = gym.make(args_cli.task, cfg=env_cfg)
     try:
@@ -131,8 +139,19 @@ def main(env_cfg, agent_cfg):
         print(f"[INFO] {wrapped.num_envs} learners; {int(leg_mask.sum())} leg joints; feeder rows {len(unwrapped.table)}; log {log_dir}")
         print(f"[INFO] stage {args_cli.stage}; physics dt {unwrapped.physics_dt} s, decimation {env_cfg.decimation}", flush=True)
         if args_cli.stage == "S2":
-            cur = core.S2Curriculum(s1_weights=dict(S1_WEIGHTS), s2_weights=dict(S2_WEIGHTS), anneal_iters=args_cli.s2_anneal, anneal_tau=args_cli.s2_tau)
+            s2w = dict(S2_WEIGHTS)
+            for kv in args_cli.w:
+                k, v = kv.split("=")
+                if k not in s2w:
+                    raise SystemExit(f"unknown weight {k}")
+                s2w[k] = float(v)
+            cur = core.S2Curriculum(s1_weights=dict(S1_WEIGHTS), s2_weights=s2w, anneal_iters=args_cli.s2_anneal, anneal_tau=args_cli.s2_tau)
             unwrapped.set_level(cur.level)
+            unwrapped.approach_cap = args_cli.approach_cap
+            if args_cli.real_serves:
+                for info in unwrapped.set_real_serves(args_cli.real_serves, args_cli.real_frac):
+                    print(f"[INFO] real serves {info}", flush=True)
+            print(f"[INFO] S2 weights {s2w}; approach_cap {args_cli.approach_cap}; real_frac {args_cli.real_frac}", flush=True)
         else:
             cur = None if args_cli.no_curriculum else core.ReceiveCurriculum(level=args_cli.level)
             unwrapped.set_level(args_cli.level)

@@ -83,6 +83,14 @@ class ReceiveBadmintonEnv(ServeBadmintonEnv):
         self.arrival_epos = []
         self.ball_lvl = z(n, dtype=torch.long)
         self.lvl_stats = z(N_LVL, 5)  # arrivals, station_ok, d_sum, ended, hit
+        # 11-08 V3.4: real serves recorded in play, mixed with the synthetic feeder.
+        self.real = None
+        self.real_frac = 0.0
+        self.real_src_id = None  # (rows,) style index of each real row
+        self.real_names = []
+        self.ball_src = z(n, dtype=torch.long)  # 0 synthetic, 1 + style index for real serves
+        self.src_stats = z(8, 4)  # per source: arrivals, station_ok, ended, hit
+        self.approach_cap = 0.8
         self.sigma_p, self.sigma_r, self.sigma_v = 2.0, 8.0, 3.0
         self.n_star = core.target_normal(50.0, device=dev)
         self.v_cap = float(cfg.swing_v_cap)
@@ -116,6 +124,25 @@ class ReceiveBadmintonEnv(ServeBadmintonEnv):
         self.level = int(level)
         self._bounds = core.level_bounds(self.table, self.level)
 
+    def set_real_serves(self, paths: list, frac: float) -> list:
+        """Load recorded serve files (receiver frame) and feed ``frac`` of the balls from them, styles equally."""
+        tabs, infos, src = [], [], []
+        for i, p in enumerate(paths):
+            d = torch.load(p, map_location="cpu")
+            t, info = core.table_from_serves(d["pos"], d["vel"], device=self.device)
+            info["file"] = p
+            tabs.append(t)
+            infos.append(info)
+            src.append(torch.full((len(t),), i, device=self.device, dtype=torch.long))
+            self.real_names.append(p.replace("\\", "/").split("/")[-1].replace("serves_", "").replace(".pt", ""))
+        self.real = core.concat_tables(tabs)
+        self.real_src_id = torch.cat(src)
+        # Equal share per style regardless of how many rows each file kept.
+        counts = torch.bincount(self.real_src_id).float()
+        self._real_w = (1.0 / counts)[self.real_src_id]
+        self.real_frac = float(frac)
+        return infos
+
     def set_stage(self, stage: str) -> None:
         """S2: hold_ready only on the non-swing upper joints (left arm, head), so the right arm and waist can swing."""
         self.stage = stage
@@ -135,23 +162,32 @@ class ReceiveBadmintonEnv(ServeBadmintonEnv):
         lo, hi = self._bounds
         rows = core.sample_rows(ids.numel(), lo, hi, 0.2, self.device)
         t = self.table
+        f = {k: getattr(t, k)[rows] for k in ("launch_pos", "launch_vel", "int_pos", "t_arr", "d_need", "station")}
+        src = torch.zeros(ids.numel(), dtype=torch.long, device=self.device)
+        if self.real is not None and self.real_frac > 0.0:
+            use = torch.rand(ids.numel(), device=self.device) < self.real_frac
+            rr = torch.multinomial(self._real_w, ids.numel(), replacement=True)
+            for k in f:
+                f[k] = torch.where(use.view(-1, *([1] * (f[k].dim() - 1))), getattr(self.real, k)[rr], f[k])
+            src = torch.where(use, 1 + self.real_src_id[rr], src)
+        self.ball_src[ids] = src
         origins = self.scene.env_origins[ids]
-        pos_w = t.launch_pos[rows] + origins
+        pos_w = f["launch_pos"] + origins
         state = torch.zeros(ids.numel(), 13, device=self.device)
         state[:, :3] = pos_w
         state[:, 3] = 1.0
-        state[:, 7:10] = t.launch_vel[rows]
+        state[:, 7:10] = f["launch_vel"]
         self._shuttle.write_root_state_to_sim(state, env_ids=ids)
         opening = torch.ones_like(ids)
         self.rules.reset(ids, opening, pos_w)
         self.rules.next_hitter[ids] = 0
         self.rules.last_hitter[ids] = 1  # a feed: no serve-height rule, receiver's turn, out faults count
         self.initial_hitter[ids] = 1
-        self.station[ids] = t.station[rows]
-        self.int_pos[ids] = t.int_pos[rows]
-        self.t_arr[ids] = t.t_arr[rows]
-        self.ball_lvl[ids] = core.ball_level(t.d_need[rows])
-        self.arr_step[ids] = torch.round(t.t_arr[rows] / self.step_dt).long().clamp(min=1)
+        self.station[ids] = f["station"]
+        self.int_pos[ids] = f["int_pos"]
+        self.t_arr[ids] = f["t_arr"]
+        self.ball_lvl[ids] = core.ball_level(f["d_need"])
+        self.arr_step[ids] = torch.round(f["t_arr"] / self.step_dt).long().clamp(min=1)
         self.ball_active[ids] = True
         self.ball_steps[ids] = 0
         self.ball_touched[ids] = False
@@ -288,6 +324,12 @@ class ReceiveBadmintonEnv(ServeBadmintonEnv):
         s[STAT_KEYS.index("ret_out")] += (hit & self.rules.step_out_fault).float().sum()
         ls[:, 3].index_add_(0, lv, ended.float())
         ls[:, 4].index_add_(0, lv, hit.float())
+        ss = self.src_stats
+        sv = self.ball_src.clamp(max=ss.shape[0] - 1)
+        ss[:, 0].index_add_(0, sv, a)
+        ss[:, 1].index_add_(0, sv, a * (d < 0.35).float())
+        ss[:, 2].index_add_(0, sv, ended.float())
+        ss[:, 3].index_add_(0, sv, hit.float())
         self.ball_active &= ~ended
         self.balls_done += ended.long()
         self.gap_left = torch.where(ended, torch.full_like(self.gap_left, self.gap_steps), self.gap_left)
@@ -309,7 +351,7 @@ class ReceiveBadmintonEnv(ServeBadmintonEnv):
         far = (self.ball_active & (d > 0.3)).float()
         v["track"] = w["track"] * core.r_track(d) * active
         # 11-08 local change (S1 300-iter check failed: v_to_station ~0): dense speed towards the station.
-        v["approach"] = w["approach"] * self._v_to.clamp(-0.5, 0.8) * far
+        v["approach"] = w["approach"] * self._v_to.clamp(-0.5, self.approach_cap) * far
         dpsi = _wrap(self._yaw() - self.ready_yaw)
         v["face_front"] = w["face_front"] * torch.exp(-((dpsi / 0.4) ** 2))
         z = robot.data.root_pos_w[:, 2] - self.scene.env_origins[:, 2]
@@ -380,6 +422,8 @@ class ReceiveBadmintonEnv(ServeBadmintonEnv):
         ep = ep[ep >= 0]
         lvl = self.lvl_stats.tolist()
         self.lvl_stats.zero_()
+        src = self.src_stats.tolist()
+        self.src_stats.zero_()
         b = max(c["balls"], 1.0)
         en = max(c["ended"], 1.0)
         out = dict(
@@ -414,6 +458,12 @@ class ReceiveBadmintonEnv(ServeBadmintonEnv):
             out[f"L{i}_station_ok"] = ok / na if na else nan
             out[f"L{i}_d_mean"] = dsum / na if na else nan
             out[f"L{i}_hit"] = h / ne if ne else nan
+        names = ["syn"] + list(self.real_names)
+        for i, name in enumerate(names):
+            na, ok, ne, h = src[i]
+            out[f"src_{name}_station_ok"] = ok / na if na else nan
+            out[f"src_{name}_hit"] = h / ne if ne else nan
+            out[f"src_{name}_n"] = ne
         return out
 
 

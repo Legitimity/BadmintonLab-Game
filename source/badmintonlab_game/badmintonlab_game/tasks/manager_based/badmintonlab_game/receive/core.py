@@ -213,6 +213,30 @@ def build_feeder_table(
     return FeederTable(sel(pos), sel(vel), sel(pt), sel(t), sel(d_need), sel(station))
 
 
+def table_from_serves(pos: torch.Tensor, vel: torch.Tensor, device="cpu") -> tuple[FeederTable, dict]:
+    """Feeder table from serves recorded in play (``scripts/tools/record_serves.py``), receiver frame.
+
+    Same intercept / station definitions as the synthetic table, but **no time or reachability filter**:
+    these are the balls the receiver will actually face. Only serves without a valid intercept in the
+    band are dropped. Sorted by ``d_need``.
+    """
+    pos, vel = pos.to(device).float(), vel.to(device).float()
+    pt, t, ok = predict_intercept(pos, vel)
+    station = station_from_intercept(pt[:, :2])
+    ready = torch.tensor(READY_ROOT_XY, device=pos.device)
+    d_need = torch.linalg.norm(station - ready, dim=-1)
+    keep = ok & (t > 0.1)
+    order = torch.argsort(d_need[keep])
+    sel = lambda x: x[keep][order]  # noqa: E731
+    info = dict(n_in=int(pos.shape[0]), n_kept=int(keep.sum()), d_need_p50=float(d_need[keep].median()) if keep.any() else float("nan"),
+                t_p50=float(t[keep].median()) if keep.any() else float("nan"))  # fmt: skip
+    return FeederTable(sel(pos), sel(vel), sel(pt), sel(t), sel(d_need), sel(station)), info
+
+
+def concat_tables(tables: list) -> FeederTable:
+    return FeederTable(*[torch.cat([getattr(t, f) for t in tables]) for f in ("launch_pos", "launch_vel", "int_pos", "t_arr", "d_need", "station")])
+
+
 LEVEL_EDGES = (0.4, 0.8, 1.4, float("inf"))
 LEVEL_ALL = 4  # uniform over the whole filtered table (the paper samples the filtered set uniformly)
 

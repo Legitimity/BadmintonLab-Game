@@ -152,6 +152,9 @@ class ReceiveRunner(ServeRunner):
                 + " | " + " ".join(f"L{i}={rates[f'L{i}_hit']:.2f}" for i in range(4)),
                 flush=True,
             )
+        src = [k[4:-4] for k in rates if k.startswith("src_") and k.endswith("_hit")]
+        if len(src) > 1:
+            print("[SRC] " + " ".join(f"{s}:hit={rates[f'src_{s}_hit']:.2f}/st={rates[f'src_{s}_station_ok']:.2f}/n={rates[f'src_{s}_n']:.0f}" for s in src), flush=True)
         print(
             "[Recv] lvl={} ".format(unwrapped.level)
             + " ".join(f"{k}={rates[k]:.3f}" for k in ("station_ok", "face_ok", "d_mean", "d_p50", "head_deg", "v_to_station", "fall", "touch"))
