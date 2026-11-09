@@ -48,7 +48,7 @@ S2_WEIGHTS = dict(
 SWING_UPPER = ("Waist", "Right_Shoulder_Pitch", "Right_Shoulder_Roll", "Right_Elbow_Pitch", "Right_Elbow_Yaw")
 STAT_KEYS = ("balls", "station_ok", "face_ok", "d_sum", "head_sum", "touch", "episodes", "falls", "vel_sum", "vel_n", "fall_low", "fall_tilt", "fall_step_sum", "timeouts",
              "ended", "hit", "ret_in", "ret_net", "ret_out", "epos_sum", "eori_sum", "vn_sum", "swing_sum")  # fmt: skip
-N_LVL = 6  # V4 speed levels (legacy distance levels use 0-3)
+N_LVL = 8  # V4 speed levels (legacy distance levels use 0-3)
 
 
 def _wrap(a: torch.Tensor) -> torch.Tensor:
@@ -69,6 +69,7 @@ class ReceiveBadmintonEnv(ServeBadmintonEnv):
         self.level = 0
         self._bounds = self._level_bounds(self.level)
         self.ready_xy = torch.tensor(core.READY_ROOT_XY, device=dev)
+        self.face_relax = False
         self.weights = {k: float(S1_WEIGHTS.get(k, 0.0)) for k in TERMS}
         self.balls_per_episode = int(cfg.balls_per_episode)
         self.gap_steps = int(round(cfg.ball_gap_s / self.step_dt))
@@ -401,7 +402,11 @@ class ReceiveBadmintonEnv(ServeBadmintonEnv):
         lo = -self.approach_cap if self.v4 else -0.5  # V4: symmetric clamp (no away-fast / back-fast farming)
         v["approach"] = w["approach"] * self._v_to.clamp(lo, self.approach_cap) * far
         dpsi = _wrap(self._yaw() - self.ready_yaw)
-        v["face_front"] = w["face_front"] * torch.exp(-((dpsi / 0.4) ** 2))
+        tol = torch.full_like(dpsi, 0.4)
+        if self.v4 and self.face_relax:
+            # 11-10: while travelling to a far station the robot may turn (faster than side-stepping).
+            tol = torch.where(self.ball_active & (d > 0.6), torch.full_like(dpsi, 1.0), tol)
+        v["face_front"] = w["face_front"] * torch.exp(-((dpsi / tol) ** 2))
         z = robot.data.root_pos_w[:, 2] - self.scene.env_origins[:, 2]
         v["base_height"] = w["base_height"] * (z - self.z_ready) ** 2
         g = robot.data.projected_gravity_b
@@ -570,7 +575,7 @@ def critic_targets(env) -> torch.Tensor:
             (t_left * act).unsqueeze(-1),
             act.unsqueeze(-1),
             left.unsqueeze(-1),
-            torch.full((n, 1), min(env.level, 5) / 3.0, device=env.device),  # S2 V4 mix level 98 -> 5
+            torch.full((n, 1), (env.level if env.level < 90 else 5) / 3.0, device=env.device),  # S2 V4 mix level 98 -> 5
             (env.ball_steps.float() * env.step_dt * act).unsqueeze(-1),
         ),
         dim=-1,

@@ -90,7 +90,7 @@ def test_v4_table_filters_and_levels(core, table):
     assert prev_hi == len(table)
     assert core.speed_level_bounds(v, core.LEVEL_ALL_V4) == (0, len(table))
     counts = torch.bincount(core.speed_level(v), minlength=n_lvl)
-    assert counts.min() > 2000
+    assert counts.min() > 1000
     lo, hi = core.speed_level_bounds(v, 0)
     assert table.d_need[lo:hi].max() < 1.0  # the first level really is a short step
 
@@ -174,8 +174,8 @@ def test_s2_gate_on_first_ball(core):
 
 
 def test_s1_v4_gate_uses_synthetic_station(core):
-    cur = core.SpeedCurriculum(level=5, level_min=1, gate_min=2, gate_ema=1)
-    good = {"L5_station_ok": 0.4, "station_ok": 0.25, "src_syn_station_ok": 0.38, "face_ok": 0.9, "fall_ball": 0.01}
+    cur = core.SpeedCurriculum(level=len(core.SPEED_EDGES) - 1, level_min=1, gate_min=2, gate_ema=1)
+    good = {f"L{cur.top}_station_ok": 0.4, "station_ok": 0.25, "src_syn_station_ok": 0.38, "face_ok": 0.9, "fall_ball": 0.01}
     for it in range(3):
         cur.update(it, good)
     assert cur.passed  # overall 0.25 (diluted by real serves) does not block the gate

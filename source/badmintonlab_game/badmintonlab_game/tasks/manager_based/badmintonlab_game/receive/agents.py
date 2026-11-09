@@ -152,7 +152,7 @@ class ReceiveRunner(ServeRunner):
             print(
                 f"[S2] it={cur.iters_in_stage} sp={p['sigma_p']:.3f} sr={p['sigma_r']:.2f} "
                 + " ".join(f"{k}={rates[k]:.3f}" for k in ("hit", "ret_in", "ret_net", "ret_out", "epos_p50", "eori_deg", "vn_mean", "swing_mean"))
-                + " | " + " ".join(f"L{i}={rates[f'L{i}_hit']:.2f}" for i in range(6 if f"L5_hit" in rates else 4))
+                + " | " + " ".join(f"L{i}={rates[f'L{i}_hit']:.2f}" for i in range(len(core.SPEED_EDGES) if "L5_hit" in rates else 4))
                 + (f" | first_hit={rates['first_all_hit']:.3f} first_st={rates['first_all_station_ok']:.3f} ema_gate={cur.ema.get(cur.gate_hit_key, float('nan')):.3f}" if "first_all_hit" in rates else ""),
                 flush=True,
             )
@@ -164,7 +164,7 @@ class ReceiveRunner(ServeRunner):
             print("[SRC] " + " ".join(f"{s}:hit={rates[f'src_{s}_hit']:.2f}/st={rates[f'src_{s}_station_ok']:.2f}/n={rates[f'src_{s}_n']:.0f}" for s in src), flush=True)
         if isinstance(cur, core.SpeedCurriculum):
             print("[V4] lvl={} cap={:.1f} real={:.2f} ".format(cur.level, unwrapped.approach_cap, unwrapped.real_frac)
-                  + " ".join(f"L{i}={rates[f'L{i}_station_ok']:.2f}/{rates[f'L{i}_n']:.0f}" for i in range(6))
+                  + " ".join(f"L{i}={rates[f'L{i}_station_ok']:.2f}/{rates[f'L{i}_n']:.0f}" for i in range(len(core.SPEED_EDGES)))
                   + " band_ema={:.3f} fall_ema={:.4f}".format(cur.ema.get(f"L{cur.level}_station_ok", float('nan')), cur.ema.get("fall_ball", float('nan'))), flush=True)
         print(
             "[Recv] lvl={} ".format(unwrapped.level)

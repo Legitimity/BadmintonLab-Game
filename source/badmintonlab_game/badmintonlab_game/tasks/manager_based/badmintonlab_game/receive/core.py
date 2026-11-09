@@ -366,8 +366,9 @@ def table_from_serves_v4(pos: torch.Tensor, vel: torch.Tensor, device="cpu") -> 
 
 
 # Speed levels (V4): upper edges of the required speed per level, m/s. The last level is open (<= v_max).
-SPEED_EDGES = (0.25, 0.5, 0.8, 1.1, 1.5, float("inf"))
-APPROACH_CAPS = (0.6, 0.9, 1.2, 1.5, 1.9, 2.3)  # approach reward cap per level, m/s
+# 11-10: the old open top band (>= 1.5 m/s) was split in three (band rate stuck at 0.01-0.04 for 700 iters).
+SPEED_EDGES = (0.25, 0.5, 0.8, 1.1, 1.5, 1.8, 2.1, float("inf"))
+APPROACH_CAPS = (0.6, 0.9, 1.2, 1.5, 1.9, 2.1, 2.4, 2.6)  # approach reward cap per level, m/s
 
 
 def speed_level(v_req: torch.Tensor, edges=SPEED_EDGES) -> torch.Tensor:
@@ -389,7 +390,7 @@ LEVEL_ALL_V4 = 99  # uniform over the whole V4 table
 # S2 V4 (11-09): feeds mixed over the speed levels (harder levels weighted up, the easy ones kept so the
 # footwork does not decay; V3.4 lost its station rate 0.73 -> 0.08 when only the swing was rewarded).
 LEVEL_MIX_V4 = 98
-S2_MIX_V4 = (0.05, 0.05, 0.10, 0.15, 0.30, 0.35)
+S2_MIX_V4 = (0.05, 0.05, 0.10, 0.15, 0.30, 0.15, 0.12, 0.08)
 
 
 def mix_row_weights(v_sorted: torch.Tensor, mix=S2_MIX_V4, edges=SPEED_EDGES) -> torch.Tensor:
@@ -418,13 +419,13 @@ class SpeedCurriculum:
     level: int = 0
     stage: str = "S1"
     n_levels: int = len(SPEED_EDGES)
-    promote: tuple = (0.6, 0.55, 0.5, 0.45, 0.4)
+    promote: tuple = (0.6, 0.55, 0.5, 0.45, 0.4, 0.35, 0.3)
     level_ema: int = 100
     level_min: int = 150
     level_fall: float = 0.03
     gate_ema: int = 200
     gate_min: int = 300  # iterations at the top level before the gate is judged
-    gate_band: float = 0.35
+    gate_band: float = 0.2  # 11-10: top band is now >= 2.1 m/s
     # 11-09 22:30: judged on the synthetic balls only. The overall rate mixes 30% real serves (station ~0 at
     # this point), and at the top level 80% of the synthetic feeds are L5: 0.45 overall was unreachable.
     gate_station: float = 0.35

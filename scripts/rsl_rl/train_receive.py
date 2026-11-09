@@ -57,6 +57,8 @@ parser.add_argument("--approach_cap", type=float, default=0.8, help="approach re
 # 11-09 S1 V4 (from p3_final): wide feeder with a free hitting height, required-speed levels, return-home gaps.
 parser.add_argument("--v4", action="store_true", help="S1 V4 feeder / curriculum (see core.SpeedCurriculum)")
 parser.add_argument("--v4_real_from", type=int, default=3, help="V4: mix real serves from this speed level on")
+parser.add_argument("--face_relax", action="store_true", help="V4: wider heading tolerance while travelling")
+parser.add_argument("--reset_leg_std", type=float, default=None, help="after resume: set the leg action std once")
 parser.add_argument("--ball_gap_s", type=float, default=None, help="gap between balls (V4 default 1.0 s)")
 parser.add_argument("--s2_other_std", type=float, default=0.3, help="S2 start: raise non-leg std to at least this.")
 cli_args.add_rsl_rl_args(parser)
@@ -136,7 +138,8 @@ def main(env_cfg, agent_cfg):
                                               mini_batches=agent_cfg.algorithm.num_mini_batches, leg_std=args_cli.leg_std,
                                               stage=args_cli.stage, init_from=args_cli.init_from, dt_ms=args_cli.dt_ms,
                                               real_serves=args_cli.real_serves, real_frac=args_cli.real_frac, w=args_cli.w,
-                                              approach_cap=args_cli.approach_cap, v4=args_cli.v4,
+                                              approach_cap=args_cli.approach_cap, v4=args_cli.v4, face_relax=args_cli.face_relax,
+                                              reset_leg_std=args_cli.reset_leg_std,
                                               v4_real_from=args_cli.v4_real_from, ball_gap_s=env_cfg.ball_gap_s))  # fmt: skip
 
     env = gym.make(args_cli.task, cfg=env_cfg)
@@ -186,9 +189,17 @@ def main(env_cfg, agent_cfg):
         runner.v4_real_from = args_cli.v4_real_from
         runner.apply_v4_params()
         runner.install_signal_handlers()
+        unwrapped.face_relax = bool(args_cli.face_relax)
         if resume_path:
             print(f"[INFO] Resuming from {resume_path}")
             runner.load(resume_path)
+            if args_cli.reset_leg_std is not None:
+                ls = runner.alg.policy.log_std.data
+                lm = leg_mask.to(ls.device)
+                import math as _m
+
+                ls.copy_(torch.where(lm, torch.full_like(ls, _m.log(args_cli.reset_leg_std)), ls))
+                print(f"[INFO] leg std reset to {args_cli.reset_leg_std}", flush=True)
         elif args_cli.stage == "S2":
             if not args_cli.init_from:
                 raise SystemExit("--stage S2 needs --init_from <S1 checkpoint>")
