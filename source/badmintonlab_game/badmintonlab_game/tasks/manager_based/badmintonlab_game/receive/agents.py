@@ -156,6 +156,9 @@ class ReceiveRunner(ServeRunner):
                 flush=True,
             )
         src = [k[4:-4] for k in rates if k.startswith("src_") and k.endswith("_hit")]
+        first = [k[6:-4] for k in rates if k.startswith("first_") and k.endswith("_hit")]
+        if first:
+            print("[FIRST] " + " ".join(f"{s}:hit={rates[f'first_{s}_hit']:.2f}/st={rates[f'first_{s}_station_ok']:.2f}/n={rates[f'first_{s}_n']:.0f}" for s in first), flush=True)
         if len(src) > 1:
             print("[SRC] " + " ".join(f"{s}:hit={rates[f'src_{s}_hit']:.2f}/st={rates[f'src_{s}_station_ok']:.2f}/n={rates[f'src_{s}_n']:.0f}" for s in src), flush=True)
         if isinstance(cur, core.SpeedCurriculum):

@@ -97,6 +97,8 @@ class ReceiveBadmintonEnv(ServeBadmintonEnv):
         self.real_names = []
         self.ball_src = z(n, dtype=torch.long)  # 0 synthetic, 1 + style index for real serves
         self.src_stats = z(8, 4)  # per source: arrivals, station_ok, ended, hit
+        # 11-09: same per source, first ball of an episode only (starts at the ready pose, like a play rally).
+        self.src_stats_first = z(8, 4)
         self.approach_cap = 0.8
         self.sigma_p, self.sigma_r, self.sigma_v = 2.0, 8.0, 3.0
         self.n_star = core.target_normal(50.0, device=dev)
@@ -352,6 +354,12 @@ class ReceiveBadmintonEnv(ServeBadmintonEnv):
         ss[:, 1].index_add_(0, sv, a * (d < 0.35).float())
         ss[:, 2].index_add_(0, sv, ended.float())
         ss[:, 3].index_add_(0, sv, hit.float())
+        first = (self.balls_done == 0).float()
+        sf = self.src_stats_first
+        sf[:, 0].index_add_(0, sv, a * first)
+        sf[:, 1].index_add_(0, sv, a * (d < 0.35).float() * first)
+        sf[:, 2].index_add_(0, sv, ended.float() * first)
+        sf[:, 3].index_add_(0, sv, hit.float() * first)
         self.ball_active &= ~ended
         self.balls_done += ended.long()
         self.gap_left = torch.where(ended, torch.full_like(self.gap_left, self.gap_steps), self.gap_left)
@@ -459,6 +467,8 @@ class ReceiveBadmintonEnv(ServeBadmintonEnv):
         self.lvl_stats.zero_()
         src = self.src_stats.tolist()
         self.src_stats.zero_()
+        src1 = self.src_stats_first.tolist()
+        self.src_stats_first.zero_()
         b = max(c["balls"], 1.0)
         en = max(c["ended"], 1.0)
         out = dict(
@@ -499,6 +509,10 @@ class ReceiveBadmintonEnv(ServeBadmintonEnv):
             out[f"src_{name}_station_ok"] = ok / na if na else nan
             out[f"src_{name}_hit"] = h / ne if ne else nan
             out[f"src_{name}_n"] = ne
+            na1, ok1, ne1, h1 = src1[i]
+            out[f"first_{name}_station_ok"] = ok1 / na1 if na1 else nan
+            out[f"first_{name}_hit"] = h1 / ne1 if ne1 else nan
+            out[f"first_{name}_n"] = ne1
         return out
 
 
