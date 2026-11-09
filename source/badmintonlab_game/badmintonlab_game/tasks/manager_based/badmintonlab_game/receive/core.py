@@ -377,7 +377,7 @@ def speed_level(v_req: torch.Tensor, edges=SPEED_EDGES) -> torch.Tensor:
 
 def speed_level_bounds(v_sorted: torch.Tensor, level: int, edges=SPEED_EDGES) -> tuple[int, int]:
     """(lo, hi) rows of a table sorted by required speed: [lo, hi) is this level's band."""
-    if level == LEVEL_ALL_V4:
+    if level in (LEVEL_ALL_V4, LEVEL_MIX_V4):
         return 0, int(v_sorted.numel())
     lo = 0 if level == 0 else int(torch.searchsorted(v_sorted, torch.tensor([edges[level - 1]], device=v_sorted.device, dtype=v_sorted.dtype)).item())
     edge = edges[level]
@@ -386,6 +386,20 @@ def speed_level_bounds(v_sorted: torch.Tensor, level: int, edges=SPEED_EDGES) ->
 
 
 LEVEL_ALL_V4 = 99  # uniform over the whole V4 table
+# S2 V4 (11-09): feeds mixed over the speed levels (harder levels weighted up, the easy ones kept so the
+# footwork does not decay; V3.4 lost its station rate 0.73 -> 0.08 when only the swing was rewarded).
+LEVEL_MIX_V4 = 98
+S2_MIX_V4 = (0.05, 0.05, 0.10, 0.15, 0.30, 0.35)
+
+
+def mix_row_weights(v_sorted: torch.Tensor, mix=S2_MIX_V4, edges=SPEED_EDGES) -> torch.Tensor:
+    """Per-row sampling weights so that level k gets ``mix[k]`` of the feeds (uniform inside a level)."""
+    lv = speed_level(v_sorted, edges)
+    counts = torch.bincount(lv, minlength=len(edges)).to(v_sorted.dtype)
+    m = torch.tensor(mix, device=v_sorted.device, dtype=v_sorted.dtype)
+    m = torch.where(counts > 0, m, torch.zeros_like(m))
+    m = m / m.sum()
+    return (m / counts.clamp(min=1.0))[lv]
 
 
 @dataclass
@@ -411,7 +425,10 @@ class SpeedCurriculum:
     gate_ema: int = 200
     gate_min: int = 300  # iterations at the top level before the gate is judged
     gate_band: float = 0.35
-    gate_station: float = 0.45
+    # 11-09 22:30: judged on the synthetic balls only. The overall rate mixes 30% real serves (station ~0 at
+    # this point), and at the top level 80% of the synthetic feeds are L5: 0.45 overall was unreachable.
+    gate_station: float = 0.35
+    gate_station_key: str = "src_syn_station_ok"
     gate_face: float = 0.5
     gate_fall: float = 0.03
     gate_max: int = 8000
@@ -451,7 +468,7 @@ class SpeedCurriculum:
             g = self.gate_ema_vals
             if (
                 self._band(g) >= self.gate_band
-                and g.get("station_ok", 0.0) >= self.gate_station
+                and g.get(self.gate_station_key, 0.0) >= self.gate_station
                 and g.get("face_ok", 0.0) >= self.gate_face
                 and g.get("fall_ball", 1.0) <= self.gate_fall
             ):
@@ -635,6 +652,7 @@ class S2Curriculum:
     gate_hit: float = 0.4
     gate_epos: float = 0.15
     gate_fall: float = 0.03
+    gate_hit_key: str = "hit"  # S2 V4: "first_all_hit" (first ball of an episode, = a play rally)
     iters_in_stage: int = 0
     ema: dict = field(default_factory=dict)
     passed: bool = False
@@ -657,7 +675,7 @@ class S2Curriculum:
         e = self.ema
         ready = self.iters_in_stage >= max(self.gate_min, self.anneal_iters)
         if ready and not self.passed and (
-            e.get("hit", 0.0) >= self.gate_hit and e.get("epos_p50", 1.0) < self.gate_epos and e.get("fall_ball", 1.0) <= self.gate_fall
+            e.get(self.gate_hit_key, 0.0) >= self.gate_hit and e.get("epos_p50", 1.0) < self.gate_epos and e.get("fall_ball", 1.0) <= self.gate_fall
         ):
             self.passed = True
             self.history.append(dict(event="passed_S2", iteration=iteration, ema=dict(e)))

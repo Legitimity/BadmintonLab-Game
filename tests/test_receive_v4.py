@@ -124,7 +124,7 @@ def test_speed_curriculum_promotion_and_gate(core):
         it += 1
     assert not cur.passed
     for _ in range(10):
-        cur.update(it, {f"L{top}_station_ok": 0.5, "fall_ball": 0.0, "station_ok": 0.6, "face_ok": 0.9})
+        cur.update(it, {f"L{top}_station_ok": 0.5, "fall_ball": 0.0, "src_syn_station_ok": 0.6, "face_ok": 0.9})
         it += 1
     assert cur.passed and "passed_S1" in [h["event"] for h in cur.history]
     c2 = core.SpeedCurriculum()
@@ -151,3 +151,31 @@ def test_real_serves_v4(core):
     v = core.required_speed(t.d_need, t.t_arr)
     assert torch.all(v[1:] >= v[:-1] - 1e-6)
     assert 1.2 < info["v_req_p50"] < 3.0  # the wide forehand serve needs fast footwork
+
+
+def test_s2_mix_weights(core, table):
+    v = core.required_speed(table.d_need, table.t_arr)
+    w = core.mix_row_weights(v)
+    assert torch.isclose(w.sum(), torch.tensor(1.0), atol=1e-4)
+    rows = torch.multinomial(w, 200_000, replacement=True, generator=torch.Generator().manual_seed(1))
+    frac = torch.bincount(core.speed_level(v[rows]), minlength=len(core.SPEED_EDGES)).float() / rows.numel()
+    m = torch.tensor(core.S2_MIX_V4)
+    assert torch.allclose(frac, m / m.sum(), atol=0.01), frac
+    assert core.speed_level_bounds(v, core.LEVEL_MIX_V4) == (0, len(table))
+
+
+def test_s2_gate_on_first_ball(core):
+    cur = core.S2Curriculum(s1_weights={}, s2_weights={}, anneal_iters=5, gate_min=5, gate_ema=1, gate_hit_key="first_all_hit")
+    for it in range(10):  # all-ball hit rate high, first-ball low: not passed
+        cur.update(it, dict(hit=0.9, first_all_hit=0.1, epos_p50=0.1, fall_ball=0.0))
+    assert not cur.passed
+    cur.update(10, dict(hit=0.9, first_all_hit=0.5, epos_p50=0.1, fall_ball=0.0))
+    assert cur.passed
+
+
+def test_s1_v4_gate_uses_synthetic_station(core):
+    cur = core.SpeedCurriculum(level=5, level_min=1, gate_min=2, gate_ema=1)
+    good = {"L5_station_ok": 0.4, "station_ok": 0.25, "src_syn_station_ok": 0.38, "face_ok": 0.9, "fall_ball": 0.01}
+    for it in range(3):
+        cur.update(it, good)
+    assert cur.passed  # overall 0.25 (diluted by real serves) does not block the gate

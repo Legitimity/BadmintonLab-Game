@@ -156,6 +156,11 @@ def main(env_cfg, agent_cfg):
                     raise SystemExit(f"unknown weight {k}")
                 s2w[k] = float(v)
             cur = core.S2Curriculum(s1_weights=dict(S1_WEIGHTS), s2_weights=s2w, anneal_iters=args_cli.s2_anneal, anneal_tau=args_cli.s2_tau)
+            if args_cli.v4:
+                # S2 V4: speed-level mix over the V4 table; gate on the first ball of an episode (= play).
+                cur.level = core.LEVEL_MIX_V4
+                cur.gate_hit_key = "first_all_hit"
+                print(f"[INFO] S2 V4: mix {core.S2_MIX_V4}; gate on first_all_hit", flush=True)
             unwrapped.set_level(cur.level)
             unwrapped.approach_cap = args_cli.approach_cap
             if args_cli.real_serves:

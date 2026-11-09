@@ -175,7 +175,12 @@ class ReceiveBadmintonEnv(ServeBadmintonEnv):
         if ids.numel() == 0:
             return
         lo, hi = self._bounds
-        rows = core.sample_rows(ids.numel(), lo, hi, 0.2, self.device)
+        if self.v4 and self.level == core.LEVEL_MIX_V4:
+            if getattr(self, "_mix_w", None) is None:
+                self._mix_w = core.mix_row_weights(self._v_sorted)
+            rows = torch.multinomial(self._mix_w, ids.numel(), replacement=True)
+        else:
+            rows = core.sample_rows(ids.numel(), lo, hi, 0.2, self.device)
         t = self.table
         f = {k: getattr(t, k)[rows] for k in ("launch_pos", "launch_vel", "int_pos", "t_arr", "d_need", "station")}
         src = torch.zeros(ids.numel(), dtype=torch.long, device=self.device)
@@ -503,6 +508,12 @@ class ReceiveBadmintonEnv(ServeBadmintonEnv):
             out[f"L{i}_station_ok"] = ok / na if na else nan
             out[f"L{i}_d_mean"] = dsum / na if na else nan
             out[f"L{i}_hit"] = h / ne if ne else nan
+        # First ball of an episode over all sources (= a play rally start).
+        a1 = sum(r[0] for r in src1)
+        e1 = sum(r[2] for r in src1)
+        out["first_all_station_ok"] = sum(r[1] for r in src1) / a1 if a1 else nan
+        out["first_all_hit"] = sum(r[3] for r in src1) / e1 if e1 else nan
+        out["first_all_n"] = e1
         names = ["syn"] + list(self.real_names)
         for i, name in enumerate(names):
             na, ok, ne, h = src[i]
@@ -559,7 +570,7 @@ def critic_targets(env) -> torch.Tensor:
             (t_left * act).unsqueeze(-1),
             act.unsqueeze(-1),
             left.unsqueeze(-1),
-            torch.full((n, 1), env.level / 3.0, device=env.device),
+            torch.full((n, 1), min(env.level, 5) / 3.0, device=env.device),  # S2 V4 mix level 98 -> 5
             (env.ball_steps.float() * env.step_dt * act).unsqueeze(-1),
         ),
         dim=-1,

@@ -152,11 +152,12 @@ class ReceiveRunner(ServeRunner):
             print(
                 f"[S2] it={cur.iters_in_stage} sp={p['sigma_p']:.3f} sr={p['sigma_r']:.2f} "
                 + " ".join(f"{k}={rates[k]:.3f}" for k in ("hit", "ret_in", "ret_net", "ret_out", "epos_p50", "eori_deg", "vn_mean", "swing_mean"))
-                + " | " + " ".join(f"L{i}={rates[f'L{i}_hit']:.2f}" for i in range(4)),
+                + " | " + " ".join(f"L{i}={rates[f'L{i}_hit']:.2f}" for i in range(6 if f"L5_hit" in rates else 4))
+                + (f" | first_hit={rates['first_all_hit']:.3f} first_st={rates['first_all_station_ok']:.3f} ema_gate={cur.ema.get(cur.gate_hit_key, float('nan')):.3f}" if "first_all_hit" in rates else ""),
                 flush=True,
             )
         src = [k[4:-4] for k in rates if k.startswith("src_") and k.endswith("_hit")]
-        first = [k[6:-4] for k in rates if k.startswith("first_") and k.endswith("_hit")]
+        first = [k[6:-4] for k in rates if k.startswith("first_") and k.endswith("_hit") and k != "first_all_hit"]
         if first:
             print("[FIRST] " + " ".join(f"{s}:hit={rates[f'first_{s}_hit']:.2f}/st={rates[f'first_{s}_station_ok']:.2f}/n={rates[f'first_{s}_n']:.0f}" for s in first), flush=True)
         if len(src) > 1:
