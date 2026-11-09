@@ -31,6 +31,8 @@ parser.add_argument("--stage", default="S1")
 parser.add_argument("--stochastic", action="store_true")
 parser.add_argument("--seed", type=int, default=7)
 parser.add_argument("--out", default=None)
+parser.add_argument("--v4", action="store_true", help="S1 V4 feeder (free height, speed levels); --level 99 = uniform")
+parser.add_argument("--real_serves", nargs="*", default=[], help="V4: evaluate on these recorded serves only (real_frac 1)")
 AppLauncher.add_app_launcher_args(parser)
 args_cli, hydra_args = parser.parse_known_args()
 sys.argv = [sys.argv[0]] + hydra_args
@@ -71,6 +73,9 @@ def main():
     env_cfg.scene.num_envs = args_cli.num_envs
     env_cfg.seed = args_cli.seed
     apply_physics(env_cfg, args_cli.dt_ms)
+    if args_cli.v4:
+        env_cfg.feeder_v4 = True
+        env_cfg.ball_gap_s = 1.0
     env = gym.make(args_cli.task, cfg=env_cfg)
     u = env.unwrapped
     print(f"[EVAL] dt={u.physics_dt} decimation={env_cfg.decimation} step_dt={u.step_dt}", flush=True)
@@ -78,8 +83,13 @@ def main():
     names = u.action_manager.get_term("player_0")._joint_names
     leg_mask = torch.tensor([any(k in n for k in LEG) for n in names])
     runner = ReceiveRunner(wrapped, agent_cfg.to_dict(), log_dir=None, device=agent_cfg.device, leg_mask=leg_mask, critic_warmup=0)
+    runner.recv_curriculum = None  # evaluation: fixed level, no curriculum state from the checkpoint
     runner.load(args_cli.checkpoint, load_optimizer=False)
     u.set_level(args_cli.level)
+    if args_cli.real_serves:
+        u.set_real_serves(args_cli.real_serves, 1.0)
+    if args_cli.v4:
+        u.approach_cap = 2.3
     u.set_stage(args_cli.stage)
     policy = runner.alg.policy
     policy.eval()

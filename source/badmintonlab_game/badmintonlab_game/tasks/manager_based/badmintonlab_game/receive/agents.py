@@ -98,6 +98,8 @@ class ReceiveRunner(ServeRunner):
         self.leg_mask = leg_mask.to(self.device)
         self.critic_warmup = critic_warmup
         self._actor_snapshot = None
+        self.v4_real_frac = 0.0
+        self.v4_real_from = 99
 
     def snapshot_actor(self) -> None:
         """Critic-only warm-up for ``critic_warmup`` iterations counted from now (also after loading S1)."""
@@ -129,6 +131,7 @@ class ReceiveRunner(ServeRunner):
             if cur.level != unwrapped.level:
                 unwrapped.set_level(cur.level)
             self.apply_recv_params()
+            self.apply_v4_params()
             for event in cur.events:
                 print(f"[Curriculum] {event} at iteration {it}", flush=True)
                 if self.log_dir is not None:
@@ -155,6 +158,10 @@ class ReceiveRunner(ServeRunner):
         src = [k[4:-4] for k in rates if k.startswith("src_") and k.endswith("_hit")]
         if len(src) > 1:
             print("[SRC] " + " ".join(f"{s}:hit={rates[f'src_{s}_hit']:.2f}/st={rates[f'src_{s}_station_ok']:.2f}/n={rates[f'src_{s}_n']:.0f}" for s in src), flush=True)
+        if isinstance(cur, core.SpeedCurriculum):
+            print("[V4] lvl={} cap={:.1f} real={:.2f} ".format(cur.level, unwrapped.approach_cap, unwrapped.real_frac)
+                  + " ".join(f"L{i}={rates[f'L{i}_station_ok']:.2f}/{rates[f'L{i}_n']:.0f}" for i in range(6))
+                  + " band_ema={:.3f} fall_ema={:.4f}".format(cur.ema.get(f"L{cur.level}_station_ok", float('nan')), cur.ema.get("fall_ball", float('nan'))), flush=True)
         print(
             "[Recv] lvl={} ".format(unwrapped.level)
             + " ".join(f"{k}={rates[k]:.3f}" for k in ("station_ok", "face_ok", "d_mean", "d_p50", "head_deg", "v_to_station", "fall", "touch"))
@@ -168,6 +175,16 @@ class ReceiveRunner(ServeRunner):
         if cur is not None and cur.stop_reason:
             self.stop_reason = cur.stop_reason
             raise StopTraining
+
+    def apply_v4_params(self) -> None:
+        """S1 V4: approach cap and the real-serve share follow the speed level."""
+        cur = self.recv_curriculum
+        if not isinstance(cur, core.SpeedCurriculum):
+            return
+        u = self.env.unwrapped
+        u.approach_cap = cur.approach_cap()
+        if u.real is not None:
+            u.real_frac = self.v4_real_frac if cur.level >= self.v4_real_from else 0.0
 
     def apply_recv_params(self) -> None:
         """S2: push the blended weights and annealed tolerances into the env (S1 uses the env defaults)."""
@@ -197,4 +214,5 @@ class ReceiveRunner(ServeRunner):
         if cur is not None:
             self.env.unwrapped.set_level(cur.level)
             self.apply_recv_params()
+            self.apply_v4_params()
         return infos

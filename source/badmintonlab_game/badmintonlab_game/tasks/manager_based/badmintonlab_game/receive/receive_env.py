@@ -48,7 +48,7 @@ S2_WEIGHTS = dict(
 SWING_UPPER = ("Waist", "Right_Shoulder_Pitch", "Right_Shoulder_Roll", "Right_Elbow_Pitch", "Right_Elbow_Yaw")
 STAT_KEYS = ("balls", "station_ok", "face_ok", "d_sum", "head_sum", "touch", "episodes", "falls", "vel_sum", "vel_n", "fall_low", "fall_tilt", "fall_step_sum", "timeouts",
              "ended", "hit", "ret_in", "ret_net", "ret_out", "epos_sum", "eori_sum", "vn_sum", "swing_sum")  # fmt: skip
-N_LVL = 4
+N_LVL = 6  # V4 speed levels (legacy distance levels use 0-3)
 
 
 def _wrap(a: torch.Tensor) -> torch.Tensor:
@@ -59,9 +59,16 @@ class ReceiveBadmintonEnv(ServeBadmintonEnv):
     def __init__(self, cfg, render_mode=None, **kwargs):
         super().__init__(cfg=cfg, render_mode=render_mode, **kwargs)
         n, dev = self.num_envs, self.device
-        self.table = core.build_feeder_table(cfg.feeder_rows, seed=cfg.feeder_seed, device=dev)
+        # 11-09 S1 V4: wide table with a free hitting height, levels by required speed, return-home gaps.
+        self.v4 = bool(getattr(cfg, "feeder_v4", False))
+        if self.v4:
+            self.table = core.build_feeder_table_v4(cfg.feeder_rows, seed=cfg.feeder_seed, device=dev)
+            self._v_sorted = core.required_speed(self.table.d_need, self.table.t_arr)
+        else:
+            self.table = core.build_feeder_table(cfg.feeder_rows, seed=cfg.feeder_seed, device=dev)
         self.level = 0
-        self._bounds = core.level_bounds(self.table, self.level)
+        self._bounds = self._level_bounds(self.level)
+        self.ready_xy = torch.tensor(core.READY_ROOT_XY, device=dev)
         self.weights = {k: float(S1_WEIGHTS.get(k, 0.0)) for k in TERMS}
         self.balls_per_episode = int(cfg.balls_per_episode)
         self.gap_steps = int(round(cfg.ball_gap_s / self.step_dt))
@@ -120,16 +127,22 @@ class ReceiveBadmintonEnv(ServeBadmintonEnv):
     def _make_serve_reward(self):
         return None
 
+    def _level_bounds(self, level: int) -> tuple[int, int]:
+        if self.v4:
+            return core.speed_level_bounds(self._v_sorted, level)
+        return core.level_bounds(self.table, level)
+
     def set_level(self, level: int) -> None:
         self.level = int(level)
-        self._bounds = core.level_bounds(self.table, self.level)
+        self._bounds = self._level_bounds(self.level)
 
     def set_real_serves(self, paths: list, frac: float) -> list:
         """Load recorded serve files (receiver frame) and feed ``frac`` of the balls from them, styles equally."""
         tabs, infos, src = [], [], []
         for i, p in enumerate(paths):
             d = torch.load(p, map_location="cpu")
-            t, info = core.table_from_serves(d["pos"], d["vel"], device=self.device)
+            maker = core.table_from_serves_v4 if self.v4 else core.table_from_serves
+            t, info = maker(d["pos"], d["vel"], device=self.device)
             info["file"] = p
             tabs.append(t)
             infos.append(info)
@@ -186,7 +199,16 @@ class ReceiveBadmintonEnv(ServeBadmintonEnv):
         self.station[ids] = f["station"]
         self.int_pos[ids] = f["int_pos"]
         self.t_arr[ids] = f["t_arr"]
-        self.ball_lvl[ids] = core.ball_level(f["d_need"])
+        if self.v4:
+            # Level of the ball as faced: required speed from where the robot is now (it is not reset between balls).
+            root_xy = self._robots[0].data.root_pos_w[ids, :2] - origins[:, :2]
+            # Right after a reset the articulation buffers may still hold the old pose: use the ready root.
+            fresh = (self.episode_length_buf[ids] == 0)[:, None]
+            root_xy = torch.where(fresh, self.ready_xy.expand_as(root_xy), root_xy)
+            d_now = torch.linalg.norm(f["station"] - root_xy, dim=-1)
+            self.ball_lvl[ids] = core.speed_level(core.required_speed(d_now, f["t_arr"]))
+        else:
+            self.ball_lvl[ids] = core.ball_level(f["d_need"])
         self.arr_step[ids] = torch.round(f["t_arr"] / self.step_dt).long().clamp(min=1)
         self.ball_active[ids] = True
         self.ball_steps[ids] = 0
@@ -335,6 +357,13 @@ class ReceiveBadmintonEnv(ServeBadmintonEnv):
         self.gap_left = torch.where(ended, torch.full_like(self.gap_left, self.gap_steps), self.gap_left)
         self._d = d
         self._v_to = v
+        if self.v4:
+            to_h = self.ready_xy - root_xy
+            dh = torch.linalg.norm(to_h, dim=-1)
+            vh = (robot.data.root_lin_vel_w[:, :2] * to_h / dh.clamp(min=1e-6).unsqueeze(-1)).sum(-1)
+            self._d_home = dh
+            self._d = torch.where(act, d, dh)
+            self._v_to = torch.where(act, v, vh)
 
     def _yaw(self) -> torch.Tensor:
         q = self._robots[0].data.root_quat_w
@@ -349,9 +378,15 @@ class ReceiveBadmintonEnv(ServeBadmintonEnv):
         d = self._d
         active = self.ball_active.float()
         far = (self.ball_active & (d > 0.3)).float()
+        if self.v4:
+            # Between balls: go back towards the ready root (every play rally starts there), half weight.
+            gap = (~self.ball_active).float() * 0.5
+            active = active + gap
+            far = far + gap * (self._d_home > 0.3).float()
         v["track"] = w["track"] * core.r_track(d) * active
         # 11-08 local change (S1 300-iter check failed: v_to_station ~0): dense speed towards the station.
-        v["approach"] = w["approach"] * self._v_to.clamp(-0.5, self.approach_cap) * far
+        lo = -self.approach_cap if self.v4 else -0.5  # V4: symmetric clamp (no away-fast / back-fast farming)
+        v["approach"] = w["approach"] * self._v_to.clamp(lo, self.approach_cap) * far
         dpsi = _wrap(self._yaw() - self.ready_yaw)
         v["face_front"] = w["face_front"] * torch.exp(-((dpsi / 0.4) ** 2))
         z = robot.data.root_pos_w[:, 2] - self.scene.env_origins[:, 2]

@@ -32,7 +32,7 @@ def cfg_predict():
     tree = ast.parse(src)
     keep = [n for n in tree.body if (isinstance(n, ast.FunctionDef) and n.name == "_predict_intercept")
             or (isinstance(n, ast.Assign) and any(getattr(t, "id", "").startswith("_") for t in n.targets))]  # fmt: skip
-    ns = {"torch": torch}
+    ns = {"torch": torch, "math": math}
     exec(compile(ast.Module(body=keep, type_ignores=[]), "player_cfg_subset", "exec"), ns)
     return ns["_predict_intercept"]
 
@@ -47,8 +47,9 @@ def _feeds(n=1000, seed=0):
 
 
 def test_submission_copy_matches_core(core, cfg_predict):
+    """V4 (11-09): the submission copy is the free-height predictor."""
     pos, vel = _feeds()
-    a = core.predict_intercept(pos, vel)
+    a = core.predict_intercept_multi(pos, vel)
     b = cfg_predict(pos, vel)
     assert torch.equal(a[2], b[2])
     assert torch.allclose(a[0], b[0], atol=1e-6) and torch.allclose(a[1], b[1], atol=1e-6)

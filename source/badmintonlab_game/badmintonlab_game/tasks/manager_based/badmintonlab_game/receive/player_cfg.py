@@ -180,42 +180,61 @@ def make_events_cfg(side: int) -> type:
 
 
 
-# ------------------------------------------------------------------ intercept prediction (P5 V3.1 4.1)
+# ------------------------------------------------------------------ intercept prediction (P5 V3.1 4.1; V4 11-09)
+# V4: free hitting height. Among the descending crossings of _HIT_ZS inside the band, pick the one with the
+# lowest score d - _V_REF t + _Z_PREF |z - 1|, d = distance from the ready root to the station of that point.
+# The score depends only on the trajectory and is invariant to a common time shift, so the target is stable
+# during the flight. Must stay identical to receive/core.predict_intercept_multi (tested).
 _DRAG_OVER_MASS = 0.00110 / 0.00519
-_HIT_Z = 1.0
+_HIT_ZS = (0.8, 0.9, 1.0, 1.1, 1.2)
 _BAND_X = (-5.0, -0.5)
 _BAND_Y = 2.4
+_V_REF = 1.5
+_Z_PREF = 0.3
+_READY_XY = (-3.251, 0.605)
+_READY_YAW = -0.043
+_O_READY = (0.825, -0.521)
 
 
 def _predict_intercept(pos: torch.Tensor, vel: torch.Tensor, dt: float = 0.03, steps: int = 70):
-    """First descending crossing of z=1.0 m inside the receiver band, canonical frame (own half x<0).
-
-    Fixed number of steps, no host sync. Must stay identical to receive/core.predict_intercept (tested).
-    """
+    """Hitting point with a free height, canonical frame (own half x<0). Returns (point, time, valid)."""
     p = pos.clone()
     v = vel.clone()
     n = p.shape[0]
+    zs = torch.tensor(_HIT_ZS, device=p.device, dtype=p.dtype)
+    k_n = zs.numel()
     gv = torch.tensor((0.0, 0.0, -9.81), device=p.device, dtype=p.dtype)
-    found = torch.zeros(n, dtype=torch.bool, device=p.device)
+    found = torch.zeros(n, k_n, dtype=torch.bool, device=p.device)
     alive = p[:, 2] > 0.03
-    pt = torch.zeros_like(p)
-    t_hit = torch.zeros(n, device=p.device, dtype=p.dtype)
+    pt = torch.zeros(n, k_n, 3, device=p.device, dtype=p.dtype)
+    t_hit = torch.zeros(n, k_n, device=p.device, dtype=p.dtype)
     for k in range(steps):
         speed = torch.linalg.norm(v, dim=-1, keepdim=True)
         vm = v + 0.5 * dt * (gv - _DRAG_OVER_MASS * speed * v)
         speed_m = torch.linalg.norm(vm, dim=-1, keepdim=True)
         vn = v + dt * (gv - _DRAG_OVER_MASS * speed_m * vm)
         pn = p + dt * vm
-        cross = alive & ~found & (p[:, 2] >= _HIT_Z) & (pn[:, 2] < _HIT_Z)
-        a = (p[:, 2] - _HIT_Z) / (p[:, 2] - pn[:, 2]).clamp(min=1e-9)
-        q = p + a[:, None] * (pn - p)
-        pt = torch.where(cross[:, None], q, pt)
+        z0, z1 = p[:, 2:3], pn[:, 2:3]
+        cross = alive[:, None] & ~found & (z0 >= zs) & (z1 < zs)
+        a = (z0 - zs) / (z0 - z1).clamp(min=1e-9)
+        q = p[:, None, :] + a[..., None] * (pn - p)[:, None, :]
+        pt = torch.where(cross[..., None], q, pt)
         t_hit = torch.where(cross, (k + a) * dt, t_hit)
         found = found | cross
         p, v = pn, vn
         alive = alive & (p[:, 2] > 0.03)
-    valid = found & (pt[:, 0] >= _BAND_X[0]) & (pt[:, 0] <= _BAND_X[1]) & (pt[:, 1].abs() <= _BAND_Y)
-    return pt, t_hit, valid
+    ok = found & (pt[..., 0] >= _BAND_X[0]) & (pt[..., 0] <= _BAND_X[1]) & (pt[..., 1].abs() <= _BAND_Y)
+    c, s = math.cos(_READY_YAW), math.sin(_READY_YAW)
+    ox = c * _O_READY[0] - s * _O_READY[1]
+    oy = s * _O_READY[0] + c * _O_READY[1]
+    sx = pt[..., 0] - ox - _READY_XY[0]
+    sy = pt[..., 1] - oy - _READY_XY[1]
+    d = torch.sqrt(sx * sx + sy * sy)
+    score = d - _V_REF * t_hit + _Z_PREF * (zs - 1.0).abs()
+    score = torch.where(ok, score, torch.full_like(score, 1e9))
+    best = score.argmin(dim=1)
+    idx = torch.arange(n, device=p.device)
+    return pt[idx, best], t_hit[idx, best], ok.any(dim=1)
 
 
 def intercept_obs(env: ManagerBasedEnv, asset_cfg: SceneEntityCfg, shuttle_cfg: SceneEntityCfg, side: int) -> torch.Tensor:

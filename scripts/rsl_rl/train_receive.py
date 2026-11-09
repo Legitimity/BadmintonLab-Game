@@ -54,6 +54,10 @@ parser.add_argument("--real_serves", nargs="*", default=[], help="serve files fr
 parser.add_argument("--real_frac", type=float, default=0.0, help="fraction of balls from the real serves")
 parser.add_argument("--w", nargs="*", default=[], help="S2 weight overrides, e.g. track=3 approach=2")
 parser.add_argument("--approach_cap", type=float, default=0.8, help="approach reward speed cap, m/s")
+# 11-09 S1 V4 (from p3_final): wide feeder with a free hitting height, required-speed levels, return-home gaps.
+parser.add_argument("--v4", action="store_true", help="S1 V4 feeder / curriculum (see core.SpeedCurriculum)")
+parser.add_argument("--v4_real_from", type=int, default=3, help="V4: mix real serves from this speed level on")
+parser.add_argument("--ball_gap_s", type=float, default=None, help="gap between balls (V4 default 1.0 s)")
 parser.add_argument("--s2_other_std", type=float, default=0.3, help="S2 start: raise non-leg std to at least this.")
 cli_args.add_rsl_rl_args(parser)
 AppLauncher.add_app_launcher_args(parser)
@@ -117,6 +121,11 @@ def main(env_cfg, agent_cfg):
         env_cfg.sim.device = args_cli.device
         agent_cfg.device = args_cli.device
     apply_physics(env_cfg, args_cli.dt_ms)
+    if args_cli.v4:
+        env_cfg.feeder_v4 = True
+        env_cfg.ball_gap_s = 1.0
+    if args_cli.ball_gap_s is not None:
+        env_cfg.ball_gap_s = args_cli.ball_gap_s
 
     log_root = os.path.abspath(os.path.join("logs", "rsl_rl", agent_cfg.experiment_name))
     resume_path = find_latest(log_root, agent_cfg.run_name) if (args_cli.auto_resume and agent_cfg.run_name) else None
@@ -127,7 +136,8 @@ def main(env_cfg, agent_cfg):
                                               mini_batches=agent_cfg.algorithm.num_mini_batches, leg_std=args_cli.leg_std,
                                               stage=args_cli.stage, init_from=args_cli.init_from, dt_ms=args_cli.dt_ms,
                                               real_serves=args_cli.real_serves, real_frac=args_cli.real_frac, w=args_cli.w,
-                                              approach_cap=args_cli.approach_cap))  # fmt: skip
+                                              approach_cap=args_cli.approach_cap, v4=args_cli.v4,
+                                              v4_real_from=args_cli.v4_real_from, ball_gap_s=env_cfg.ball_gap_s))  # fmt: skip
 
     env = gym.make(args_cli.task, cfg=env_cfg)
     try:
@@ -152,6 +162,14 @@ def main(env_cfg, agent_cfg):
                 for info in unwrapped.set_real_serves(args_cli.real_serves, args_cli.real_frac):
                     print(f"[INFO] real serves {info}", flush=True)
             print(f"[INFO] S2 weights {s2w}; approach_cap {args_cli.approach_cap}; real_frac {args_cli.real_frac}", flush=True)
+        elif args_cli.v4:
+            cur = core.SpeedCurriculum(level=args_cli.level)
+            unwrapped.set_level(cur.level)
+            if args_cli.real_serves:
+                for info in unwrapped.set_real_serves(args_cli.real_serves, 0.0):
+                    print(f"[INFO] real serves {info}", flush=True)
+            print(f"[INFO] S1 V4: table rows {len(unwrapped.table)}; speed edges {core.SPEED_EDGES}; caps {core.APPROACH_CAPS}; "
+                  f"real serves {args_cli.real_frac} from level {args_cli.v4_real_from}; gap {env_cfg.ball_gap_s} s", flush=True)
         else:
             cur = None if args_cli.no_curriculum else core.ReceiveCurriculum(level=args_cli.level)
             unwrapped.set_level(args_cli.level)
@@ -159,6 +177,9 @@ def main(env_cfg, agent_cfg):
                                time_budget_hours=args_cli.time_budget_hours, curriculum=cur, leg_mask=leg_mask,
                                critic_warmup=0 if resume_path else args_cli.critic_warmup)  # fmt: skip
         runner.stop_on_pass = not args_cli.no_stop_on_pass
+        runner.v4_real_frac = args_cli.real_frac
+        runner.v4_real_from = args_cli.v4_real_from
+        runner.apply_v4_params()
         runner.install_signal_handlers()
         if resume_path:
             print(f"[INFO] Resuming from {resume_path}")

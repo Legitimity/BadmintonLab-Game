@@ -69,6 +69,78 @@ def predict_intercept(
     return pt, t_hit, valid
 
 
+# ------------------------------------------------------------------ S1 V4 (11-09): free hitting height
+# The hitting point is chosen among the descending crossings of several heights. The choice depends only
+# on the trajectory (not on the robot), with a score that is invariant to a common time shift, so the
+# target does not switch while the shuttle flies: score = d_k - V_REF t_k + Z_PREF |z_k - 1.0|, where
+# d_k is the distance from the ready root to the station of crossing k. A copy lives in
+# receive/player_cfg.py (``_predict_intercept``); a test checks they agree.
+HIT_ZS = (0.8, 0.9, 1.0, 1.1, 1.2)  # 0.7/1.3 tried offline: half the balls went to 0.7 (too low for the swing)
+V_REF = 1.5  # m of walking per s of extra flight time
+Z_PREF = 0.3  # m-equivalent per m of height away from 1.0 (prefer the trained height on ties)
+REACT = 0.2
+REACH_SLACK = 0.3  # r_track is flat within 0.3 m
+
+
+def _ready_offset_xy(yaw: float = READY_YAW, o_ready=O_READY) -> tuple[float, float]:
+    c, s = math.cos(yaw), math.sin(yaw)
+    return c * o_ready[0] - s * o_ready[1], s * o_ready[0] + c * o_ready[1]
+
+
+def predict_intercept_multi(
+    pos: torch.Tensor,
+    vel: torch.Tensor,
+    dt: float = 0.03,
+    steps: int = 70,
+    hit_zs: tuple = HIT_ZS,
+    band_x: tuple[float, float] = BAND_X,
+    band_y: float = BAND_Y,
+    drag: float = DRAG_OVER_MASS,
+    g: float = GRAVITY,
+):
+    """Hitting point with a free height (V4). Returns ``(point (N,3), time (N,), valid (N,))``."""
+    p = pos.clone()
+    v = vel.clone()
+    n = p.shape[0]
+    zs = torch.tensor(hit_zs, device=p.device, dtype=p.dtype)
+    k_n = zs.numel()
+    gv = torch.tensor((0.0, 0.0, -g), device=p.device, dtype=p.dtype)
+    found = torch.zeros(n, k_n, dtype=torch.bool, device=p.device)
+    alive = p[:, 2] > 0.03
+    pt = torch.zeros(n, k_n, 3, device=p.device, dtype=p.dtype)
+    t_hit = torch.zeros(n, k_n, device=p.device, dtype=p.dtype)
+    for k in range(steps):
+        speed = torch.linalg.norm(v, dim=-1, keepdim=True)
+        vm = v + 0.5 * dt * (gv - drag * speed * v)
+        speed_m = torch.linalg.norm(vm, dim=-1, keepdim=True)
+        vn = v + dt * (gv - drag * speed_m * vm)
+        pn = p + dt * vm
+        z0, z1 = p[:, 2:3], pn[:, 2:3]
+        cross = alive[:, None] & ~found & (z0 >= zs) & (z1 < zs)
+        a = (z0 - zs) / (z0 - z1).clamp(min=1e-9)
+        q = p[:, None, :] + a[..., None] * (pn - p)[:, None, :]
+        pt = torch.where(cross[..., None], q, pt)
+        t_hit = torch.where(cross, (k + a) * dt, t_hit)
+        found = found | cross
+        p, v = pn, vn
+        alive = alive & (p[:, 2] > 0.03)
+    ok = found & (pt[..., 0] >= band_x[0]) & (pt[..., 0] <= band_x[1]) & (pt[..., 1].abs() <= band_y)
+    ox, oy = _ready_offset_xy()
+    sx = pt[..., 0] - ox - READY_ROOT_XY[0]
+    sy = pt[..., 1] - oy - READY_ROOT_XY[1]
+    d = torch.sqrt(sx * sx + sy * sy)
+    score = d - V_REF * t_hit + Z_PREF * (zs - 1.0).abs()
+    score = torch.where(ok, score, torch.full_like(score, 1e9))
+    best = score.argmin(dim=1)
+    idx = torch.arange(n, device=p.device)
+    return pt[idx, best], t_hit[idx, best], ok.any(dim=1)
+
+
+def required_speed(d_need: torch.Tensor, t_arr: torch.Tensor) -> torch.Tensor:
+    """Mean walking speed needed after the reaction time, with the flat r_track zone as slack."""
+    return (d_need - REACH_SLACK).clamp(min=0.0) / (t_arr - REACT).clamp(min=0.05)
+
+
 def simulate_feed(pos: torch.Tensor, vel: torch.Tensor, dt: float = 0.01, steps: int = 400):
     """Net-crossing height (going -x), landing point, for feeds launched from x > 0."""
     p = pos.clone()
@@ -231,6 +303,185 @@ def table_from_serves(pos: torch.Tensor, vel: torch.Tensor, device="cpu") -> tup
     info = dict(n_in=int(pos.shape[0]), n_kept=int(keep.sum()), d_need_p50=float(d_need[keep].median()) if keep.any() else float("nan"),
                 t_p50=float(t[keep].median()) if keep.any() else float("nan"))  # fmt: skip
     return FeederTable(sel(pos), sel(vel), sel(pt), sel(t), sel(d_need), sel(station)), info
+
+
+def build_feeder_table_v4(
+    n: int = 300_000,
+    seed: int = 0,
+    device="cpu",
+    t_min: float = 0.7,
+    v_max: float = 2.4,
+    launch_x=(2.0, 3.0),
+    launch_y=(-0.4, 0.4),
+    height=(0.6, 1.15),
+    speed=(5.0, 16.0),
+    elev_deg=(20.0, 62.0),
+    azim_deg=(-25.0, 25.0),
+) -> FeederTable:
+    """S1 V4 (11-09): wide Monte-Carlo feeds, free hitting height, no reachability filter.
+
+    The launch box covers the recorded serves (contact x 2.2-2.4, z 0.74-0.84, 8-13 m/s, 32-53 deg).
+    Kept: legal (net clearance, singles court), an intercept in the band, flight >= ``t_min`` and a required
+    speed <= ``v_max``. ``d_need`` keeps its meaning (distance ready root -> station); the curriculum key
+    is ``required_speed(d_need, t_arr)``. Sorted by that speed.
+    """
+    gen = torch.Generator(device="cpu").manual_seed(seed)
+
+    def u(lo, hi):
+        return lo + (hi - lo) * torch.rand(n, generator=gen)
+
+    pos = torch.stack((u(*launch_x), u(*launch_y), u(*height)), dim=-1)
+    sp, el, az = u(*speed), torch.deg2rad(u(*elev_deg)), torch.deg2rad(u(*azim_deg))
+    vel = torch.stack((-sp * torch.cos(el) * torch.cos(az), sp * torch.cos(el) * torch.sin(az), sp * torch.sin(el)), dim=-1)
+    pos, vel = pos.to(device), vel.to(device)
+    net_z, land = simulate_feed(pos, vel)
+    legal = (net_z >= NET_CLEAR) & (land[:, 0] <= 0.0) & (land[:, 0] >= -6.7) & (land[:, 1].abs() <= 2.59)
+    pt, t, ok = predict_intercept_multi(pos, vel)
+    station = station_from_intercept(pt[:, :2])
+    ready = torch.tensor(READY_ROOT_XY, device=pos.device)
+    d_need = torch.linalg.norm(station - ready, dim=-1)
+    v_req = required_speed(d_need, t)
+    keep = legal & ok & (t >= t_min) & (v_req <= v_max)
+    order = torch.argsort(v_req[keep])
+    sel = lambda x: x[keep][order]  # noqa: E731
+    return FeederTable(sel(pos), sel(vel), sel(pt), sel(t), sel(d_need), sel(station))
+
+
+def table_from_serves_v4(pos: torch.Tensor, vel: torch.Tensor, device="cpu") -> tuple[FeederTable, dict]:
+    """Recorded serves with the free-height intercept; no time / reachability filter (sorted by speed)."""
+    pos, vel = pos.to(device).float(), vel.to(device).float()
+    pt, t, ok = predict_intercept_multi(pos, vel)
+    station = station_from_intercept(pt[:, :2])
+    ready = torch.tensor(READY_ROOT_XY, device=pos.device)
+    d_need = torch.linalg.norm(station - ready, dim=-1)
+    keep = ok & (t > 0.1)
+    v_req = required_speed(d_need, t)
+    order = torch.argsort(v_req[keep])
+    sel = lambda x: x[keep][order]  # noqa: E731
+    vk = v_req[keep]
+    info = dict(n_in=int(pos.shape[0]), n_kept=int(keep.sum()), v_req_p50=float(vk.median()) if keep.any() else float("nan"),
+                d_need_p50=float(d_need[keep].median()) if keep.any() else float("nan"),
+                t_p50=float(t[keep].median()) if keep.any() else float("nan"))  # fmt: skip
+    return FeederTable(sel(pos), sel(vel), sel(pt), sel(t), sel(d_need), sel(station)), info
+
+
+# Speed levels (V4): upper edges of the required speed per level, m/s. The last level is open (<= v_max).
+SPEED_EDGES = (0.25, 0.5, 0.8, 1.1, 1.5, float("inf"))
+APPROACH_CAPS = (0.6, 0.9, 1.2, 1.5, 1.9, 2.3)  # approach reward cap per level, m/s
+
+
+def speed_level(v_req: torch.Tensor, edges=SPEED_EDGES) -> torch.Tensor:
+    e = torch.tensor(edges[:-1], device=v_req.device, dtype=v_req.dtype)
+    return torch.bucketize(v_req, e, right=True)
+
+
+def speed_level_bounds(v_sorted: torch.Tensor, level: int, edges=SPEED_EDGES) -> tuple[int, int]:
+    """(lo, hi) rows of a table sorted by required speed: [lo, hi) is this level's band."""
+    if level == LEVEL_ALL_V4:
+        return 0, int(v_sorted.numel())
+    lo = 0 if level == 0 else int(torch.searchsorted(v_sorted, torch.tensor([edges[level - 1]], device=v_sorted.device, dtype=v_sorted.dtype)).item())
+    edge = edges[level]
+    hi = int(v_sorted.numel()) if math.isinf(edge) else int(torch.searchsorted(v_sorted, torch.tensor([edge], device=v_sorted.device, dtype=v_sorted.dtype)).item())
+    return lo, max(hi, lo + 1)
+
+
+LEVEL_ALL_V4 = 99  # uniform over the whole V4 table
+
+
+@dataclass
+class SpeedCurriculum:
+    """S1 V4 (11-09): footwork with a required-speed curriculum.
+
+    The paper samples S1 targets uniformly from one filtered corpus and moves on when the stage objective
+    has converged; it gives no in-stage schedule. Our robot starts from p3_final's fixed serve stance, so we
+    grow the difficulty instead of starting wide: level k feeds 80% from its speed band and 20% from the
+    easier rows (``sample_rows``). Promotion: EMA of the **band's own** station rate >= ``promote[k]`` and
+    falls per ball <= ``level_fall`` after ``level_min`` iterations. Gate (stage passed), at the top level:
+    band station rate >= ``gate_band``, overall station rate >= ``gate_station``, heading ok >= ``gate_face``,
+    falls per ball <= ``gate_fall``.
+    """
+
+    level: int = 0
+    stage: str = "S1"
+    n_levels: int = len(SPEED_EDGES)
+    promote: tuple = (0.6, 0.55, 0.5, 0.45, 0.4)
+    level_ema: int = 100
+    level_min: int = 150
+    level_fall: float = 0.03
+    gate_ema: int = 200
+    gate_min: int = 300  # iterations at the top level before the gate is judged
+    gate_band: float = 0.35
+    gate_station: float = 0.45
+    gate_face: float = 0.5
+    gate_fall: float = 0.03
+    gate_max: int = 8000
+    iters_in_level: int = 0
+    iters_in_stage: int = 0
+    ema: dict = field(default_factory=dict)
+    gate_ema_vals: dict = field(default_factory=dict)
+    passed: bool = False
+    stop_reason: str | None = None
+    history: list = field(default_factory=list)
+    events: list = field(default_factory=list)
+    version: str = "v4"
+
+    @property
+    def top(self) -> int:
+        return self.n_levels - 1
+
+    def _band(self, store: dict) -> float:
+        return store.get(f"L{self.level}_station_ok", 0.0)
+
+    def update(self, iteration: int, rates: dict) -> None:
+        self.events = []
+        self.iters_in_level += 1
+        self.iters_in_stage += 1
+        ReceiveCurriculum._ema(self.ema, rates, self.level_ema)
+        if self.level == self.top:
+            ReceiveCurriculum._ema(self.gate_ema_vals, rates, self.gate_ema)
+        e = self.ema
+        if self.level < self.top and self.iters_in_level >= self.level_min:
+            if self._band(e) >= self.promote[self.level] and e.get("fall_ball", 1.0) <= self.level_fall:
+                self.history.append(dict(event=f"level_{self.level + 1}", iteration=iteration, ema=dict(e)))
+                self.level += 1
+                self.iters_in_level = 0
+                self.ema = {}
+                self.events.append(f"level{self.level}")
+        if self.level == self.top and not self.passed and self.iters_in_level >= self.gate_min:
+            g = self.gate_ema_vals
+            if (
+                self._band(g) >= self.gate_band
+                and g.get("station_ok", 0.0) >= self.gate_station
+                and g.get("face_ok", 0.0) >= self.gate_face
+                and g.get("fall_ball", 1.0) <= self.gate_fall
+            ):
+                self.passed = True
+                self.history.append(dict(event="passed_S1", iteration=iteration, ema=dict(g)))
+                self.events.append("passed_S1")
+        for m in (500, 1000, 1500, 2000, 3000, 4000, 5000, 6000):
+            if self.iters_in_stage == m:
+                self.events.append(f"s1_{m}")
+        if not self.passed and self.iters_in_stage >= self.gate_max:
+            self.stop_reason = "S1_max_iters"
+
+    def approach_cap(self) -> float:
+        return APPROACH_CAPS[min(self.level, len(APPROACH_CAPS) - 1)]
+
+    def log_values(self) -> dict:
+        out = {"Curriculum/level": float(self.level), "Curriculum/passed": float(self.passed), "Curriculum/approach_cap": self.approach_cap()}
+        out.update({f"Curriculum/ema_{k}": v for k, v in self.ema.items() if k in ("station_ok", "fall_ball", "v_to_station", f"L{self.level}_station_ok")})
+        out.update({f"Curriculum/gate_{k}": v for k, v in self.gate_ema_vals.items() if k in ("station_ok", "fall_ball", "face_ok", f"L{self.level}_station_ok")})
+        return out
+
+    def state_dict(self) -> dict:
+        keys = ("level", "stage", "iters_in_level", "iters_in_stage", "ema", "gate_ema_vals", "passed", "history", "version")
+        return {k: getattr(self, k) for k in keys}
+
+    def load_state_dict(self, state: dict) -> None:
+        if state.get("version") != "v4":
+            raise ValueError("not a V4 S1 curriculum state")
+        for k, v in state.items():
+            setattr(self, k, v)
 
 
 def concat_tables(tables: list) -> FeederTable:

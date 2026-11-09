@@ -1,0 +1,153 @@
+"""CPU tests of S1 V4 (11-09): free hitting height, wide feeder, speed curriculum."""
+
+from __future__ import annotations
+
+import importlib.util
+import sys
+from pathlib import Path
+
+import pytest
+import torch
+
+ROOT = Path(__file__).resolve().parents[1]
+RECV = ROOT / "source/badmintonlab_game/badmintonlab_game/tasks/manager_based/badmintonlab_game/receive"
+
+
+@pytest.fixture(scope="module")
+def core():
+    spec = importlib.util.spec_from_file_location("recv_core_v4", RECV / "core.py")
+    mod = importlib.util.module_from_spec(spec)
+    sys.modules["recv_core_v4"] = mod
+    spec.loader.exec_module(mod)
+    return mod
+
+
+@pytest.fixture(scope="module")
+def table(core):
+    return core.build_feeder_table_v4(60_000, seed=5)
+
+
+def _advance(core, pos, vel, t, dt=0.001):
+    """Fine integration of the play drag law for ``t`` seconds."""
+    g = torch.tensor((0.0, 0.0, -core.GRAVITY))
+    for _ in range(int(round(t / dt))):
+        s = torch.linalg.norm(vel, dim=-1, keepdim=True)
+        vel = vel + dt * (g - core.DRAG_OVER_MASS * s * vel)
+        pos = pos + dt * vel
+    return pos, vel
+
+
+def test_multi_height_point_is_a_crossing(core, table):
+    pt, t, ok = core.predict_intercept_multi(table.launch_pos[:2000], table.launch_vel[:2000])
+    assert ok.all()
+    z = pt[:, 2]
+    assert torch.all(torch.stack([(z - h).abs() < 1e-4 for h in core.HIT_ZS]).any(0))
+    assert torch.allclose(pt, table.int_pos[:2000], atol=1e-5)
+
+
+def test_target_stable_during_flight(core, table):
+    """The chosen point must not jump while the shuttle flies (score invariant to a time shift)."""
+    idx = torch.randperm(len(table), generator=torch.Generator().manual_seed(0))[:400]
+    pos, vel = table.launch_pos[idx], table.launch_vel[idx]
+    pt0, t0, ok0 = core.predict_intercept_multi(pos, vel)
+    for lag in (0.2, 0.4):
+        p, v = _advance(core, pos, vel, lag)
+        pt, t, ok = core.predict_intercept_multi(p, v)
+        both = ok0 & ok & (t0 > lag + 0.1)
+        err = (pt[both] - pt0[both]).norm(dim=-1)
+        # Discretisation (dt 0.03) can flip near-ties; require almost all to keep the same point.
+        frac = (err < 0.05).float().mean()
+        assert frac > 0.97, (lag, frac)
+        assert ((t[both] - (t0[both] - lag)).abs() < 0.03).float().mean() > 0.97
+
+
+def test_multi_never_worse_than_fixed_height(core, table):
+    """The free-height score is never worse than the z = 1.0 point when that point exists."""
+    pos, vel = table.launch_pos[:3000], table.launch_vel[:3000]
+    p1, t1, ok1 = core.predict_intercept(pos, vel)
+    pm, tm, okm = core.predict_intercept_multi(pos, vel)
+    ready = torch.tensor(core.READY_ROOT_XY)
+    d1 = torch.linalg.norm(core.station_from_intercept(p1[:, :2]) - ready, dim=-1)
+    dm = torch.linalg.norm(core.station_from_intercept(pm[:, :2]) - ready, dim=-1)
+    both = ok1 & okm
+    s1 = d1 - core.V_REF * t1
+    sm = dm - core.V_REF * tm + core.Z_PREF * (pm[:, 2] - 1.0).abs()
+    assert torch.all(sm[both] <= s1[both] + 1e-4)
+
+
+def test_v4_table_filters_and_levels(core, table):
+    v = core.required_speed(table.d_need, table.t_arr)
+    assert torch.all(v[1:] >= v[:-1] - 1e-6)
+    assert torch.all(table.t_arr >= 0.7) and torch.all(v <= 2.4 + 1e-5)
+    assert torch.all(table.int_pos[:, 0] <= -0.5) and torch.all(table.int_pos[:, 1].abs() <= 2.4)
+    n_lvl = len(core.SPEED_EDGES)
+    prev_hi = 0
+    for k in range(n_lvl):
+        lo, hi = core.speed_level_bounds(v, k)
+        assert lo == prev_hi and hi > lo, (k, lo, hi)
+        assert torch.all(core.speed_level(v[lo:hi]) == k)
+        prev_hi = hi
+    assert prev_hi == len(table)
+    assert core.speed_level_bounds(v, core.LEVEL_ALL_V4) == (0, len(table))
+    counts = torch.bincount(core.speed_level(v), minlength=n_lvl)
+    assert counts.min() > 2000
+    lo, hi = core.speed_level_bounds(v, 0)
+    assert table.d_need[lo:hi].max() < 1.0  # the first level really is a short step
+
+
+def test_required_speed(core):
+    d = torch.tensor([0.2, 1.3, 1.3])
+    t = torch.tensor([1.0, 1.2, 0.2])
+    v = core.required_speed(d, t)
+    assert v[0] == 0.0 and v[1] == pytest.approx(1.0) and v[2] == pytest.approx(1.0 / 0.05)
+
+
+def test_speed_curriculum_promotion_and_gate(core):
+    cur = core.SpeedCurriculum(level_min=5, level_ema=3, gate_min=5, gate_ema=3, gate_max=500)
+    top = cur.top
+    for it in range(20):
+        cur.update(it, {"L0_station_ok": 0.3, "fall_ball": 0.0, "station_ok": 0.9, "face_ok": 0.9})
+    assert cur.level == 0
+    for it in range(20, 40):  # falls block promotion even when the band is good
+        cur.update(it, {"L0_station_ok": 0.9, "fall_ball": 0.2})
+    assert cur.level == 0
+    it = 40
+    caps = [cur.approach_cap()]
+    while cur.level < top and it < 400:
+        cur.update(it, {f"L{cur.level}_station_ok": 0.9, "fall_ball": 0.0, "station_ok": 0.9, "face_ok": 0.9})
+        caps.append(cur.approach_cap())
+        it += 1
+    assert cur.level == top
+    assert caps == sorted(caps) and caps[-1] == core.APPROACH_CAPS[-1]
+    for _ in range(10):  # other levels' rates do not count for the band
+        cur.update(it, {"L0_station_ok": 1.0, f"L{top}_station_ok": 0.1, "fall_ball": 0.0, "station_ok": 0.9, "face_ok": 0.9})
+        it += 1
+    assert not cur.passed
+    for _ in range(10):
+        cur.update(it, {f"L{top}_station_ok": 0.5, "fall_ball": 0.0, "station_ok": 0.6, "face_ok": 0.9})
+        it += 1
+    assert cur.passed and "passed_S1" in [h["event"] for h in cur.history]
+    c2 = core.SpeedCurriculum()
+    c2.load_state_dict(cur.state_dict())
+    assert c2.level == top and c2.passed
+    with pytest.raises(ValueError):
+        c2.load_state_dict(core.ReceiveCurriculum().state_dict())
+
+
+def test_speed_curriculum_ignores_nan_band(core):
+    cur = core.SpeedCurriculum(level_min=1, level_ema=1)
+    for it in range(5):
+        cur.update(it, {"L0_station_ok": float("nan"), "fall_ball": 0.0})
+    assert cur.level == 0
+
+
+def test_real_serves_v4(core):
+    p = Path("D:/rl-badminton-dev/recv_logs/serves/serves_s2.pt")
+    if not p.exists():
+        pytest.skip("recorded serves not available")
+    d = torch.load(p, weights_only=False)
+    t, info = core.table_from_serves_v4(d["pos"][:300], d["vel"][:300])
+    assert info["n_kept"] >= 290
+    v = core.required_speed(t.d_need, t.t_arr)
+    assert torch.all(v[1:] >= v[:-1] - 1e-6)
+    assert 1.2 < info["v_req_p50"] < 3.0  # the wide forehand serve needs fast footwork
