@@ -147,6 +147,14 @@ class ReceiveRunner(ServeRunner):
                 if isinstance(v, float) and math.isnan(v):
                     continue
                 self.writer.add_scalar(k, v, it)
+        if getattr(cur, "stage", "S1") == "S3":
+            print(
+                f"[S3] it={cur.iters_in_stage} "
+                + " ".join(f"{k}={rates[k]:.3f}" for k in ("hit", "ret_over", "ret_in", "ret_net", "ret_out", "pred_mean", "epos_p50", "vn_mean"))
+                + f" | first: hit={rates['first_all_hit']:.3f} over={rates['first_ret_over']:.3f} in={rates['first_ret_in']:.3f}"
+                + f" | home_d={rates['home_d_mean']:.2f} fall_ball={rates['fall_ball']:.4f}",
+                flush=True,
+            )
         if getattr(cur, "stage", "S1") == "S2":
             p = cur.params()
             print(
@@ -193,11 +201,11 @@ class ReceiveRunner(ServeRunner):
     def apply_recv_params(self) -> None:
         """S2: push the blended weights and annealed tolerances into the env (S1 uses the env defaults)."""
         cur = self.recv_curriculum
-        if cur is None or getattr(cur, "stage", "S1") != "S2":
+        if cur is None or getattr(cur, "stage", "S1") not in ("S2", "S3"):
             return
         p = cur.params()
         u = self.env.unwrapped
-        u.set_stage("S2")
+        u.set_stage("S2")  # S3 uses the S2 hold-ready mask (swing joints free)
         u.set_stage_params(p["weights"], p["sigma_p"], p["sigma_r"])
 
     def _infos(self) -> dict:

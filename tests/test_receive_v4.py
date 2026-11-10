@@ -179,3 +179,51 @@ def test_s1_v4_gate_uses_synthetic_station(core):
     for it in range(3):
         cur.update(it, good)
     assert cur.passed  # overall 0.25 (diluted by real serves) does not block the gate
+
+
+# ---------------------------------------------------------------- S3 (11-10)
+def test_return_outcome_score(core):
+    inf = float("inf")
+    net = torch.tensor([2.0, 1.60, 1.40, -inf, 2.0, 2.0, 2.0])
+    land = torch.tensor([[4.0, 0.0], [4.0, 0.0], [4.0, 0.0], [4.0, 0.0], [7.5, 0.0], [4.0, 3.2], [-1.0, 0.0]])
+    s = core.return_outcome_score(net, land)
+    assert s[0] == pytest.approx(1.0)  # clears by > margin, lands in
+    assert 0.8 < s[1] < 1.0  # clears by 5 cm: slightly below the full score
+    assert s[2] < s[1]  # below the net edge
+    assert s[3] == 0.0  # never crosses
+    assert s[4] < 0.1 and s[5] < 0.1  # long / wide
+    assert s[6] == 0.0  # lands on our side
+
+
+def test_return_result_order(core):
+    t = torch.tensor([True, True, False, True])
+    e = torch.tensor([True, True, True, False])
+    w = torch.tensor([True, False, False, True])
+    r = core.return_result(t, e, w)
+    assert r.tolist() == pytest.approx([1.0, -0.2, -0.5, 0.0])
+    assert r[1] > r[2]  # a bad return is better than no touch
+
+
+def test_s3_next_gap(core):
+    touched = torch.tensor([True, True, False])
+    since = torch.tensor([20, 80, 0])
+    tret = torch.tensor([60, 60, 60])
+    g = core.s3_next_gap(touched, since, tret, 50)
+    assert g.tolist() == [40, 0, 50]
+
+
+def test_s3_curriculum(core):
+    cur = core.S3Curriculum(s2_weights={"swing": 20.0, "ret_pred": 0.0}, s3_weights={"swing": 15.0, "ret_pred": 10.0},
+                            blend_iters=10, gate_min=5, gate_ema=1)
+    p = cur.params()
+    assert p["weights"]["swing"] == 20.0 and p["sigma_p"] == 0.1
+    for it in range(10):
+        cur.update(it, dict(first_all_hit=0.5, first_ret_over=0.1, fall_ball=0.0))
+    assert not cur.passed and cur.params()["weights"]["ret_pred"] == pytest.approx(10.0)
+    cur.update(10, dict(first_all_hit=0.5, first_ret_over=0.25, fall_ball=0.0))
+    assert cur.passed
+    c2 = core.S3Curriculum()
+    c2.load_state_dict(cur.state_dict())
+    assert c2.passed
+    with pytest.raises(ValueError):
+        c2.load_state_dict(dict(stage="S2"))

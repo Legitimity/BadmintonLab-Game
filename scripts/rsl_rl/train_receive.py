@@ -42,7 +42,8 @@ parser.add_argument("--leg_std", type=float, default=0.5)
 parser.add_argument("--other_std", type=float, default=0.3)
 parser.add_argument("--no_curriculum", action="store_true")
 parser.add_argument("--level", type=int, default=0, help="Start feeder level (fixed if --no_curriculum).")
-parser.add_argument("--stage", default="S1", choices=("S1", "S2"))
+parser.add_argument("--stage", default="S1", choices=("S1", "S2", "S3"))
+parser.add_argument("--s3_timeout_s", type=float, default=4.0, help="S3: per-ball timeout (the return must land)")
 parser.add_argument("--init_from", default=None, help="S2: checkpoint of the passed S1 (weights, optimizer, lr).")
 parser.add_argument("--dt_ms", type=int, default=1, help="physics step in ms (1 = play a5e0780)")
 parser.add_argument("--s2_anneal", type=int, default=1000, help="earliest S2 gate iteration")
@@ -76,7 +77,7 @@ from isaaclab_tasks.utils.hydra import hydra_task_config  # noqa: E402
 import badmintonlab_game.tasks  # noqa: E402,F401
 from badmintonlab_game.tasks.manager_based.badmintonlab_game import receive as _receive  # noqa: E402,F401
 from badmintonlab_game.tasks.manager_based.badmintonlab_game.receive import core  # noqa: E402
-from badmintonlab_game.tasks.manager_based.badmintonlab_game.receive.receive_env import S1_WEIGHTS, S2_WEIGHTS  # noqa: E402
+from badmintonlab_game.tasks.manager_based.badmintonlab_game.receive.receive_env import S1_WEIGHTS, S2_WEIGHTS, S3_WEIGHTS  # noqa: E402
 from badmintonlab_game.tasks.manager_based.badmintonlab_game.physics import apply_physics  # noqa: E402
 from badmintonlab_game.tasks.manager_based.badmintonlab_game.receive.agents import (  # noqa: E402
     EXTRA_MEAN,
@@ -126,6 +127,9 @@ def main(env_cfg, agent_cfg):
     if args_cli.v4:
         env_cfg.feeder_v4 = True
         env_cfg.ball_gap_s = 1.0
+    if args_cli.stage == "S3":
+        env_cfg.ball_timeout_s = args_cli.s3_timeout_s
+        env_cfg.episode_length_s = 30.0
     if args_cli.ball_gap_s is not None:
         env_cfg.ball_gap_s = args_cli.ball_gap_s
 
@@ -151,7 +155,24 @@ def main(env_cfg, agent_cfg):
         leg_mask = torch.tensor([any(k in n for k in LEG) for n in names])
         print(f"[INFO] {wrapped.num_envs} learners; {int(leg_mask.sum())} leg joints; feeder rows {len(unwrapped.table)}; log {log_dir}")
         print(f"[INFO] stage {args_cli.stage}; physics dt {unwrapped.physics_dt} s, decimation {env_cfg.decimation}", flush=True)
-        if args_cli.stage == "S2":
+        if args_cli.stage == "S3":
+            s3w = dict(S3_WEIGHTS)
+            for kv in args_cli.w:
+                k, v = kv.split("=")
+                if k not in s3w:
+                    raise SystemExit(f"unknown weight {k}")
+                s3w[k] = float(v)
+            s2w = dict(S2_WEIGHTS, track=4.0, approach=2.0)  # the S2 V4 run used --w track=4 approach=2
+            cur = core.S3Curriculum(s2_weights=s2w, s3_weights=s3w)
+            unwrapped.set_level(cur.level)
+            unwrapped.set_s3(True, args_cli.s3_timeout_s)
+            unwrapped.approach_cap = args_cli.approach_cap
+            if args_cli.real_serves:
+                for info in unwrapped.set_real_serves(args_cli.real_serves, args_cli.real_frac):
+                    print(f"[INFO] real serves {info}", flush=True)
+            print(f"[INFO] S3 weights {s3w}; approach_cap {args_cli.approach_cap}; real_frac {args_cli.real_frac}; "
+                  f"ball timeout {args_cli.s3_timeout_s} s", flush=True)
+        elif args_cli.stage == "S2":
             s2w = dict(S2_WEIGHTS)
             for kv in args_cli.w:
                 k, v = kv.split("=")
@@ -200,9 +221,9 @@ def main(env_cfg, agent_cfg):
 
                 ls.copy_(torch.where(lm, torch.full_like(ls, _m.log(args_cli.reset_leg_std)), ls))
                 print(f"[INFO] leg std reset to {args_cli.reset_leg_std}", flush=True)
-        elif args_cli.stage == "S2":
+        elif args_cli.stage in ("S2", "S3"):
             if not args_cli.init_from:
-                raise SystemExit("--stage S2 needs --init_from <S1 checkpoint>")
+                raise SystemExit(f"--stage {args_cli.stage} needs --init_from <checkpoint>")
             # Weights, optimizer state and learning rate continue from S1 (spec 2.1: never a fresh Adam).
             runner.load(args_cli.init_from)
             ls = runner.alg.policy.log_std.data

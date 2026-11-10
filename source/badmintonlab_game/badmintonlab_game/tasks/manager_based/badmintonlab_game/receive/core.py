@@ -502,6 +502,108 @@ class SpeedCurriculum:
             setattr(self, k, v)
 
 
+# ------------------------------------------------------------------ S3 (11-10): return quality + recovery
+NET_H_RET = 1.55  # conservative net edge height for the return prediction
+HALF_LEN = 6.7
+SINGLES_HALF_W = 2.59
+
+
+def return_outcome_score(net_z: torch.Tensor, land_xy: torch.Tensor, margin: float = 0.15, net_scale: float = 0.5,
+                         edge_x: float = 0.3, edge_y: float = 0.2, edge_scale: float = 0.3) -> torch.Tensor:
+    """Predicted quality of our return in [0, 1], receiver frame (we hit towards +x, net at x = 0).
+
+    net term: 1 once the shuttle clears the net edge by ``margin`` (smooth below, 0 if it never crosses);
+    landing terms: 1 inside the opponent singles court with a small safety margin, exponential tails outside.
+    """
+    clear = net_z - NET_H_RET
+    s_net = torch.exp(-torch.clamp(margin - clear, min=0.0) / net_scale)
+    s_net = torch.where(torch.isfinite(net_z), s_net, torch.zeros_like(s_net))
+    x, y = land_xy[..., 0], land_xy[..., 1]
+    s_x = torch.exp(-torch.clamp(x - (HALF_LEN - edge_x), min=0.0) / edge_scale) * (x > 0.0).float()
+    s_y = torch.exp(-torch.clamp(y.abs() - (SINGLES_HALF_W - edge_y), min=0.0) / edge_scale)
+    return s_net * s_x * s_y
+
+
+def return_result(touched: torch.Tensor, ended: torch.Tensor, won: torch.Tensor, bad: float = 0.2, miss: float = 0.5) -> torch.Tensor:
+    """Ball-end event in [-miss, 1]: +1 return won the rally, -bad touched but faulted, -miss never touched.
+
+    A touched-but-bad return must stay better than not touching (bad < miss), otherwise the policy learns
+    to avoid the shuttle.
+    """
+    t = touched & ended
+    good = t & won
+    return good.float() - bad * (t & ~won).float() - miss * (ended & ~touched).float()
+
+
+def s3_next_gap(touched: torch.Tensor, steps_since_hit: torch.Tensor, t_return_steps: torch.Tensor, miss_gap_steps: int) -> torch.Tensor:
+    """Control steps to wait before the next ball: the opponent's return arrives ``t_return`` after our hit."""
+    g = (t_return_steps - steps_since_hit).clamp(min=0)
+    return torch.where(touched, g, torch.full_like(g, miss_gap_steps))
+
+
+@dataclass
+class S3Curriculum:
+    """S3 task refinement (paper IV-A stage 3, adapted): weights blend S2 -> S3 over ``blend_iters``, the swing
+    tolerances stay at the S2 end values. The gate is the B-grade target on the first ball of an episode (= a
+    play rally): touch >= 0.4 and return over the net >= 0.2, falls per ball <= 3%; it is recorded, the run
+    does not stop on it (--no_stop_on_pass).
+    """
+
+    s2_weights: dict = field(default_factory=dict)
+    s3_weights: dict = field(default_factory=dict)
+    stage: str = "S3"
+    level: int = LEVEL_MIX_V4
+    blend_iters: int = 200
+    sigma_p: float = 0.1
+    sigma_r: float = 1.0
+    gate_ema: int = 200
+    gate_min: int = 300
+    gate_hit: float = 0.4
+    gate_over: float = 0.2
+    gate_fall: float = 0.03
+    iters_in_stage: int = 0
+    ema: dict = field(default_factory=dict)
+    passed: bool = False
+    stop_reason: str | None = None
+    history: list = field(default_factory=list)
+    events: list = field(default_factory=list)
+
+    def params(self) -> dict:
+        a = self.iters_in_stage / max(self.blend_iters, 1)
+        return dict(weights=blend_weights(self.s2_weights, self.s3_weights, a), sigma_p=self.sigma_p, sigma_r=self.sigma_r)
+
+    def update(self, iteration: int, rates: dict) -> None:
+        self.events = []
+        self.iters_in_stage += 1
+        ReceiveCurriculum._ema(self.ema, rates, self.gate_ema)
+        e = self.ema
+        if not self.passed and self.iters_in_stage >= self.gate_min and (
+            e.get("first_all_hit", 0.0) >= self.gate_hit and e.get("first_ret_over", 0.0) >= self.gate_over
+            and e.get("fall_ball", 1.0) <= self.gate_fall
+        ):
+            self.passed = True
+            self.history.append(dict(event="passed_S3", iteration=iteration, ema=dict(e)))
+            self.events.append("passed_S3")
+        for m in (250, 500, 1000, 1500, 2000, 2500, 3000):
+            if self.iters_in_stage == m:
+                self.events.append(f"s3_{m}")
+
+    def log_values(self) -> dict:
+        out = {"Curriculum/passed": float(self.passed), "Curriculum/blend": min(self.iters_in_stage / max(self.blend_iters, 1), 1.0)}
+        out.update({f"Curriculum/ema_{k}": v for k, v in self.ema.items() if k in ("first_all_hit", "first_ret_over", "first_ret_in", "fall_ball")})
+        return out
+
+    def state_dict(self) -> dict:
+        keys = ("stage", "level", "iters_in_stage", "ema", "passed", "history")
+        return {k: getattr(self, k) for k in keys}
+
+    def load_state_dict(self, state: dict) -> None:
+        if state.get("stage") != "S3":
+            raise ValueError(f"not an S3 curriculum state: {state.get('stage')}")
+        for k, v in state.items():
+            setattr(self, k, v)
+
+
 def concat_tables(tables: list) -> FeederTable:
     return FeederTable(*[torch.cat([getattr(t, f) for t in tables]) for f in ("launch_pos", "launch_vel", "int_pos", "t_arr", "d_need", "station")])
 
