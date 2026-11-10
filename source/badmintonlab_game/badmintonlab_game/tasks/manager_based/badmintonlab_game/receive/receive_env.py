@@ -46,12 +46,15 @@ S1_WEIGHTS = dict(
 S2_WEIGHTS = dict(
     S1_WEIGHTS, track=2.0, approach=1.0, swing=20.0, contact=2.0, racket_style=0.2, torque=-2.0e-5, energy=-2.0e-4,
 )  # fmt: skip
-# S3 (11-10, P5_S3_PLAN.md): return quality (predicted outcome one step after the hit, ball-end result) and
-# recovery (after the hit the tracking target becomes the ready position, full weight). The paper anneals the
-# approach reward and some gait terms away; footwork is our bottleneck, so track / approach stay (lower), only
-# step height and gait symmetry go. Swing tolerances stay at the S2 end values.
+# S3 (11-11, P5_S3_PLAN.md, paper IV-A stage 3): anneal away the target-approach reward and the gait-shaping
+# terms (step height, step/contact symmetry, air time), keep the hit reward and the global regularization
+# (strengthened). Our deviations: a weak regional track term stays (footwork is our bottleneck), and the
+# return-quality terms (predicted outcome after the hit, ball-end result) are added. Recovery uses the same
+# track term with the ready position as target after our hit, plus the paper's default holding pose while no
+# shuttle is incoming. Swing tolerances stay at the S2 end values.
 S3_WEIGHTS = dict(
-    S2_WEIGHTS, track=3.0, approach=1.5, step_height=0.0, gait_symmetry=0.0, swing=15.0, contact=2.0,
+    S2_WEIGHTS, track=2.0, approach=0.0, step_height=0.0, gait_symmetry=0.0, feet_air_time=0.0,
+    swing=15.0, contact=2.0, torque=-4.0e-5, energy=-4.0e-4, acc_reg=-5.0e-7, hold_ready=0.5,
     ret_pred=10.0, ret_result=10.0,
 )  # fmt: skip
 SWING_UPPER = ("Waist", "Right_Shoulder_Pitch", "Right_Shoulder_Roll", "Right_Elbow_Pitch", "Right_Elbow_Yaw")
@@ -491,8 +494,17 @@ class ReceiveBadmintonEnv(ServeBadmintonEnv):
         v["no_double_flight"] = w["no_double_flight"] * (~contact).all(dim=-1).float()
         v["feet_slide"] = w["feet_slide"] * (torch.linalg.norm(foot_vel[..., :2], dim=-1) * contact.float()).sum(-1)
         v["acc_reg"] = w["acc_reg"] * (robot.data.joint_acc**2).sum(-1)
-        err = robot.data.joint_pos[:, self._upper_ids] - self.q_ready[self._upper_ids]
-        v["hold_ready"] = w["hold_ready"] * torch.exp(-(err**2).mean(-1) / 0.1)
+        if self.s3:
+            # Paper S2/S3: default holding pose when no shuttle is incoming (gap, or after our hit) on all upper
+            # joints; while a ball is incoming only the non-swing joints (the S2 mask).
+            idle = (~self.ball_active) | self.home_mode
+            e_all = robot.data.joint_pos[:, self._upper_s1] - self.q_ready[self._upper_s1]
+            e_sw = robot.data.joint_pos[:, self._upper_s2] - self.q_ready[self._upper_s2]
+            hr = torch.where(idle, torch.exp(-(e_all**2).mean(-1) / 0.1), torch.exp(-(e_sw**2).mean(-1) / 0.1))
+            v["hold_ready"] = w["hold_ready"] * hr
+        else:
+            err = robot.data.joint_pos[:, self._upper_ids] - self.q_ready[self._upper_ids]
+            v["hold_ready"] = w["hold_ready"] * torch.exp(-(err**2).mean(-1) / 0.1)
         # S2 terms (weights 0 in S1).
         arr = self._arrive.float()
         sw = core.r_swing(self._e_pos, self._e_ori, self._v_n, self.sigma_p, self.sigma_r, self.sigma_v, self.v_cap)

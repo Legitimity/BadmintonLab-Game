@@ -543,7 +543,8 @@ def s3_next_gap(touched: torch.Tensor, steps_since_hit: torch.Tensor, t_return_s
 
 @dataclass
 class S3Curriculum:
-    """S3 task refinement (paper IV-A stage 3, adapted): weights blend S2 -> S3 over ``blend_iters``, the swing
+    """S3 task refinement (paper IV-A stage 3, adapted): the S2 -> S3 weights are annealed linearly over
+    ``blend_iters`` (the paper "anneals away" the approach and gait terms; no schedule is given), the swing
     tolerances stay at the S2 end values. The gate is the B-grade target on the first ball of an episode (= a
     play rally): touch >= 0.4 and return over the net >= 0.2, falls per ball <= 3%; it is recorded, the run
     does not stop on it (--no_stop_on_pass).
@@ -553,7 +554,7 @@ class S3Curriculum:
     s3_weights: dict = field(default_factory=dict)
     stage: str = "S3"
     level: int = LEVEL_MIX_V4
-    blend_iters: int = 200
+    blend_iters: int = 500
     sigma_p: float = 0.1
     sigma_r: float = 1.0
     gate_ema: int = 200
