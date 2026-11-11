@@ -34,6 +34,18 @@ def cfg_for_side(src: Path, side: int) -> str:
     return text.replace(marker, f"SIDE = {side}\n", 1)
 
 
+def _retry(fn, *args, tries=20, wait=3.0):
+    """11-11: a cfg write sometimes fails with PermissionError (file briefly held by another process): retry."""
+    import time
+    for k in range(tries):
+        try:
+            return fn(*args)
+        except PermissionError:
+            if k == tries - 1:
+                raise
+            time.sleep(wait)
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--play_root", type=Path, required=True)
@@ -58,7 +70,7 @@ def main():
         shutil.copy2(p, backup / p.name)
     opp_side = 1 - a.side
     try:
-        targets[a.side].write_text(cfg_for_side(a.ours / "player_cfg.py", a.side), encoding="utf-8")
+        _retry(lambda: targets[a.side].write_text(cfg_for_side(a.ours / "player_cfg.py", a.side), encoding="utf-8"))
         if a.opponent == "zero":
             targets[opp_side].write_text(cfg_for_side(a.ours / "player_cfg.py", opp_side), encoding="utf-8")
             opp_model = "zero"
@@ -66,7 +78,7 @@ def main():
             opp_model = str(a.play_root / "model_test.pt")  # play's own default config stays in place
         else:
             opp = Path(a.opponent)
-            targets[opp_side].write_text(cfg_for_side(opp / "player_cfg.py", opp_side), encoding="utf-8")
+            _retry(lambda: targets[opp_side].write_text(cfg_for_side(opp / "player_cfg.py", opp_side), encoding="utf-8"))
             opp_model = str(opp / "policy.pt")
         models = {a.side: str(a.ours / "policy.pt"), opp_side: opp_model}
         env = dict(os.environ, PYTHONPATH=str(a.play_root / "source/badmintonlab_game") + os.pathsep + os.environ.get("PYTHONPATH", ""))
@@ -97,7 +109,7 @@ def main():
             a.out.write_text(json.dumps(result, indent=1), encoding="utf-8")
     finally:
         for s, p in targets.items():
-            shutil.copy2(backup / p.name, p)
+            _retry(shutil.copy2, backup / p.name, p)
         shutil.rmtree(backup, ignore_errors=True)
 
 
