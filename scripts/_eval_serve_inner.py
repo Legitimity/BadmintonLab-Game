@@ -64,6 +64,14 @@ def main():
     server = u.next_hitter.clone()
     ours_hit = torch.zeros(n, dtype=torch.bool, device=device)
     ours_hits = torch.zeros(n, dtype=torch.long, device=device)
+    # 11-11 rally metrics: hits of both sides per rally, and our distance to the ready position at the moment
+    # the opponent hits (= how well we recovered before the next ball).
+    all_hits = torch.zeros(n, dtype=torch.long, device=device)
+    sign = 1.0 if me == 0 else -1.0
+    ready_xy = torch.tensor((sign * -3.251, sign * 0.605), device=device)
+    pre_opp_hit = torch.zeros(n, dtype=torch.bool, device=device)
+    home_at_opp_hit = []
+    rally_hits = {"serve": [], "receive": []}
     fell = torch.zeros(n, dtype=torch.bool, device=device)
     started = torch.zeros(n, device=device)
     sim_t = 0.0
@@ -80,6 +88,7 @@ def main():
         ids = torch.as_tensor(env_ids, device=device, dtype=torch.long)
         pre_z[ids] = robot.data.root_pos_w[ids, 2] - origin_z[ids]
         pre_hit[ids] = u.just_hit[ids, me]
+        pre_opp_hit[ids] = u.just_hit[ids, other]
         pre_gz[ids] = robot.data.projected_gravity_b[ids, 2]
         return original_reset(env_ids)
 
@@ -104,6 +113,14 @@ def main():
         hit_t = torch.where(new_hit & (hit_t < 0), torch.full_like(hit_t, sim_t), hit_t)
         ours_hit |= new_hit
         ours_hits += new_hit.long()
+        opp_hit = torch.where(resolved, pre_opp_hit, u.just_hit[:, other])
+        all_hits += new_hit.long() + opp_hit.long()
+        if opp_hit.any():
+            xy = robot.data.root_pos_w[:, :2] - u.scene.env_origins[:, :2]
+            dh = torch.linalg.norm(xy - ready_xy, dim=-1)
+            # skip the opponent's opening serve: only returns after one of our hits count
+            m = opp_hit & ~resolved & (ours_hits > 0)
+            home_at_opp_hit.extend(dh[m].tolist())
         gz = torch.where(resolved, pre_gz, robot.data.projected_gravity_b[:, 2])
         now_fell = (z < args.fall_height) | (gz > -args.upright_cos)
         fall_t = torch.where(now_fell & (fall_t < 0), torch.full_like(fall_t, sim_t), fall_t)
@@ -132,6 +149,7 @@ def main():
                 s["served_in_standing"] += int(won and bool(ours_hit[i]) and not bool(fell[i]))
                 s["fell"] += int(fell[i])
                 s["hits_ours"] += int(ours_hits[i])
+                rally_hits[role].append(int(all_hits[i]))
                 t0 = float(started[i])
                 tl = timing[role]
                 tl["len"].append(sim_t - t0)
@@ -148,6 +166,7 @@ def main():
             server[done] = u.next_hitter[done]
             ours_hit[done] = False
             ours_hits[done] = 0
+            all_hits[done] = 0
             fell[done] = False
             fall_t[done] = -1.0
             hit_t[done] = -1.0
@@ -164,7 +183,14 @@ def main():
         s["rates"] = {k: s[k] / r for k in keys if k != "rallies"}
         # Seconds from the rally start (hit, fall, rally length) and from our hit to the fall.
         s["timing_s"] = {k: summary(v) for k, v in timing[role].items()}
-    out = dict(obs_dims=dims, num_envs=n, seed=args.seed, wall_s=time.time() - wall, **stats)
+    for role, s in stats.items():
+        h = rally_hits[role]
+        s["rally_hits"] = {"mean": sum(h) / max(len(h), 1), "hist": {str(k): h.count(k) for k in sorted(set(h))}}
+    out_home = summary(home_at_opp_hit)
+    if home_at_opp_hit:
+        out_home["within_0.5"] = sum(x < 0.5 for x in home_at_opp_hit) / len(home_at_opp_hit)
+        out_home["within_1.0"] = sum(x < 1.0 for x in home_at_opp_hit) / len(home_at_opp_hit)
+    out = dict(home_d_at_opp_hit=out_home, obs_dims=dims, num_envs=n, seed=args.seed, wall_s=time.time() - wall, **stats)
     print("[SERVE_EVAL]" + json.dumps(out), flush=True)
     env.close()
 
