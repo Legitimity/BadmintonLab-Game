@@ -347,6 +347,98 @@ def build_feeder_table_v4(
     return FeederTable(sel(pos), sel(vel), sel(pt), sel(t), sel(d_need), sel(station))
 
 
+# 11-11 grid test: incoming balls spread over the receiver half by landing cell x arc height, as in a rally
+# (opponent hits from anywhere on its half). Cells: landing x (net -> back line) x landing y x apex tier.
+GRID_X_EDGES = (0.0, -2.0, -3.2, -4.4, -5.6, -6.7)
+GRID_Y_EDGES = (-2.59, -1.55, -0.52, 0.52, 1.55, 2.59)
+GRID_APEX_EDGES = (0.0, 2.5, 4.0, 99.0)  # flat / mid / high
+
+
+def simulate_flight(pos: torch.Tensor, vel: torch.Tensor, dt: float = 0.005, steps: int = 800):
+    """Net-crossing height (going -x), landing point, landing time and apex height (same drag model as play)."""
+    p = pos.clone()
+    v = vel.clone()
+    n = p.shape[0]
+    gv = torch.tensor((0.0, 0.0, -GRAVITY), device=p.device, dtype=p.dtype)
+    net_z = torch.full((n,), -torch.inf, device=p.device, dtype=p.dtype)
+    t_land = torch.full((n,), torch.inf, device=p.device, dtype=p.dtype)
+    apex = p[:, 2].clone()
+    alive = torch.ones(n, dtype=torch.bool, device=p.device)
+    for k in range(steps):
+        speed = torch.linalg.norm(v, dim=-1, keepdim=True)
+        vm = v + 0.5 * dt * (gv - DRAG_OVER_MASS * speed * v)
+        speed_m = torch.linalg.norm(vm, dim=-1, keepdim=True)
+        vn = v + dt * (gv - DRAG_OVER_MASS * speed_m * vm)
+        pn = torch.where(alive[:, None], p + dt * vm, p)
+        crossing = alive & (p[:, 0] > 0.0) & (pn[:, 0] <= 0.0)
+        a = p[:, 0] / torch.where(crossing, p[:, 0] - pn[:, 0], torch.ones_like(p[:, 0]))
+        net_z = torch.where(crossing, p[:, 2] + a * (pn[:, 2] - p[:, 2]), net_z)
+        apex = torch.where(alive, torch.maximum(apex, pn[:, 2]), apex)
+        landed = alive & (pn[:, 2] <= 0.0)
+        t_land = torch.where(landed, torch.full_like(t_land, (k + 1) * dt), t_land)
+        v = torch.where(alive[:, None], vn, v)
+        p = pn
+        alive = alive & ~landed
+    return net_z, p[:, :2], t_land, apex
+
+
+def grid_cell(land_xy: torch.Tensor, apex: torch.Tensor) -> torch.Tensor:
+    """Cell id = ix * 15 + iy * 3 + ia (ix 0 = near the net), -1 outside the receiver's singles court."""
+    xe = torch.tensor(GRID_X_EDGES, device=land_xy.device)
+    ye = torch.tensor(GRID_Y_EDGES, device=land_xy.device)
+    ae = torch.tensor(GRID_APEX_EDGES, device=land_xy.device)
+    ix = torch.bucketize(-land_xy[:, 0], -xe) - 1  # edges are decreasing in x: bucket on -x
+    iy = torch.bucketize(land_xy[:, 1], ye) - 1
+    ia = torch.bucketize(apex, ae) - 1
+    nx, ny, na = len(GRID_X_EDGES) - 1, len(GRID_Y_EDGES) - 1, len(GRID_APEX_EDGES) - 1
+    ok = (ix >= 0) & (ix < nx) & (iy >= 0) & (iy < ny) & (ia >= 0) & (ia < na)
+    return torch.where(ok, ix * (ny * na) + iy * na + ia, torch.full_like(ix, -1))
+
+
+def build_grid_table(
+    per_cell: int = 100,
+    n: int = 1_500_000,
+    seed: int = 11,
+    device="cpu",
+    launch_x=(1.0, 6.0),
+    launch_y=(-2.4, 2.4),
+    height=(0.6, 1.5),
+    speed=(4.0, 18.0),
+    elev_deg=(-5.0, 75.0),
+    azim_deg=(-35.0, 35.0),
+) -> tuple[FeederTable, torch.Tensor, dict]:
+    """Monte-Carlo launches from the whole opponent half, kept if legal (net clearance, lands in our singles
+    court), at most ``per_cell`` per (landing x, landing y, apex) cell. No reachability or intercept filter:
+    balls without an intercept in the hitting band show up as cells the policy cannot see a target for.
+    Returns the table, the cell id of each row and per-row extras (speed, apex, landing, valid intercept)."""
+    gen = torch.Generator(device="cpu").manual_seed(seed)
+
+    def u(lo, hi):
+        return lo + (hi - lo) * torch.rand(n, generator=gen)
+
+    pos = torch.stack((u(*launch_x), u(*launch_y), u(*height)), dim=-1)
+    sp, el, az = u(*speed), torch.deg2rad(u(*elev_deg)), torch.deg2rad(u(*azim_deg))
+    vel = torch.stack((-sp * torch.cos(el) * torch.cos(az), sp * torch.cos(el) * torch.sin(az), sp * torch.sin(el)), dim=-1)
+    net_z, land, t_land, apex = simulate_flight(pos, vel)
+    cell = grid_cell(land, apex)
+    legal = (net_z >= NET_CLEAR) & (cell >= 0)
+    idx = []
+    n_cells = (len(GRID_X_EDGES) - 1) * (len(GRID_Y_EDGES) - 1) * (len(GRID_APEX_EDGES) - 1)
+    for c in range(n_cells):
+        rows = (legal & (cell == c)).nonzero().flatten()[:per_cell]
+        idx.append(rows)
+    idx = torch.cat(idx)
+    pos, vel = pos[idx].to(device), vel[idx].to(device)
+    pt, t, ok = predict_intercept_multi(pos, vel)
+    station = station_from_intercept(pt[:, :2])
+    ready = torch.tensor(READY_ROOT_XY, device=pos.device)
+    d_need = torch.linalg.norm(station - ready, dim=-1)
+    extra = dict(speed=sp[idx].to(device), apex=apex[idx].to(device), land=land[idx].to(device),
+                 t_land=t_land[idx].to(device), valid=ok, t_hit=t, n_cells=n_cells)  # fmt: skip
+    table = FeederTable(pos, vel, pt, torch.where(ok, t, torch.full_like(t, 1.0)), d_need, station)
+    return table, cell[idx].to(device), extra
+
+
 def table_from_serves_v4(pos: torch.Tensor, vel: torch.Tensor, device="cpu") -> tuple[FeederTable, dict]:
     """Recorded serves with the free-height intercept; no time / reachability filter (sorted by speed)."""
     pos, vel = pos.to(device).float(), vel.to(device).float()

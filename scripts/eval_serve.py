@@ -76,6 +76,8 @@ def main():
             opp_model = "zero"
         elif a.opponent == "model_test":
             opp_model = str(a.play_root / "model_test.pt")  # play's own default config stays in place
+        elif not (Path(a.opponent) / "player_cfg.py").exists():
+            opp_model = str(Path(a.opponent) / "policy.pt")  # e.g. the course baseline: play's default cfg stays
         else:
             opp = Path(a.opponent)
             _retry(lambda: targets[opp_side].write_text(cfg_for_side(opp / "player_cfg.py", opp_side), encoding="utf-8"))

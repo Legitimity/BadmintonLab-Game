@@ -1,8 +1,7 @@
 """Test-only combined player (11-11): serve expert for our own opening drop, receive expert otherwise.
 
 The switch is a fixed rule on the observation (not learned): serve mode while the shuttle is within
-``r_serve`` m of the root horizontally and its horizontal speed (relative to the root) is below
-``v_serve`` m/s and no incoming-ball target is set (intercept valid flag 0), i.e. the static opening drop
+``r_serve`` m of the root horizontally and its horizontal world speed is below ``v_serve`` m/s and no incoming-ball target is set (intercept valid flag 0), i.e. the static opening drop
 on our side. Used to measure multi-shot rallies in play
 before the distillation; the final submission stays a single distilled MLP.
 
@@ -32,10 +31,17 @@ class Combo(torch.nn.Module):
         self.v_serve = v_serve
 
     def forward(self, obs: torch.Tensor) -> torch.Tensor:
-        p = obs[:, 5:7]
-        v = obs[:, 8:10]
+        # Body-frame obs: shuttle_pos_b 5:8, shuttle_vel_b 8:11 (relative to the root), base_lin_vel 17:20,
+        # projected_gravity 23:26. The world vertical in the body frame is -g_b, so horizontal parts are
+        # taken against it (a tilted trunk must not turn the falling drop into "horizontal" speed).
+        z = -obs[:, 23:26]
+        z = z / torch.linalg.norm(z, dim=-1, keepdim=True).clamp(min=1e-6)
+        v = obs[:, 8:11] + obs[:, 17:20]
+        p = obs[:, 5:8]
+        v_h = v - (v * z).sum(-1, keepdim=True) * z
+        p_h = p - (p * z).sum(-1, keepdim=True) * z
         no_target = obs[:, 99] < 0.5  # intercept valid flag: an incoming ball always sets it
-        serving = no_target & (torch.linalg.norm(p, dim=-1) < self.r_serve) & (torch.linalg.norm(v, dim=-1) < self.v_serve)
+        serving = no_target & (torch.linalg.norm(p_h, dim=-1) < self.r_serve) & (torch.linalg.norm(v_h, dim=-1) < self.v_serve)
         a_s = self.serve(obs[:, :95])
         a_r = self.recv(obs)
         return torch.where(serving.unsqueeze(-1), a_s, a_r)
@@ -46,8 +52,8 @@ def main():
     ap.add_argument("--serve", type=Path, required=True)
     ap.add_argument("--recv", type=Path, required=True)
     ap.add_argument("--out", type=Path, required=True)
-    ap.add_argument("--r_serve", type=float, default=2.0)
-    ap.add_argument("--v_serve", type=float, default=1.5)
+    ap.add_argument("--r_serve", type=float, default=2.5)
+    ap.add_argument("--v_serve", type=float, default=1.0)
     a = ap.parse_args()
     serve = torch.jit.load(str(a.serve / "policy.pt"), map_location="cpu").eval()
     recv = torch.jit.load(str(a.recv / "policy.pt"), map_location="cpu").eval()
@@ -57,8 +63,10 @@ def main():
     shutil.copy2(a.recv / "player_cfg.py", a.out / "player_cfg.py")
     # Self-check on random observations: both branches reproduce the experts.
     x = torch.randn(64, 100)
-    x[:32, 5:7] = 0.5
-    x[:32, 8:10] = 0.1
+    x[:, 23:26] = torch.tensor((0.0, 0.0, -1.0))
+    x[:32, 5:8] = torch.tensor((0.5, 0.0, 1.0))
+    x[:32, 8:11] = torch.tensor((0.0, 0.0, -6.0))  # falling drop: fast but vertical
+    x[:32, 17:20] = 0.0
     x[:32, 99] = 0.0
     x[32:, 5:7] = 4.0
     y = torch.jit.load(str(a.out / "policy.pt")).eval()(x)
