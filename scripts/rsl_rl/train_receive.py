@@ -53,6 +53,7 @@ parser.add_argument("--no_stop_on_pass", action="store_true", help="keep trainin
 # pushes the policy towards not moving, the opposite of what V3.4 needs).
 parser.add_argument("--real_serves", nargs="*", default=[], help="serve files from record_serves.py")
 parser.add_argument("--real_frac", type=float, default=0.0, help="fraction of balls from the real serves")
+parser.add_argument("--real_style_w", nargs="*", default=[], help="style=share for the real serves, e.g. s2=2 s3=2 (default equal)")
 parser.add_argument("--w", nargs="*", default=[], help="S2 weight overrides, e.g. track=3 approach=2")
 parser.add_argument("--approach_cap", type=float, default=0.8, help="approach reward speed cap, m/s")
 # 11-09 S1 V4 (from p3_final): wide feeder with a free hitting height, required-speed levels, return-home gaps.
@@ -96,6 +97,14 @@ from common import prepare_agent_cfg  # noqa: E402
 
 REPO = Path(__file__).resolve().parents[2]
 LEG = ("Hip", "Knee", "Ankle")
+
+
+def _style_w(items: list) -> dict:
+    out = {}
+    for kv in items:
+        k, v = kv.split("=")
+        out[k] = float(v)
+    return out
 
 
 def _ready_action(unwrapped, side: int) -> torch.Tensor:
@@ -142,6 +151,7 @@ def main(env_cfg, agent_cfg):
                                               mini_batches=agent_cfg.algorithm.num_mini_batches, leg_std=args_cli.leg_std,
                                               stage=args_cli.stage, init_from=args_cli.init_from, dt_ms=args_cli.dt_ms,
                                               real_serves=args_cli.real_serves, real_frac=args_cli.real_frac, w=args_cli.w,
+                                              real_style_w=args_cli.real_style_w,
                                               approach_cap=args_cli.approach_cap, v4=args_cli.v4, face_relax=args_cli.face_relax,
                                               reset_leg_std=args_cli.reset_leg_std,
                                               v4_real_from=args_cli.v4_real_from, ball_gap_s=env_cfg.ball_gap_s))  # fmt: skip
@@ -168,7 +178,7 @@ def main(env_cfg, agent_cfg):
             unwrapped.set_s3(True, args_cli.s3_timeout_s)
             unwrapped.approach_cap = args_cli.approach_cap
             if args_cli.real_serves:
-                for info in unwrapped.set_real_serves(args_cli.real_serves, args_cli.real_frac):
+                for info in unwrapped.set_real_serves(args_cli.real_serves, args_cli.real_frac, _style_w(args_cli.real_style_w)):
                     print(f"[INFO] real serves {info}", flush=True)
             print(f"[INFO] S3 weights {s3w}; approach_cap {args_cli.approach_cap}; real_frac {args_cli.real_frac}; "
                   f"ball timeout {args_cli.s3_timeout_s} s", flush=True)
@@ -188,7 +198,7 @@ def main(env_cfg, agent_cfg):
             unwrapped.set_level(cur.level)
             unwrapped.approach_cap = args_cli.approach_cap
             if args_cli.real_serves:
-                for info in unwrapped.set_real_serves(args_cli.real_serves, args_cli.real_frac):
+                for info in unwrapped.set_real_serves(args_cli.real_serves, args_cli.real_frac, _style_w(args_cli.real_style_w)):
                     print(f"[INFO] real serves {info}", flush=True)
             print(f"[INFO] S2 weights {s2w}; approach_cap {args_cli.approach_cap}; real_frac {args_cli.real_frac}", flush=True)
         elif args_cli.v4:

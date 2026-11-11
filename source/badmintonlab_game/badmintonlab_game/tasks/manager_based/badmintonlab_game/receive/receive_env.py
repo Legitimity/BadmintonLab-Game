@@ -167,8 +167,10 @@ class ReceiveBadmintonEnv(ServeBadmintonEnv):
         self.level = int(level)
         self._bounds = self._level_bounds(self.level)
 
-    def set_real_serves(self, paths: list, frac: float) -> list:
-        """Load recorded serve files (receiver frame) and feed ``frac`` of the balls from them, styles equally."""
+    def set_real_serves(self, paths: list, frac: float, style_w: dict | None = None) -> list:
+        """Load recorded serve files (receiver frame) and feed ``frac`` of the balls from them, styles equally
+        unless ``style_w`` (style name -> relative share, e.g. {"s2": 2, "s3": 2}) says otherwise (11-11: the
+        wide serves s2/s3 were never reached in S2, give them more of the real balls)."""
         tabs, infos, src = [], [], []
         for i, p in enumerate(paths):
             d = torch.load(p, map_location="cpu")
@@ -183,7 +185,14 @@ class ReceiveBadmintonEnv(ServeBadmintonEnv):
         self.real_src_id = torch.cat(src)
         # Equal share per style regardless of how many rows each file kept.
         counts = torch.bincount(self.real_src_id).float()
-        self._real_w = (1.0 / counts)[self.real_src_id]
+        share = torch.ones(len(paths), device=self.device)
+        for k, v in (style_w or {}).items():
+            if k not in self.real_names:
+                raise KeyError(f"style {k} not in {self.real_names}")
+            share[self.real_names.index(k)] = float(v)
+        self._real_w = (share / counts)[self.real_src_id]
+        for i, info in enumerate(infos):
+            info["share"] = float(share[i] / share.sum())
         self.real_frac = float(frac)
         return infos
 
