@@ -187,7 +187,7 @@ def make_events_cfg(side: int) -> type:
 # during the flight. Must stay identical to receive/core.predict_intercept_multi (tested).
 _DRAG_OVER_MASS = 0.00110 / 0.00519
 _HIT_ZS = (0.8, 0.9, 1.0, 1.1, 1.2)
-_BAND_X = (-5.0, -0.5)
+_BAND_X = (-6.6, -0.5)  # S4 11-12: was -5.0
 _BAND_Y = 2.4
 _V_REF = 1.5
 _Z_PREF = 0.3

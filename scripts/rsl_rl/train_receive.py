@@ -42,7 +42,13 @@ parser.add_argument("--leg_std", type=float, default=0.5)
 parser.add_argument("--other_std", type=float, default=0.3)
 parser.add_argument("--no_curriculum", action="store_true")
 parser.add_argument("--level", type=int, default=0, help="Start feeder level (fixed if --no_curriculum).")
-parser.add_argument("--stage", default="S1", choices=("S1", "S2", "S3"))
+parser.add_argument("--stage", default="S1", choices=("S1", "S2", "S3", "S4"))
+# 11-12 S4 (rally practice): opponent returns for the 2nd+ ball, weak-cell weights from a grid test, recovery event.
+parser.add_argument("--rally_frac", type=float, default=0.7, help="S4: share of 2nd+ balls from the opponent-return table")
+parser.add_argument("--rally_grid", default=None, help="S4: eval_grid.py json; weak cells get more opponent returns")
+parser.add_argument("--rally_vmax", type=float, default=2.4, help="S4: max required speed (m/s from the ready pose) of a return")
+parser.add_argument("--balls", type=int, default=None, help="balls per episode (S4 default 10)")
+parser.add_argument("--t_return", type=float, nargs=2, default=None, help="S4: seconds from our hit to the next ball (default 0.7 1.3)")
 parser.add_argument("--s3_timeout_s", type=float, default=4.0, help="S3: per-ball timeout (the return must land)")
 parser.add_argument("--init_from", default=None, help="S2: checkpoint of the passed S1 (weights, optimizer, lr).")
 parser.add_argument("--dt_ms", type=int, default=1, help="physics step in ms (1 = play a5e0780)")
@@ -78,7 +84,7 @@ from isaaclab_tasks.utils.hydra import hydra_task_config  # noqa: E402
 import badmintonlab_game.tasks  # noqa: E402,F401
 from badmintonlab_game.tasks.manager_based.badmintonlab_game import receive as _receive  # noqa: E402,F401
 from badmintonlab_game.tasks.manager_based.badmintonlab_game.receive import core  # noqa: E402
-from badmintonlab_game.tasks.manager_based.badmintonlab_game.receive.receive_env import S1_WEIGHTS, S2_WEIGHTS, S3_WEIGHTS  # noqa: E402
+from badmintonlab_game.tasks.manager_based.badmintonlab_game.receive.receive_env import S1_WEIGHTS, S2_WEIGHTS, S3_WEIGHTS, S4_WEIGHTS  # noqa: E402
 from badmintonlab_game.tasks.manager_based.badmintonlab_game.physics import apply_physics  # noqa: E402
 from badmintonlab_game.tasks.manager_based.badmintonlab_game.receive.agents import (  # noqa: E402
     EXTRA_MEAN,
@@ -136,9 +142,14 @@ def main(env_cfg, agent_cfg):
     if args_cli.v4:
         env_cfg.feeder_v4 = True
         env_cfg.ball_gap_s = 1.0
-    if args_cli.stage == "S3":
+    if args_cli.stage in ("S3", "S4"):
         env_cfg.ball_timeout_s = args_cli.s3_timeout_s
         env_cfg.episode_length_s = 30.0
+    if args_cli.stage == "S4":
+        env_cfg.balls_per_episode = args_cli.balls or 10
+        env_cfg.episode_length_s = 40.0
+    elif args_cli.balls is not None:
+        env_cfg.balls_per_episode = args_cli.balls
     if args_cli.ball_gap_s is not None:
         env_cfg.ball_gap_s = args_cli.ball_gap_s
 
@@ -151,7 +162,9 @@ def main(env_cfg, agent_cfg):
                                               mini_batches=agent_cfg.algorithm.num_mini_batches, leg_std=args_cli.leg_std,
                                               stage=args_cli.stage, init_from=args_cli.init_from, dt_ms=args_cli.dt_ms,
                                               real_serves=args_cli.real_serves, real_frac=args_cli.real_frac, w=args_cli.w,
-                                              real_style_w=args_cli.real_style_w,
+                                              real_style_w=args_cli.real_style_w, rally_frac=args_cli.rally_frac,
+                                              rally_grid=args_cli.rally_grid, rally_vmax=args_cli.rally_vmax, balls=env_cfg.balls_per_episode,
+                                              t_return=args_cli.t_return,
                                               approach_cap=args_cli.approach_cap, v4=args_cli.v4, face_relax=args_cli.face_relax,
                                               reset_leg_std=args_cli.reset_leg_std,
                                               v4_real_from=args_cli.v4_real_from, ball_gap_s=env_cfg.ball_gap_s))  # fmt: skip
@@ -165,7 +178,38 @@ def main(env_cfg, agent_cfg):
         leg_mask = torch.tensor([any(k in n for k in LEG) for n in names])
         print(f"[INFO] {wrapped.num_envs} learners; {int(leg_mask.sum())} leg joints; feeder rows {len(unwrapped.table)}; log {log_dir}")
         print(f"[INFO] stage {args_cli.stage}; physics dt {unwrapped.physics_dt} s, decimation {env_cfg.decimation}", flush=True)
-        if args_cli.stage == "S3":
+        if args_cli.stage == "S4":
+            s4w = dict(S4_WEIGHTS)
+            for kv in args_cli.w:
+                k, v = kv.split("=")
+                if k not in s4w:
+                    raise SystemExit(f"unknown weight {k}")
+                s4w[k] = float(v)
+            s3w = dict(S3_WEIGHTS, approach=1.0)  # the S3 run used --w approach=1
+            cur = core.S3Curriculum(s2_weights=s3w, s3_weights=s4w, stage="S4", blend_iters=200)
+            unwrapped.set_level(cur.level)
+            unwrapped.set_s3(True, args_cli.s3_timeout_s)
+            unwrapped.approach_cap = args_cli.approach_cap
+            tr = args_cli.t_return or (0.7, 1.3)
+            unwrapped.t_return_range = (int(round(tr[0] / unwrapped.step_dt)), int(round(tr[1] / unwrapped.step_dt)) + 1)
+            if args_cli.real_serves:
+                for info in unwrapped.set_real_serves(args_cli.real_serves, args_cli.real_frac, _style_w(args_cli.real_style_w)):
+                    print(f"[INFO] real serves {info}", flush=True)
+            cell_w = None
+            if args_cli.rally_grid:
+                import json as _json
+
+                g = _json.load(open(args_cli.rally_grid, encoding="utf-8"))
+                cell_w = core.cell_weights_from_grid(g["per_row"], g["cell"], g["n_cells"])
+            tab, cells, rw = core.build_rally_table(device="cpu", cell_w=cell_w, v_max=args_cli.rally_vmax)
+            unwrapped.set_rally(tab, rw, args_cli.rally_frac)
+            cnt = torch.bincount(cells, minlength=75).view(5, 15).sum(-1).tolist()
+            share = [float(rw[(cells // 15) == i].sum() / rw.sum()) for i in range(5)]
+            print(f"[INFO] S4 rally table {len(tab)} rows; rows per x-band {cnt}; sampled share per x-band {[round(x, 3) for x in share]}; "
+                  f"cell weights {'from ' + args_cli.rally_grid if cell_w else 'equal'}", flush=True)
+            print(f"[INFO] S4 weights {s4w}; balls {env_cfg.balls_per_episode}; rally_frac {args_cli.rally_frac}; "
+                  f"t_return {tr} s; real_frac {args_cli.real_frac}; ball timeout {args_cli.s3_timeout_s} s", flush=True)
+        elif args_cli.stage == "S3":
             s3w = dict(S3_WEIGHTS)
             for kv in args_cli.w:
                 k, v = kv.split("=")
@@ -231,7 +275,7 @@ def main(env_cfg, agent_cfg):
 
                 ls.copy_(torch.where(lm, torch.full_like(ls, _m.log(args_cli.reset_leg_std)), ls))
                 print(f"[INFO] leg std reset to {args_cli.reset_leg_std}", flush=True)
-        elif args_cli.stage in ("S2", "S3"):
+        elif args_cli.stage in ("S2", "S3", "S4"):
             if not args_cli.init_from:
                 raise SystemExit(f"--stage {args_cli.stage} needs --init_from <checkpoint>")
             # Weights, optimizer state and learning rate continue from S1 (spec 2.1: never a fresh Adam).

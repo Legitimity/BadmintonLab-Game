@@ -227,3 +227,40 @@ def test_s3_curriculum(core):
     assert c2.passed
     with pytest.raises(ValueError):
         c2.load_state_dict(dict(stage="S2"))
+
+
+def test_s4_rally_table_and_weights(core):
+    """S4 (11-12): opponent returns cover the whole half including the back court, every row has a target,
+    cell weights equalize the cells and follow the grid-test weak cells."""
+    tab, cell, w = core.build_rally_table(n=300_000, seed=3)
+    assert len(tab) > 10_000
+    assert bool((tab.t_arr >= 0.35).all())
+    assert float(tab.int_pos[:, 0].min()) < -5.2  # back court has targets now (band to -6.6)
+    ix = cell // 15
+    share = torch.stack([w[ix == i].sum() for i in range(5)]) / w.sum()
+    assert float(share.min()) > 0.08  # every distance band gets a real share
+    weak = {c: (3.0 if c // 15 == 4 else 1.0) for c in range(75)}
+    _, cell2, w2 = core.build_rally_table(n=300_000, seed=3, cell_w=weak)
+    s2 = float(w2[(cell2 // 15) == 4].sum() / w2.sum())
+    assert s2 > float(share[4]) * 1.8
+
+
+def test_cell_weights_from_grid(core):
+    per_row = {"done": [1, 1, 1, 1, 1, 1, 0], "won": [1, 1, 1, 1, 1, 0, 0]}
+    cell = [0, 0, 0, 0, 0, 1, 2]
+    w = core.cell_weights_from_grid(per_row, cell, 3, base=0.5, min_n=5)
+    assert w[0] == pytest.approx(0.5)  # all won
+    assert w[1] == pytest.approx(1.5) and w[2] == pytest.approx(1.5)  # too few finished balls -> max
+
+
+def test_s4_curriculum_names(core):
+    cur = core.S3Curriculum(s2_weights={"a": 1.0}, s3_weights={"a": 3.0}, stage="S4", blend_iters=200)
+    for _ in range(250):
+        cur.update(0, {})
+    assert "s4_250" in cur.events
+    assert cur.params()["weights"]["a"] == pytest.approx(3.0)
+    st = cur.state_dict()
+    cur2 = core.S3Curriculum(stage="S4")
+    cur2.load_state_dict(st)
+    with pytest.raises(ValueError):
+        core.S3Curriculum(stage="S3").load_state_dict(st)

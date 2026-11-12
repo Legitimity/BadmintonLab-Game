@@ -33,7 +33,7 @@ UPPER_JOINTS = (
 DENSE = ("track", "face_front", "base_height", "base_orientation", "feet_air_time", "step_height", "foot_posture",
          "no_double_flight", "feet_slide", "acc_reg", "hold_ready", "approach",
          "racket_style", "torque", "energy")  # fmt: skip
-EVENTS = ("touchdown_speed", "gait_symmetry", "fall", "swing", "contact", "ret_pred", "ret_result")
+EVENTS = ("touchdown_speed", "gait_symmetry", "fall", "swing", "contact", "ret_pred", "ret_result", "recover")
 TERMS = DENSE + EVENTS
 S1_WEIGHTS = dict(
     track=4.0, approach=2.0, face_front=0.5, base_height=-10.0, base_orientation=-2.0, feet_air_time=1.0, step_height=0.5,
@@ -57,10 +57,15 @@ S3_WEIGHTS = dict(
     swing=15.0, contact=2.0, torque=-4.0e-5, energy=-4.0e-4, acc_reg=-5.0e-7, hold_ready=0.5,
     ret_pred=10.0, ret_result=10.0,
 )  # fmt: skip
+# S4 (11-12, rally practice): S3 as run (approach 1) plus a recovery event: when the opponent's return is
+# launched after one of our hits, reward being close to the ready position (play rallies start every ball
+# from wherever we stand; the grid test showed back-court / net / forehand-sideline weak cells).
+S4_WEIGHTS = dict(S3_WEIGHTS, approach=1.0, recover=5.0)
 SWING_UPPER = ("Waist", "Right_Shoulder_Pitch", "Right_Shoulder_Roll", "Right_Elbow_Pitch", "Right_Elbow_Yaw")
 STAT_KEYS = ("balls", "station_ok", "face_ok", "d_sum", "head_sum", "touch", "episodes", "falls", "vel_sum", "vel_n", "fall_low", "fall_tilt", "fall_step_sum", "timeouts",
              "ended", "hit", "ret_in", "ret_net", "ret_out", "epos_sum", "eori_sum", "vn_sum", "swing_sum",
-             "ret_over", "pred_sum", "pred_n", "f_ended", "f_hit", "f_ret_in", "f_ret_over", "home_d_sum", "home_n")  # fmt: skip
+             "ret_over", "pred_sum", "pred_n", "f_ended", "f_hit", "f_ret_in", "f_ret_over", "home_d_sum", "home_n",
+             "rec_n", "rec_d_sum", "rec_ok")  # fmt: skip
 N_LVL = 8  # V4 speed levels (legacy distance levels use 0-3)
 
 
@@ -98,6 +103,14 @@ class ReceiveBadmintonEnv(ServeBadmintonEnv):
         self._touched_end = torch.zeros(n, dtype=torch.bool, device=dev)
         self._ret_pred = torch.zeros(n, device=dev)
         self.ball_touched_before_step = torch.zeros(n, dtype=torch.bool, device=dev)
+        # S4: opponent returns (rally table) for the 2nd+ ball of an episode, recovery event at their launch.
+        self.rally = None
+        self.rally_frac = 0.0
+        self._rally_w = None
+        self.rally_src = 0
+        self.t_return_range = (45, 71)  # control steps from our hit to the next ball (S3 0.9-1.4 s)
+        self._rec_pending = torch.zeros(n, dtype=torch.bool, device=dev)
+        self._rec_d = torch.zeros(n, device=dev)
         self.weights = {k: float(S1_WEIGHTS.get(k, 0.0)) for k in TERMS}
         self.balls_per_episode = int(cfg.balls_per_episode)
         self.gap_steps = int(round(cfg.ball_gap_s / self.step_dt))
@@ -196,6 +209,13 @@ class ReceiveBadmintonEnv(ServeBadmintonEnv):
         self.real_frac = float(frac)
         return infos
 
+    def set_rally(self, table, weights: torch.Tensor, frac: float) -> None:
+        """S4: the 2nd+ ball of an episode comes from ``table`` (opponent returns) with probability ``frac``."""
+        self.rally = core.FeederTable(*(getattr(table, k).to(self.device) for k in ("launch_pos", "launch_vel", "int_pos", "t_arr", "d_need", "station")))
+        self._rally_w = weights.to(self.device)
+        self.rally_frac = float(frac)
+        self.rally_src = 1 + len(self.real_names)
+
     def set_s3(self, on: bool, ball_timeout_s: float | None = None) -> None:
         self.s3 = bool(on)
         self.home_weight = 1.0 if on else 0.5
@@ -234,6 +254,24 @@ class ReceiveBadmintonEnv(ServeBadmintonEnv):
             for k in f:
                 f[k] = torch.where(use.view(-1, *([1] * (f[k].dim() - 1))), getattr(self.real, k)[rr], f[k])
             src = torch.where(use, 1 + self.real_src_id[rr], src)
+        if self.rally is not None and self.rally_frac > 0.0:
+            use = (self.balls_done[ids] > 0) & (torch.rand(ids.numel(), device=self.device) < self.rally_frac)
+            rr = torch.multinomial(self._rally_w, ids.numel(), replacement=True)
+            for k in f:
+                f[k] = torch.where(use.view(-1, *([1] * (f[k].dim() - 1))), getattr(self.rally, k)[rr], f[k])
+            src = torch.where(use, torch.full_like(src, self.rally_src), src)
+        # S4 recovery event: the opponent's return is launched now; if we touched the previous ball (same
+        # episode), score our distance to the ready position on the next reward step.
+        if self.weights.get("recover", 0.0) != 0.0:
+            cont = (self.episode_length_buf[ids] > 0) & (self.balls_done[ids] > 0) & self.ball_touched[ids]
+            rxy = self._robots[0].data.root_pos_w[ids, :2] - self.scene.env_origins[ids, :2]
+            dh = torch.linalg.norm(rxy - self.ready_xy, dim=-1)
+            self._rec_pending[ids] = cont
+            self._rec_d[ids] = dh
+            c = cont.float()
+            self.stats[STAT_KEYS.index("rec_n")] += c.sum()
+            self.stats[STAT_KEYS.index("rec_d_sum")] += (c * dh).sum()
+            self.stats[STAT_KEYS.index("rec_ok")] += (c * (dh < 0.5).float()).sum()
         self.ball_src[ids] = src
         origins = self.scene.env_origins[ids]
         pos_w = f["launch_pos"] + origins
@@ -269,7 +307,7 @@ class ReceiveBadmintonEnv(ServeBadmintonEnv):
         self.pred_pending[ids] = False
         self.pred_over[ids] = False
         # Opponent return 0.9-1.4 s after our hit (next ball timing in S3).
-        self.t_return_steps[ids] = torch.randint(45, 71, (ids.numel(),), device=self.device)
+        self.t_return_steps[ids] = torch.randint(self.t_return_range[0], self.t_return_range[1], (ids.numel(),), device=self.device)
         self._prev_phys_shuttle[ids] = pos_w
         self.prev_shuttle_pos_w[ids] = pos_w
         self.curr_shuttle_pos_w[ids] = pos_w
@@ -539,6 +577,8 @@ class ReceiveBadmintonEnv(ServeBadmintonEnv):
         self.pred_pending = self._hit_now & ~self.ball_touched_before_step
         v["ret_pred"] = w["ret_pred"] * score / dt
         v["ret_result"] = w["ret_result"] * core.return_result(self._touched_end, self._ended_now, self._won_now) / dt
+        v["recover"] = w["recover"] * core.r_track(self._rec_d) * self._rec_pending.float() / dt
+        self._rec_pending = torch.zeros_like(self._rec_pending)
         tau = robot.data.applied_torque
         v["torque"] = w["torque"] * (tau**2).sum(-1)
         v["energy"] = w["energy"] * (tau * robot.data.joint_vel).abs().sum(-1)
@@ -617,13 +657,15 @@ class ReceiveBadmintonEnv(ServeBadmintonEnv):
         out["first_ret_in"] = c["f_ret_in"] / fe
         out["first_ret_over"] = c["f_ret_over"] / fe
         out["home_d_mean"] = c["home_d_sum"] / c["home_n"] if c["home_n"] else nan
+        out["rec_d_mean"] = c["rec_d_sum"] / c["rec_n"] if c["rec_n"] else nan
+        out["rec_ok"] = c["rec_ok"] / c["rec_n"] if c["rec_n"] else nan
         # First ball of an episode over all sources (= a play rally start).
         a1 = sum(r[0] for r in src1)
         e1 = sum(r[2] for r in src1)
         out["first_all_station_ok"] = sum(r[1] for r in src1) / a1 if a1 else nan
         out["first_all_hit"] = sum(r[3] for r in src1) / e1 if e1 else nan
         out["first_all_n"] = e1
-        names = ["syn"] + list(self.real_names)
+        names = ["syn"] + list(self.real_names) + (["rally"] if self.rally is not None else [])
         for i, name in enumerate(names):
             na, ok, ne, h = src[i]
             out[f"src_{name}_station_ok"] = ok / na if na else nan

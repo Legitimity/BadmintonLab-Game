@@ -16,7 +16,7 @@ import torch
 DRAG_OVER_MASS = 0.00110 / 0.00519
 GRAVITY = 9.81
 HIT_Z = 1.0  # intercept = first descending crossing of this height
-BAND_X = (-5.0, -0.5)  # receiver half, 0.5-5.0 m from the net
+BAND_X = (-6.6, -0.5)  # receiver half, 0.5-6.6 m from the net (S4 11-12: was -5.0, the back-court balls had no target)
 BAND_Y = 2.4
 NET_CLEAR = 1.60  # legal feed: crosses the net at least 5 cm above its edge height
 # Ready pose of the side-0 robot (serve/player_cfg.READY_ROOT) and the sweet-spot offset in the root
@@ -439,6 +439,60 @@ def build_grid_table(
     return table, cell[idx].to(device), extra
 
 
+def build_rally_table(
+    n: int = 2_000_000,
+    seed: int = 23,
+    device="cpu",
+    cell_w: dict | None = None,
+    t_min: float = 0.35,
+    v_max: float = 2.4,
+) -> tuple[FeederTable, torch.Tensor, torch.Tensor]:
+    """S4 (11-12) opponent returns: the grid-test launch distribution (whole opponent half, 4-18 m/s,
+    -5..75 deg), kept if legal, landing in our singles court and with a hitting point in the band.
+    Returns the table, the grid cell of each row and per-row sampling weights: equal total weight per cell
+    (the raw Monte-Carlo density is very uneven), times ``cell_w[cell]`` (weak cells from the grid test)."""
+    gen = torch.Generator(device="cpu").manual_seed(seed)
+
+    def u(lo, hi):
+        return lo + (hi - lo) * torch.rand(n, generator=gen)
+
+    pos = torch.stack((u(1.0, 6.0), u(-2.4, 2.4), u(0.6, 1.5)), dim=-1)
+    sp, el, az = u(4.0, 18.0), torch.deg2rad(u(-5.0, 75.0)), torch.deg2rad(u(-35.0, 35.0))
+    vel = torch.stack((-sp * torch.cos(el) * torch.cos(az), sp * torch.cos(el) * torch.sin(az), sp * torch.sin(el)), dim=-1)
+    pos, vel = pos.to(device), vel.to(device)
+    net_z, land, _, apex = simulate_flight(pos, vel)
+    cell = grid_cell(land, apex)
+    keep = (net_z >= NET_CLEAR) & (cell >= 0)
+    pos, vel, cell = pos[keep], vel[keep], cell[keep]
+    pt, t, ok = predict_intercept_multi(pos, vel)
+    station = station_from_intercept(pt[:, :2])
+    ready = torch.tensor(READY_ROOT_XY, device=pos.device)
+    d_need = torch.linalg.norm(station - ready, dim=-1)
+    # Reachable from the ready position (S3 trained up to 2.4 m/s; the 11-12 smoke without this filter fell
+    # on ~19% of the balls chasing 3+ m/s returns). Faster returns are left to the next stage.
+    keep = ok & (t >= t_min) & (required_speed(d_need, t) <= v_max)
+    pos, vel, cell, pt, t, station, d_need = pos[keep], vel[keep], cell[keep], pt[keep], t[keep], station[keep], d_need[keep]
+    n_cells = (len(GRID_X_EDGES) - 1) * (len(GRID_Y_EDGES) - 1) * (len(GRID_APEX_EDGES) - 1)
+    counts = torch.bincount(cell, minlength=n_cells).float()
+    cw = torch.ones(n_cells, device=pos.device)
+    for k, v in (cell_w or {}).items():
+        cw[int(k)] = float(v)
+    w = (cw / counts.clamp(min=1.0))[cell]
+    return FeederTable(pos, vel, pt, t, d_need, station), cell, w
+
+
+def cell_weights_from_grid(per_row: dict, cell: list, n_cells: int, base: float = 0.5, min_n: int = 5) -> dict:
+    """Weak-cell weights from an eval_grid.py result: ``base + (1 - return-in rate)``; cells without enough
+    finished balls (e.g. no target before the band was widened) get the maximum ``base + 1``."""
+    tot = [0.0] * n_cells
+    won = [0.0] * n_cells
+    for c, d, w_ in zip(cell, per_row["done"], per_row["won"]):
+        if d > 0:
+            tot[c] += 1.0
+            won[c] += w_ / d
+    return {c: (base + 1.0 - won[c] / tot[c]) if tot[c] >= min_n else base + 1.0 for c in range(n_cells)}
+
+
 def table_from_serves_v4(pos: torch.Tensor, vel: torch.Tensor, device="cpu") -> tuple[FeederTable, dict]:
     """Recorded serves with the free-height intercept; no time / reachability filter (sorted by speed)."""
     pos, vel = pos.to(device).float(), vel.to(device).float()
@@ -644,7 +698,7 @@ class S3Curriculum:
 
     s2_weights: dict = field(default_factory=dict)
     s3_weights: dict = field(default_factory=dict)
-    stage: str = "S3"
+    stage: str = "S3"  # S4 (11-12) reuses this class: start weights -> S4 weights, same gate, s4_* milestones
     level: int = LEVEL_MIX_V4
     blend_iters: int = 500
     sigma_p: float = 0.1
@@ -675,11 +729,11 @@ class S3Curriculum:
             and e.get("fall_ball", 1.0) <= self.gate_fall
         ):
             self.passed = True
-            self.history.append(dict(event="passed_S3", iteration=iteration, ema=dict(e)))
-            self.events.append("passed_S3")
+            self.history.append(dict(event=f"passed_{self.stage}", iteration=iteration, ema=dict(e)))
+            self.events.append(f"passed_{self.stage}")
         for m in (250, 500, 1000, 1500, 2000, 2500, 3000):
             if self.iters_in_stage == m:
-                self.events.append(f"s3_{m}")
+                self.events.append(f"{self.stage.lower()}_{m}")
 
     def log_values(self) -> dict:
         out = {"Curriculum/passed": float(self.passed), "Curriculum/blend": min(self.iters_in_stage / max(self.blend_iters, 1), 1.0)}
@@ -691,8 +745,8 @@ class S3Curriculum:
         return {k: getattr(self, k) for k in keys}
 
     def load_state_dict(self, state: dict) -> None:
-        if state.get("stage") != "S3":
-            raise ValueError(f"not an S3 curriculum state: {state.get('stage')}")
+        if state.get("stage") != self.stage:
+            raise ValueError(f"not an {self.stage} curriculum state: {state.get('stage')}")
         for k, v in state.items():
             setattr(self, k, v)
 
