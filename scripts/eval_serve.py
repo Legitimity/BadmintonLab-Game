@@ -57,6 +57,8 @@ def main():
     ap.add_argument("--seed", type=int, default=42)
     ap.add_argument("--watchdog_s", type=float, default=60.0)
     ap.add_argument("--out", type=Path, default=None)
+    ap.add_argument("--trace_out", default=None)
+    ap.add_argument("--trace_envs", type=int, default=8)
     ap.add_argument("--python", default=sys.executable)
     a = ap.parse_args()
     a.ours = a.ours.resolve()  # the inner process runs with cwd = play root
@@ -96,7 +98,7 @@ def main():
             "--seed", str(a.seed),
             "--watchdog_s", str(a.watchdog_s),
             "--headless",
-        ]
+        ] + (["--trace_out", str(Path(a.trace_out).resolve()), "--trace_envs", str(a.trace_envs)] if a.trace_out else [])
         out = subprocess.run(cmd, env=env, cwd=a.play_root, capture_output=True, text=True)
         sys.stderr.write(out.stderr[-4000:])
         line = [ln for ln in out.stdout.splitlines() if ln.startswith("[SERVE_EVAL]")]

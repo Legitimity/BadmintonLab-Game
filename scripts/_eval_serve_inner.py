@@ -23,6 +23,8 @@ parser.add_argument("--rallies", type=int, default=200)
 parser.add_argument("--seed", type=int, default=42)
 parser.add_argument("--watchdog_s", type=float, default=60.0)
 parser.add_argument("--fall_height", type=float, default=0.45)
+parser.add_argument("--trace_out", default=None, help="11-13: save a per-step trace (shuttle, both roots, hits) of the first --trace_envs courts")
+parser.add_argument("--trace_envs", type=int, default=8)
 parser.add_argument("--upright_cos", type=float, default=0.70, help="Fall also if projected-gravity z > -this (trunk tilt > ~45 deg), as in training. Use -1 for height only.")
 AppLauncher.add_app_launcher_args(parser)
 args, hydra_args = parser.parse_known_args()
@@ -100,6 +102,10 @@ def main():
     for s_ in stats.values():
         s_.update({k: 0 for k in ("fell_before_hit", "fell_after_hit")})
     wall = time.time()
+    tk = min(args.trace_envs, n)
+    trace = []  # per step: [t, shuttle xyz, robot0 xyz, robot1 xyz, hit0, hit1, resolved] for courts < tk
+    rally_id = torch.zeros(n, dtype=torch.long, device=device)
+    rob = [u.scene["robot_0"], u.scene["robot_1"]]
     while total < args.rallies * n:
         with torch.inference_mode():
             a0 = pols[0](obs["player_0"]).to(device=device, dtype=torch.float32)
@@ -107,6 +113,13 @@ def main():
             obs, info = env.step(torch.cat((a0, a1), dim=-1))
         sim_t += u.step_dt
         resolved = info["rally_resolved"]
+        if args.trace_out:
+            org = u.scene.env_origins[:tk]
+            hits_now = torch.where(resolved[:tk, None], torch.stack((pre_hit, pre_opp_hit), -1)[:tk] if me == 0 else torch.stack((pre_opp_hit, pre_hit), -1)[:tk], u.just_hit[:tk])
+            row = torch.cat((torch.full((tk, 1), sim_t, device=device), rally_id[:tk, None].float(),
+                             u._shuttle.data.root_pos_w[:tk] - org, rob[0].data.root_pos_w[:tk] - org, rob[1].data.root_pos_w[:tk] - org,
+                             hits_now.float(), resolved[:tk, None].float(), (sim_t - started[:tk, None]) > args.watchdog_s), dim=-1)
+            trace.append(row.cpu())
         # On resolved courts the live state already belongs to the next rally: use the snapshots.
         new_hit = torch.where(resolved, pre_hit, u.just_hit[:, me])
         z = torch.where(resolved, pre_z, robot.data.root_pos_w[:, 2] - origin_z)
@@ -171,6 +184,7 @@ def main():
             fall_t[done] = -1.0
             hit_t[done] = -1.0
             started[done] = sim_t
+            rally_id[done] += 1
     def summary(xs):
         if not xs:
             return None
@@ -191,6 +205,9 @@ def main():
         out_home["within_0.5"] = sum(x < 0.5 for x in home_at_opp_hit) / len(home_at_opp_hit)
         out_home["within_1.0"] = sum(x < 1.0 for x in home_at_opp_hit) / len(home_at_opp_hit)
     out = dict(home_d_at_opp_hit=out_home, obs_dims=dims, num_envs=n, seed=args.seed, wall_s=time.time() - wall, **stats)
+    if args.trace_out:
+        torch.save({"cols": ["t", "rally", "sx", "sy", "sz", "r0x", "r0y", "r0z", "r1x", "r1y", "r1z", "hit0", "hit1", "resolved", "stuck"],
+                    "data": torch.stack(trace, 1), "ours": me, "step_dt": float(u.step_dt)}, args.trace_out)
     print("[SERVE_EVAL]" + json.dumps(out), flush=True)
     env.close()
 
