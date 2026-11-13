@@ -33,8 +33,9 @@ class ServeRunner(OnPolicyRunner):
     FINITE_CHECK_INTERVAL = 50
 
     def __init__(self, env, train_cfg, log_dir=None, device="cpu", time_budget_hours=None, curriculum=None,
-                 stop_after_stage=None, std_range=None):
+                 stop_after_stage=None, std_range=None, target_schedule=None):
         super().__init__(env, train_cfg, log_dir=log_dir, device=device)
+        self.target_schedule = target_schedule  # P7: styles.TargetSchedule or None
         self.std_range = std_range
         self.time_budget_s = None if time_budget_hours is None else time_budget_hours * 3600.0
         self.curriculum = curriculum
@@ -58,6 +59,17 @@ class ServeRunner(OnPolicyRunner):
         if self.curriculum is not None and computer is not None:
             for name, value in self.curriculum.params().items():
                 setattr(computer.p, name, value)
+
+    def apply_target_schedule(self) -> None:
+        computer = getattr(self.env.unwrapped, "serve_reward", None)
+        if self.target_schedule is None or computer is None:
+            return
+        x_t, sigma, w_apex = self.target_schedule.current()
+        computer.p.land_x_t = float(x_t)
+        computer.p.land_sigma = float(sigma)
+        w = dict(computer.weights)
+        w["apex"] = float(w_apex)
+        computer.set_weights(w)
 
     def install_signal_handlers(self) -> None:
         def handler(signum, _frame):
@@ -84,8 +96,16 @@ class ServeRunner(OnPolicyRunner):
                 print(f"[Curriculum] {event} at iteration {it}: {self.curriculum.history[-1] if self.curriculum.history else ''}", flush=True)
                 if self.log_dir is not None:
                     self.save(os.path.join(self.log_dir, f"model_{event}_{it}.pt"))
+        if self.target_schedule is not None:
+            if self.target_schedule.update(rates):
+                self.apply_target_schedule()
+                for event in self.target_schedule.events:
+                    print(f"[Target] {event} at iteration {it}: {self.target_schedule.current()}", flush=True)
+                    if self.log_dir is not None:
+                        self.save(os.path.join(self.log_dir, f"model_{event}_{it}.pt"))
+            values["Serve/target_step"] = float(self.target_schedule.step)
         values.update({f"Serve/weight_{k}": v for k, v in computer.weights.items()})
-        param_names = ["v_close_max"]
+        param_names = ["v_close_max", "land_x_t", "land_sigma"]
         if self.curriculum is not None:
             param_names += [k for k in self.curriculum.base_params if k != "v_close_max"]
         params = {f"param_{k}": float(getattr(computer.p, k)) for k in param_names}
@@ -157,6 +177,7 @@ class ServeRunner(OnPolicyRunner):
             "samples": self.samples,
             "learning_rate": self.alg.learning_rate,
             "curriculum": None if self.curriculum is None else self.curriculum.state_dict(),
+            "target_schedule": None if self.target_schedule is None else self.target_schedule.state_dict(),
             "rng": {
                 "python": random.getstate(),
                 "numpy": np.random.get_state(),
@@ -188,6 +209,8 @@ class ServeRunner(OnPolicyRunner):
                 if computer is not None:
                     computer.set_weights(self.curriculum.weights())
                 self.apply_stage_params()
+            if self.target_schedule is not None and infos.get("target_schedule") is not None:
+                self.target_schedule.load_state_dict(infos["target_schedule"])
             rng = infos.get("rng")
             if rng:
                 random.setstate(rng["python"])

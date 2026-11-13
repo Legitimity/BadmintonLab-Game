@@ -140,6 +140,10 @@ class ServeRewardParams:
     # apex: sign * (apex - start height) / apex_scale clamped to [0, 1]; sign +1 rewards a high arc, -1 a flat one.
     apex_sign: float = 1.0
     apex_scale: float = 2.0
+    # P7 (11-13): reference height of the apex term. < 0 keeps the contact height (any serve over the net has its
+    # apex above the contact, so apex_sign -1 always scored 0). >= 0: sign * (apex - apex_ref) / scale, e.g.
+    # apex_ref 3.2, scale 1.2, sign -1 pays 1 at an apex of 2.0 m and 0 at 3.2 m.
+    apex_ref: float = -1.0
     net_height: float = 1.55  # conservative: the edge height
     net_margin: float = 0.20
     net_scale: float = 0.5
@@ -299,7 +303,8 @@ def net_clear_score(net_z, p: ServeRewardParams) -> torch.Tensor:
 
 
 def apex_score(apex, z0, p: ServeRewardParams) -> torch.Tensor:
-    return torch.clamp(p.apex_sign * (apex - z0) / p.apex_scale, 0.0, 1.0)
+    ref = z0 if p.apex_ref < 0.0 else torch.full_like(apex, p.apex_ref)
+    return torch.clamp(p.apex_sign * (apex - ref) / p.apex_scale, 0.0, 1.0)
 
 
 def flight_time_score(tof, p: ServeRewardParams) -> torch.Tensor:

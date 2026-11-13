@@ -17,6 +17,9 @@ import sys
 from datetime import datetime
 from pathlib import Path
 
+import torch  # noqa: F401,E402  (Windows: before Kit, else tensordict import crashes; HANDOVER 2.6)
+import tensordict  # noqa: F401,E402
+import rsl_rl  # noqa: F401,E402
 from isaaclab.app import AppLauncher
 
 import cli_args
@@ -90,6 +93,8 @@ parser.add_argument(
 )
 parser.add_argument("--entropy_coef", type=float, default=None, help="Override algorithm.entropy_coef.")
 parser.add_argument("--save_interval_override", type=int, default=None, help="Checkpoint every N iterations.")
+parser.add_argument("--target_schedule", action="store_true",
+                    help="P7: move the landing target of --style along styles.TARGET_SCHEDULES (gated by train pred_in / land x).")
 parser.add_argument("--style", default=None, help="Serve style preset (serve/styles.py), applied before hydra overrides "
                     "of env.serve_reward and before --stage_weights.")
 parser.add_argument(
@@ -114,7 +119,7 @@ from isaaclab_tasks.utils.hydra import hydra_task_config  # noqa: E402
 import badmintonlab_game.tasks  # noqa: E402,F401
 from badmintonlab_game.tasks.manager_based.badmintonlab_game.dual_agent_env_cfg import set_physics_dt  # noqa: E402
 from badmintonlab_game.tasks.manager_based.badmintonlab_game.serve import player_cfg  # noqa: E402
-from badmintonlab_game.tasks.manager_based.badmintonlab_game.serve.styles import style_config  # noqa: E402
+from badmintonlab_game.tasks.manager_based.badmintonlab_game.serve.styles import TargetSchedule, style_config  # noqa: E402
 from badmintonlab_game.tasks.manager_based.badmintonlab_game.serve.curriculum import (  # noqa: E402
     ServeCurriculum,
     apply_stage_gates,
@@ -336,6 +341,7 @@ def main(env_cfg, agent_cfg):
             entropy_coef=agent_cfg.algorithm.entropy_coef,
             std_range=std_range,
             style=style,
+            target_schedule=args_cli.target_schedule,
             stage_weights_effective={k: dict(v) for k, v in STAGE_WEIGHTS.items()},
             serve_reward={k: v for k, v in vars(env_cfg.serve_reward).items() if isinstance(v, (int, float, str, bool))},
             num_mini_batches=agent_cfg.algorithm.num_mini_batches,
@@ -389,12 +395,16 @@ def main(env_cfg, agent_cfg):
             curriculum=curriculum,
             stop_after_stage=args_cli.stop_after_stage,
             std_range=std_range,
+            target_schedule=TargetSchedule(args_cli.style) if args_cli.target_schedule else None,
         )
         runner.install_signal_handlers()
         if resume_path:
             print(f"[INFO] Resuming from: {resume_path}")
             runner.load(resume_path)
             runner.clamp_std()
+        if runner.target_schedule is not None:
+            runner.apply_target_schedule()
+            print(f"[INFO] target schedule {args_cli.style}: step {runner.target_schedule.step} {runner.target_schedule.current()}", flush=True)
         elif not args_cli.no_pose_init:
             init_actor_output(runner.alg.policy, _ready_action(env))
         dump_yaml(os.path.join(log_dir, "params", "env.yaml"), env_cfg)

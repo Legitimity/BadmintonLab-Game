@@ -93,3 +93,40 @@ def test_styles_use_known_params_and_terms(name):
 def test_unknown_style():
     with pytest.raises(KeyError):
         styles.style_config("nope")
+
+
+def test_p7_flat_long_presets_and_schedule():
+    for name in ("l1_flat_long", "l2_flat_long_wide"):
+        sp, sw = styles.style_config(name)
+        assert sp["apex_sign"] == -1.0 and sp["v_close_max"] == 15.0
+        assert sw["flight_time"] == 0.0 and sw["land_target"] > 0 and sw["apex"] > 0
+        assert all(hasattr(sr.ServeRewardParams(), k) for k in sp)
+    ts = styles.TargetSchedule("l1_flat_long")
+    assert ts.current()[0] == 3.8
+    # far from the target: no step; close and in: steps after min_iters
+    for _ in range(300):
+        assert not ts.update({"pred_in": 0.99, "land_x_mean": 2.5})
+    for i in range(200):
+        moved = ts.update({"pred_in": 0.99, "land_x_mean": 3.6})
+        if moved:
+            break
+    assert ts.step == 1 and ts.current()[0] == 4.4
+    # low in-rate blocks the next step
+    for _ in range(400):
+        ts.update({"pred_in": 0.80, "land_x_mean": 4.4})
+    assert ts.step == 1
+    st = ts.state_dict()
+    ts2 = styles.TargetSchedule("l1_flat_long")
+    ts2.load_state_dict(st)
+    assert ts2.current() == ts.current()
+    # Old form: with sign -1 an apex above the contact point (every serve over the net) always scored 0.
+    z0 = torch.tensor([1.0, 1.0, 1.0])
+    ap = torch.tensor([2.0, 2.6, 4.0])
+    assert float(sr.apex_score(ap, z0, sr.ServeRewardParams(apex_sign=-1.0, apex_scale=1.5)).max()) == 0.0
+    # apex_ref (P7): low arcs score, high arcs 0, monotone.
+    sp, _ = styles.style_config("l1_flat_long")
+    p = sr.ServeRewardParams(apex_sign=sp["apex_sign"], apex_scale=sp["apex_scale"], apex_ref=sp["apex_ref"])
+    s = sr.apex_score(ap, z0, p)
+    assert float(s[0]) == pytest.approx(1.0) and 0.0 < float(s[1]) < 1.0 and float(s[2]) == 0.0
+    # default (apex_ref < 0) unchanged for the high-arc styles
+    assert float(sr.apex_score(torch.tensor([3.5]), torch.tensor([1.0]), sr.ServeRewardParams(apex_sign=1.0, apex_scale=2.5))[0]) == pytest.approx(1.0)
